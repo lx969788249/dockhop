@@ -22,7 +22,6 @@ const (
 	labelConfigFiles = "com.docker.compose.project.config_files"
 	labelService     = "com.docker.compose.service"
 	labelOneoff      = "com.docker.compose.oneoff"
-	labelConfigHash  = "com.docker.compose.config-hash"
 )
 
 // item 是一个容器：解析后的常用字段，加上完整的原始配置。

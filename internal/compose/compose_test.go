@@ -1,29 +1,49 @@
 package compose
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
 
-func TestReferencedOutside(t *testing.T) {
-	cfg := `{
-	  "services": {
-	    "web": {"env_file": ["/opt/app/.env", "/etc/shared/common.env"], "build": {"context": "/opt/app/web"}},
-	    "api": {"env_file": [{"path": "/srv/secrets/api.env", "required": true}], "build": {"context": "https://github.com/x/y.git"}},
-	    "db":  {}
-	  },
-	  "configs": {"nginx": {"file": "/etc/nginx/site.conf"}},
-	  "secrets": {"pw": {"file": "./secrets/pw.txt"}}
-	}`
-	got, err := referencedOutside(cfg, "/opt/app")
-	if err != nil {
-		t.Fatal(err)
+func TestDeclaredFiles(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "proj")
+	for _, d := range []string{proj, filepath.Join(proj, "web"), filepath.Join(root, "ctx"), filepath.Join(root, "etc")} {
+		os.MkdirAll(d, 0o755)
 	}
-	want := []string{"/etc/nginx/site.conf", "/etc/shared/common.env", "/srv/secrets/api.env"}
+	for _, f := range []string{"shared.env", "api.env", "etc/site.conf", "extra.yml"} {
+		os.WriteFile(filepath.Join(root, f), []byte("x"), 0o644)
+	}
+	os.WriteFile(filepath.Join(proj, "local.env"), []byte("x"), 0o644)
+	main := filepath.Join(proj, "compose.yml")
+	os.WriteFile(main, []byte(`
+include: ["../extra.yml"]
+services:
+  web:
+    env_file: ../shared.env
+    build: ./web
+  api:
+    env_file:
+      - path: `+filepath.Join(root, "api.env")+`
+        required: true
+      - ./local.env
+      - ${MISSING}/x.env
+    build: {context: ../ctx}
+  db:
+    env_file: [../does-not-exist.env]
+configs:
+  nginx: {file: ../etc/site.conf}
+secrets:
+  pw: {file: ./local.env}
+`), 0o644)
+	got := DeclaredFiles(Project{Name: "p", WorkingDir: proj, Files: []string{main}})
+	want := []string{
+		filepath.Join(root, "api.env"), filepath.Join(root, "ctx"), filepath.Join(root, "etc", "site.conf"),
+		filepath.Join(root, "extra.yml"), filepath.Join(root, "shared.env"),
+	}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("项目目录以外引用的文件：\n实际 %v\n期望 %v", got, want)
-	}
-	if _, err := referencedOutside("不是 JSON", "/opt/app"); err == nil {
-		t.Fatal("输出读不懂时应报错")
+		t.Fatalf("项目目录以外写到的文件：\n实际 %v\n期望 %v", got, want)
 	}
 }

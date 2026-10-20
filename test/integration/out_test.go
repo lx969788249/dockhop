@@ -129,6 +129,9 @@ func TestOutBundleContents(t *testing.T) {
 			t.Errorf("输出里缺少「%s」", want)
 		}
 	}
+	if strings.Contains(out, "对不上") {
+		t.Error("项目文件没改过（只是用了 env_file），不应报告配置对不上")
+	}
 	sharedLine := ""
 	for _, l := range strings.Split(out, "\n") {
 		if strings.Contains(l, "共用数据或网络") {
@@ -256,18 +259,10 @@ func TestOutBundleContents(t *testing.T) {
 			t.Errorf("项目目录里缺少 %s", n)
 		}
 	}
-	if !composeLegacy() {
+	{
 		outside := tarEntries(t, bundle.OpenStream(dst, "compose/"+mp.Name+"/outside", mp.OutParts))
 		if outside[strings.TrimPrefix(filepath.Join(f.dir, "outside.env"), "/")].content != "FROM_OUTSIDE=yes\n" {
 			t.Errorf("项目目录以外的 env_file 没有迁移：%v", mp.Outside)
-			c := composeCmd(t)
-			t.Logf("Compose 版本：%s", try(c[0], append(c[1:], "version")...))
-			for _, l := range strings.Split(readLogs(home), "\n") {
-				if strings.Contains(l, "Compose") || strings.Contains(l, "引用") {
-					t.Log(l)
-				}
-			}
-			t.Log(try(c[0], append(c[1:], "-p", f.project, "-f", filepath.Join(f.dir, "proj", "compose.yml"), "config", "--format", "json", "--no-env-resolution")...))
 		}
 	}
 
@@ -441,4 +436,29 @@ func readLogs(home string) string {
 		b.Write(c)
 	}
 	return b.String()
+}
+
+// 启动时用了 shell 里临时设置的变量：迁出时应提醒，迁过去会按文件里的值启动。
+func TestOutComposeDrift(t *testing.T) {
+	if composeLegacy() {
+		t.Skip("老的 docker-compose 不支持核对")
+	}
+	f := setup(t)
+	proj := filepath.Join(f.dir, "proj")
+	c := composeCmd(t)
+	up := exec.Command(c[0], append(c[1:], "-p", f.project, "-f", filepath.Join(proj, "compose.yml"), "--project-directory", proj, "up", "-d", "app")...)
+	up.Env = append(os.Environ(), "MODE=dev") // 覆盖 .env 里的 MODE=prod
+	if b, err := up.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, b)
+	}
+	home := t.TempDir()
+	p := start(t, []string{"DOCKHOP_HOME=" + home}, "out", "--include", f.app, "--host", "127.0.0.1", "--port", fmt.Sprint(freePort()+4))
+	p.waitFor(t, linkPattern, 5*time.Minute)
+	if !strings.Contains(p.out(), "app（环境变量 MODE）") {
+		t.Errorf("应提醒 app 的 MODE 和文件里不一致：\n%s", p.out())
+	}
+	_ = p.cmd.Process.Signal(os.Interrupt)
+	if code := p.wait(t, time.Minute); code != 0 {
+		t.Errorf("按 Ctrl+C 结束传输应正常退出，退出码 %d", code)
+	}
 }

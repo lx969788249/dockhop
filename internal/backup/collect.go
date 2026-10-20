@@ -231,26 +231,23 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 			screen.Note("统计项目目录 · " + u.workingDir)
 			p.dirBytes, p.skipped = treeSize(u.workingDir, p.excludes, bigFileLimit)
 		}
+		cp := compose.Project{Name: u.project, WorkingDir: u.workingDir, Files: u.files}
+		for _, r := range compose.DeclaredFiles(cp) {
+			if spec.IsSystemPath(r) {
+				continue
+			}
+			p.outside = append(p.outside, r)
+			size, _ := treeSize(r, nil, 0)
+			p.outBytes += size
+		}
 		if tool != nil {
-			cp := compose.Project{Name: u.project, WorkingDir: u.workingDir, Files: u.files}
-			if hashes, err := tool.ConfigHashes(ctx, cp); err != nil {
-				screen.Detail("Compose 项目 %s 的配置摘要算不出来：%v", u.project, err)
-			} else {
+			if services, err := tool.Services(ctx, cp); err != nil {
+				screen.Detail("Compose 项目 %s 的配置算不出来：%v", u.project, err)
+			} else if services != nil {
 				for _, it := range u.items {
 					svc := it.c.Config.Labels[labelService]
-					if want := it.c.Config.Labels[labelConfigHash]; want != "" && hashes[svc] != "" && hashes[svc] != want {
-						p.drift = append(p.drift, svc)
-					}
-				}
-			}
-			if refs, err := tool.ReferencedFiles(ctx, cp); err != nil {
-				screen.Detail("Compose 项目 %s 引用的文件找不全：%v", u.project, err)
-			} else {
-				for _, r := range refs {
-					if _, err := os.Stat(r); err == nil && !spec.IsSystemPath(r) {
-						p.outside = append(p.outside, r)
-						size, _ := treeSize(r, nil, 0)
-						p.outBytes += size
+					if why := driftReason(services[svc], it.c); why != "" {
+						p.drift = append(p.drift, svc+"（"+why+"）")
 					}
 				}
 			}
@@ -358,4 +355,32 @@ func treeSize(root string, excludes []string, bigLimit int64) (int64, []string) 
 		return nil
 	})
 	return total, skipped
+}
+
+// driftReason 核对按现在的文件算出来的服务配置和正在运行的容器：镜像不同、或者
+// 文件里写的环境变量值和容器里的不一样时，说明启动后改过文件，或者启动时用了
+// shell 里临时设置的变量。返回不一样的地方；一致时返回空。
+func driftReason(svc compose.Service, c *docker.Container) string {
+	if svc.Image != "" && svc.Image != c.Config.Image {
+		return "镜像 " + c.Config.Image + " → " + svc.Image
+	}
+	env := map[string]string{}
+	for _, e := range c.Config.Env {
+		k, v, _ := strings.Cut(e, "=")
+		env[k] = v
+	}
+	var diff []string
+	for k, v := range svc.Environment {
+		if v == nil {
+			continue // 只写了变量名，值来自启动时的环境，无法核对
+		}
+		if cur, ok := env[k]; !ok || cur != *v {
+			diff = append(diff, k)
+		}
+	}
+	if len(diff) == 0 {
+		return ""
+	}
+	sort.Strings(diff)
+	return "环境变量 " + strings.Join(diff, "、")
 }
