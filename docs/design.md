@@ -10,7 +10,7 @@
 
 1. **现有版本有 7 个会直接影响用户的问题**（第 1.1 节）。其中 2 个是“迁移显示成功，实际丢了东西”：独立容器的显卡、停止等待时间、`-it` 等配置会丢；单服务的 Compose 项目（Vaultwarden、Memos 这类）不会迁移 compose 文件。另有 2 个是程序被强制结束后，两台服务器都可能停在半途、没人收拾。
    这些问题大多出在结构上（把配置翻译成命令行参数、恢复逻辑写在迁移包里），在 bash 里修补成本高，正好在 Go 版本里从根上解决。
-2. **核心思路**：用户看到的东西（一行命令、参数、环境变量、9 个步骤的显示、链接）基本不变；内部换成：
+2. **核心思路**：DockHop 是脱胎于 bash 版的新项目，继承它好的体验（一行命令、大白话、分步骤显示、预检、失败回滚），不背旧接口的包袱（命令、环境变量、链接都重新设计，更简单）；内部换成：
    - 直接调用 Docker 接口，**把原来的容器配置原样交给 Docker 重建**，而不是翻译成 `docker run` 参数；
    - **Compose 项目整体迁移**，用用户原来的 compose 文件启动；
    - 数据读写走 Docker 接口，**不再需要 alpine 辅助镜像**，新服务器不用连 Docker Hub；
@@ -58,7 +58,7 @@
 | # | 问题 |
 |---|---|
 | C1 | 旧服务器看不到新服务器的下载进度；恢复完成后要用户回到旧服务器手动按回车 |
-| C2 | 恢复失败时，**解密后的明文数据**（数据库文件等）保留在 `~/docker_migrate_restore` 里“便于排查”，没有提示这是敏感数据 |
+| C2 | 恢复失败时，**解密后的明文数据**（数据库文件等）保留在 `~/docker_migrate_restore`（bash 版）里“便于排查”，没有提示这是敏感数据 |
 | C3 | 新服务器要“下载一份 → 解密再写一份 → 解压再写一份”，磁盘要 3 倍空间，低配机器慢（138 上 45MB 解密花了 17 秒） |
 | C4 | 卷和目录先压成 `.tgz`，整个包又压缩一次，CPU 白白多花一倍；而且卷的压缩发生在**停机期间**，拖长停机时间 |
 | C5 | 迁移后用户的 Compose 目录里多出 `_resolved_config.yml`、`_migration_images.yml`、`_env_files/` 等内部文件；容器标签指向解析后的文件而不是用户的 `compose.yml`。Compose 项目的 `build:` 上下文目录不会迁移，迁移后 `docker compose build` 会失败 |
@@ -109,7 +109,7 @@
 
 ### 3.1 原则
 
-1. **用户感知不变**：一行命令、参数、环境变量、9 个步骤和结果摘要的格式、链接格式都保持；变化只来自修复问题和新增功能，并在 CHANGELOG 里写清楚。
+1. **新项目，不背包袱**：继承 bash 版好的体验——一行命令、大白话、分步骤显示、迁移前预检、失败自动回滚；命令、环境变量、链接、迁移包格式都按“最简单好用”重新设计，不为和 bash 版一致而妥协。
 2. **配置原样搬运，少做翻译**：能直接用 Docker 原始数据的地方就不转换。
 3. **只依赖 Docker**：除了 Docker 和（有 Compose 项目时的）`docker compose`，不需要任何其他命令，也不往系统里装软件包。
 4. **任何中断都能收场**：两台服务器上所有“改动前”的状态都写到磁盘，程序被强制结束后下次运行能还原。
@@ -117,14 +117,58 @@
 
 ### 3.2 用户能看到的部分
 
-| 项目 | Go 版 |
+**运行**：仍然是一行命令，不带参数时显示菜单：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/dockhop/main/run.sh)
+```
+
+```
+1) 把这台服务器上的服务搬出去（旧服务器）
+2) 接收搬过来的服务（新服务器）
+3) 收集诊断信息
+```
+
+**命令**：用子命令代替一堆开关，名字直接说明在哪台服务器上用。bash 版叫“备份/恢复”，容易让人以为是备份工具，这里改成“搬出/接收”。
+
+| 命令 | 用途 | 对应 bash 版 |
+|---|---|---|
+| `dockhop send` | 旧服务器：选择容器、打包、提供下载 | `--backup` |
+| `dockhop receive [链接]` | 新服务器：预检、下载、恢复 | `--restore=URL` |
+| `dockhop receive --check 链接` | 只做预检，不下载、不改动 | `--check=URL` |
+| `dockhop receive --file 迁移包 链接` | 用别的方式带过来的迁移包恢复（新功能，C9） | 手动解压后运行 `restore.sh` |
+| `dockhop diagnose` | 生成诊断文件 | `--diagnose` |
+| `dockhop version` | 显示版本 | — |
+
+通过一行命令运行时，参数接在后面即可，例如 `bash <(curl …/run.sh) receive '链接'`。
+
+**选项**：用户会主动选择的东西做成命令选项，环境变量只留给少数全局设置（附录 B 有和 bash 版的完整对照）：
+
+| 选项 | 用途 |
 |---|---|
-| 运行方式 | `bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/dockhop/main/run.sh)`，参数原样传递，例如 `... run.sh) --restore='链接'` |
-| 参数 | 全部保留：`--backup`、`--restore[=URL]`、`--check=URL`、`--include=`、`--no-stop`、`--verbose/-v`、`--diagnose`、`--help`。新增 `--file=本地迁移包`（见 C9） |
-| 环境变量 | README 里的 13 个全部保留，含义不变；另外 10 个没写进 README 的也保留（附录 B） |
-| 屏幕输出 | `[n/7]`、`[n/9]` 阶段行、✓/✗、进度行、警告汇总、结果摘要的几种状态、失败时的原因/建议/日志位置，文字和格式保持一致 |
-| 链接格式 | 加密和签名方式不变；`#` 后面的参数不变；文件名后缀从 `.tar.gz.enc` 变为 `.tar.zst.enc`（新格式，见 3.4.4） |
-| 日志 | 位置、成功删除、失败保留、脱敏都保持 |
+| `send --include a,b` | 只迁移指定的容器（或它们所在的 Compose 项目），不显示菜单 |
+| `send --no-stop` | 不停机打包（数据可能不一致，会提示） |
+| `send --stop-shared` | 非交互运行时，允许临时停止和所选容器共用数据的其他容器 |
+| `send --snapshot auto\|always\|never` | 容器内未挂载的改动：有改动才快照（默认）/ 总是 / 不迁移 |
+| `send --port 端口`、`send --host 地址` | 下载服务的端口（默认 8080，被占用自动后移）、链接里的地址（默认自动探测） |
+| `receive --yes` | 非交互运行时，预检发现的问题自动采用推荐做法 |
+| `receive --existing replace\|skip\|fail` | 新服务器已有同名服务时：替换（可回滚，默认）/ 跳过 / 停止 |
+| `receive --skip-check` | 跳过迁移前预检 |
+| `receive --health-timeout 秒数` | 健康检查至少等待的时间（默认 60 秒，并会按容器自己的检查间隔自动加长） |
+| `receive --keep-files` | 恢复成功后保留下载和解压的文件 |
+| `-v` / `--verbose` | 在屏幕上显示每一步的细节 |
+
+**环境变量**只有三个：
+
+| 变量 | 默认 | 用途 |
+|---|---|---|
+| `DOCKHOP_HOME` | `~/.dockhop` | 日志、中断记录、回滚资料、锁和工作文件都放在这里（`logs/`、`state/`、`rollback/`、`work/`），不再散落在家目录的几个地方 |
+| `DOCKHOP_KEEP_LOG` | — | 设为 `1` 时成功后也保留日志 |
+| `DOCKHOP_MIRROR` | — | `run.sh` 下载程序用的镜像站 |
+
+**屏幕输出**：保留 bash 版的风格——分步骤、每步一行、`✓` / `✗`、进度条、警告汇总、结果摘要、失败时给出原因/建议/日志位置；文字按需要重新斟酌，不要求和 bash 版逐字相同。
+
+**链接**：变短，只包含地址和一个密钥，见 3.4.13。
 
 ### 3.3 代码结构
 
@@ -199,13 +243,14 @@ run.sh        一行命令的入口脚本（约 30 行）
 |---|---|---|
 | 压缩 | 卷、目录各自 gzip，整包再 gzip 一次 | 整包只压缩一次，用 zstd（压缩和解压都比 gzip 快几倍，多核并行） |
 | 旧服务器磁盘 | 先写一份未加密的目录，再写一份加密包，约 2 倍 | **边打包边压缩边加密，直接写成最终文件**，约 1 倍（压缩后大小） |
+| 新服务器校验 | 下载完再把整包读一遍算摘要和签名 | 每 64KB 一段，下载的同时逐段校验；包损坏或被篡改，在出问题的那一段就能发现 |
 | 停机时间 | 停机期间每个卷、目录单独 gzip 一次 | 停机期间只做一次快速压缩（zstd 多核），通常读盘速度就是上限；镜像导出仍在恢复容器之后（现有做法） |
 | 新服务器磁盘 | 下载 1 份 + 解密 1 份 + 解压 1 份 | 下载 1 份 + 解压 1 份，解压完删掉下载文件 |
 | 包内容 | 数据 + 恢复脚本 | 只有数据和配置记录，没有脚本 |
 | 长度未知的数据 | 先写成文件再打进包 | 卷数据、镜像导出这类事先不知道大小的数据流，按固定大小（如 16MB）分段写进包里，内存占用固定，也不用先落盘 |
-| 加密和链接 | AES-256-CTR + HMAC-SHA256，密钥在链接里 | **不变** |
+| 加密和链接 | AES-256-CTR + HMAC-SHA256，链接约 330 个字符 | 分块认证加密，链接约 80 个字符，见 3.4.13 |
 
-打包前先估算大小（卷、目录、镜像），在**停机之前**检查工作目录所在磁盘的空间，不够就提示换目录（新增 `DOCKER_MIGRATE_WORKDIR`），绝不在停机后才发现磁盘满了（解决 A5）。
+打包前先估算大小（卷、目录、镜像），在**停机之前**检查工作目录所在磁盘的空间，不够就提示换目录（`DOCKHOP_HOME` 或 `send --workdir`），绝不在停机后才发现磁盘满了（解决 A5）。
 
 **不兼容旧版**：Go 版只读写自己的格式，不读 bash 版的迁移包，也不为旧版保留任何代码分支。
 
@@ -224,7 +269,7 @@ run.sh        一行命令的入口脚本（约 30 行）
 
 #### 3.4.6 中断补救（解决 A3、A4）
 
-- **旧服务器**：停机前把“停了哪些容器、原来是什么状态”写到程序的记录目录（和恢复事务用同一个目录，默认 `~/.docker_migrate_rollback`，可用 `RESTORE_ROLLBACK_BASE` 修改）。任务正常结束会删掉；如果程序被强制结束，下次运行（任何模式）开头会提示：
+- **旧服务器**：停机前把“停了哪些容器、原来是什么状态”写到 `~/.dockhop/state/`。任务正常结束会删掉；如果程序被强制结束，下次运行（任何模式）开头会提示：
   `上次备份被中断，有 2 个容器还停着：nextcloud-app、nextcloud-db。现在启动它们吗？[Y/n]`
 - **新服务器**：恢复事务的记录改为一个追加写入的日志文件（每一步改动前先写一条）。下次运行开头如果发现没完成的事务：
   `上次恢复在第 8 步被中断，新服务器上有 3 个原有容器被暂停或改名。现在还原到恢复前的状态吗？[Y/n]`
@@ -269,10 +314,24 @@ run.sh        一行命令的入口脚本（约 30 行）
 - 能拉取：恢复时加载迁移包里的镜像后，再按 digest 拉取一次补上仓库清单，和源端完全一致（已加载的层能否免去重复下载，阶段 0 验证）；
 - 不能拉取：作为预检里“需要选择”的问题：`改用迁移包里的镜像（推荐，内容和旧服务器完全相同，只是配置里的镜像名去掉 @sha256 部分）/ 取消`。选择后把加载的镜像打上不带 digest 的标签，容器和 Compose（通过临时覆盖文件）使用这个标签。
 
-#### 3.4.13 安装和发布
+#### 3.4.13 链接和加密（新设计）
+
+bash 版的链接带着摘要、加密方式、128 位十六进制密钥、IV、签名，约 330 个字符，复制时容易漏掉一截（bash 版专门有“链接不完整”的报错）。DockHop 改为：
+
+```
+http://203.0.113.7:8080/k3Jx9QmP2vLa/#Vn3q…（43 个字符的密钥）
+```
+
+- `#` 后面只有一个 32 字节的随机密钥，加密、校验、迁移计划用的子密钥都从它派生；
+- `#` 后面的部分浏览器和 curl 都不会发给服务器，下载服务本身拿不到密钥（和现在一样）；
+- 加密改用成熟的“分块认证加密”（每 64KB 一段，每段都带校验，能发现截断和顺序被调换），不再自己拼“加密 + 签名”。具体用开源加密库 age 的格式，还是基于 Go 官方加密库的 ChaCha20-Poly1305 实现同样的分块方式，在阶段 0 定下来；
+- 迁移计划用同一个密钥加密，地址由链接推算（现有设计）；
+- 识别到 bash 版的旧链接（`.tar.gz.enc#sha256=…`）时，只提示“这个链接是 docker_migrate 生成的，请在旧服务器改用 DockHop 重新运行”。
+
+#### 3.4.14 安装和发布
 
 - `run.sh`（约 30 行）：判断 CPU 架构（x86_64 / arm64 / armv7）→ 从 GitHub Releases 下载对应程序 → 核对 SHA-256 → 运行 → 删除。
-- 国内访问 GitHub 慢：支持 `DOCKER_MIGRATE_MIRROR=镜像地址`；下载失败时提示怎么设置。程序的校验值写在 `run.sh` 里，从镜像站下载也能确认没被篡改。
+- 国内访问 GitHub 慢：支持 `DOCKHOP_MIRROR=镜像地址`；下载失败时提示怎么设置。程序的校验值写在 `run.sh` 里，从镜像站下载也能确认没被篡改。
 - 发布：打标签后 GitHub Actions 自动编译三个架构、生成校验值、发布。
 - 版本号从 3.0.0 开始。
 
@@ -284,8 +343,8 @@ run.sh        一行命令的入口脚本（约 30 行）
 
 | 阶段 | 内容 | 验收标准 | 估计 |
 |---|---|---|---|
-| 0 | 补充验证：Compose 用原文件恢复后标签是否和源端一致；Compose 卷带标签预先创建后 Compose 是否不再提示；源端用 containerd 镜像存储（Docker 29 默认）导出时 digest 能否保留、加载后再按 digest 拉取是否重复下载层；断点续传；zstd 在 1G 内存机器上的速度和内存；Docker 20.10 多网络容器的创建 | 每项有实验结果，结论写回本文档 | 半天 |
-| 1 | 骨架：命令行、环境变量、界面输出、日志、Docker 客户端、`run.sh`、自动发布 | `--help`、`--diagnose` 可用；界面输出和 bash 版逐字一致（用测试比对） | 1 天 |
+| 0 | 补充验证：选定分块加密的实现（age 格式还是 ChaCha20-Poly1305 分块）；Compose 用原文件恢复后标签是否和源端一致；Compose 卷带标签预先创建后 Compose 是否不再提示；源端用 containerd 镜像存储（Docker 29 默认）导出时 digest 能否保留、加载后再按 digest 拉取是否重复下载层；断点续传；zstd 在 1G 内存机器上的速度和内存；Docker 20.10 多网络容器的创建 | 每项有实验结果，结论写回本文档 | 半天 |
+| 1 | 骨架：子命令和选项、界面输出、日志、Docker 客户端、加密和链接、`run.sh`、自动发布 | `dockhop --help`、`dockhop diagnose`、`dockhop version` 可用；界面输出有快照测试；加密格式有测试 | 1 天 |
 | 2 | **备份端和迁移包格式**：选择容器、Compose 整体迁移、停机快照、打包、下载服务、进度、中断记录 | 打出的包内容逐项核对（容器配置、卷、目录、Compose 文件、镜像）；旧服务器强制中断后能恢复容器；停机前磁盘检查生效 | 1.5–2 天 |
 | 3 | **恢复端**：预检、下载（断点续传）、事务、容器重建、Compose、完成通知、中断补救 | `tests/apps` 全部 8 个应用 + 断网场景通过；保真测试全量比较通过；事务回滚场景（附录 C）全部通过；新增“单服务 Compose 迁移后能在原目录 `docker compose up`”和 digest 镜像测试通过 | 2–2.5 天 |
 | 4 | 发布：DockHop 仓库公开，发布 1.0.0；docker_migrate 的 README 顶部指向 DockHop | 两台真服务器实测一次完整迁移（你协助） | 半天 |
@@ -331,11 +390,11 @@ run.sh        一行命令的入口脚本（约 30 行）
 6. **镜像继续随迁移包传输**；“不打包镜像、新服务器在线拉取”以后再考虑。
 7. **版本号**：DockHop 是新项目，从 1.0.0 开始。切换后 docker_migrate 仓库保留，README 顶部指向 DockHop；约一个月内只修严重问题，之后归档（只读）。
 8. **名字和仓库**：项目改名 DockHop，命令名 `dockhop`，代码放在独立的新仓库 `lx969788249/dockhop`，和旧仓库隔离。
-9. **待定**：环境变量和数据目录要不要跟着改名（例如 `DOCKER_MIGRATE_*` → `DOCKHOP_*`、`~/docker_migrate_logs` → `~/.dockhop/logs`）。推荐改：既然不兼容旧版，名字统一更清楚；`PORT`、`ADVERTISE_HOST`、`RESTORE_*` 这类不带项目名的保持不变。
+9. **当作新项目设计**：命令改为子命令（`send` / `receive` / `diagnose`），用户的选择做成命令选项，环境变量只留 `DOCKHOP_HOME`、`DOCKHOP_KEEP_LOG`、`DOCKHOP_MIRROR` 三个，所有文件放在 `~/.dockhop`；链接改短（3.4.13）。
 
 ---
 
-## 附录 A：现有功能对照（确认没有遗漏）
+## 附录 A：bash 版功能对照（确认没有遗漏；左列沿用 bash 版的叫法，新叫法见 3.2 和附录 B）
 
 | 现有功能 | Go 版位置 |
 |---|---|
@@ -361,15 +420,27 @@ run.sh        一行命令的入口脚本（约 30 行）
 | `RESTORE_KEEP`、`RESTORE_CLEAN_ALL`、`RESTORE_BASE` | restore |
 | 非交互运行（`kill -TERM` 结束源端） | transfer |
 
-## 附录 B：环境变量
+## 附录 B：bash 版的环境变量去哪了
 
-README 中的 13 个全部保留：`PORT`、`ADVERTISE_HOST`、`DOCKER_MIGRATE_SNAPSHOT`、`STOP_SHARED_MOUNTS`、`RESTORE_EXISTING`、`RESTORE_BASE`、`RESTORE_KEEP`、`RESTORE_CLEAN_ALL`、`RESTORE_HEALTH_TIMEOUT`、`RESTORE_AUTO_RESOLVE`、`RESTORE_SKIP_PREFLIGHT`、`DOCKER_MIGRATE_LOG_DIR`、`DOCKER_MIGRATE_KEEP_LOG`。
+| bash 版 | DockHop |
+|---|---|
+| `PORT` | `send --port` |
+| `ADVERTISE_HOST` | `send --host` |
+| `DOCKER_MIGRATE_SNAPSHOT` | `send --snapshot` |
+| `STOP_SHARED_MOUNTS` | `send --stop-shared` |
+| `RESTORE_EXISTING` | `receive --existing` |
+| `RESTORE_AUTO_RESOLVE` | `receive --yes` |
+| `RESTORE_SKIP_PREFLIGHT` | `receive --skip-check` |
+| `RESTORE_HEALTH_TIMEOUT` | `receive --health-timeout` |
+| `RESTORE_KEEP` | `receive --keep-files` |
+| `RESTORE_CLEAN_ALL` | 去掉：失败时本来就删除解密后的数据，只留加密包和日志 |
+| `RESTORE_BASE`、`RESTORE_ROLLBACK_BASE`、`RESTORE_LOCK_BASE`、`DOCKER_MIGRATE_LOCK_BASE`、`DOCKER_MIGRATE_LOG_DIR` | 统一由 `DOCKHOP_HOME` 决定 |
+| `DOCKER_MIGRATE_KEEP_LOG` | `DOCKHOP_KEEP_LOG` |
+| `--verbose` | `-v` / `--verbose`（不变） |
+| `RESTORE_CONNECT_TIMEOUT`、`RESTORE_STARTUP_GRACE`、`DOCKER_MIGRATE_PROGRESS_INTERVAL`、`DOCKER_MIGRATE_PROGRESS_MODE`、`DM_PROGRESS_STALL`、`RESTORE_IGNORE_CONTAINERS`、`DOCKER_MIGRATE_IGNORE_CONTAINERS` | 只供测试使用，改为不写进文档的 `DOCKHOP_TEST_*` |
+| `DOCKER_MIGRATE_GZIP_LEVEL`、`DOCKER_MIGRATE_LIB_ONLY`、各种 `DM_*` | 不再需要 |
 
-未写进 README、继续保留的：`RESTORE_CONNECT_TIMEOUT`、`RESTORE_STARTUP_GRACE`、`RESTORE_ROLLBACK_BASE`、`RESTORE_LOCK_BASE`、`RESTORE_IGNORE_CONTAINERS`、`DOCKER_MIGRATE_IGNORE_CONTAINERS`、`DOCKER_MIGRATE_LOCK_BASE`、`DOCKER_MIGRATE_PROGRESS_INTERVAL`、`DOCKER_MIGRATE_PROGRESS_MODE`、`DM_PROGRESS_STALL`。
-
-不再需要的：`DOCKER_MIGRATE_GZIP_LEVEL`（改为 zstd）、`DOCKER_MIGRATE_LIB_ONLY` 和各种 `DM_*` 内部变量（只用于 bash 进程间通信）。
-
-新增：`DOCKER_MIGRATE_WORKDIR`（旧服务器打包目录）、`DOCKER_MIGRATE_MIRROR`（下载程序用的镜像站）。
+新增：`DOCKHOP_MIRROR`（`run.sh` 下载程序用的镜像站）。
 
 ## 附录 C：必须保留的事务和安全场景（来自 integration_docker.sh）
 
@@ -388,6 +459,6 @@ README 中的 13 个全部保留：`PORT`、`ADVERTISE_HOST`、`DOCKER_MIGRATE_S
 13. 同名卷后端不同时，在清空之前就失败
 14. 归档里有穿过软链接写出目标目录的成员时，在改动任何数据之前拒绝
 15. Compose 新配置不健康时自动还原旧项目
-16. `RESTORE_EXISTING=fail` 在停止服务、覆盖数据之前终止
+16. `--existing fail` 在停止服务、覆盖数据之前终止
 17. 回滚本身失败时，结果如实显示“回滚未完全成功”，不能误报“已安全回滚”
 18. 新服务已验证、但清理回滚资料失败时，不能误报成功，也不能回滚已提交的数据
