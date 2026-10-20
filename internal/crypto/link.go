@@ -8,7 +8,9 @@
 package crypto
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/big"
@@ -145,4 +147,18 @@ func ParseLink(s string) (Link, error) {
 		host = ip.String()
 	}
 	return Link{Scheme: u.Scheme, Host: host, Port: port, Token: token, id: id}, nil
+}
+
+// SignStatus 用链接里的密钥给迁入结果签名：只有拿到完整链接的新服务器才能通知
+// 旧服务器“迁入完成”，别人伪造不了。
+func (l Link) SignStatus(body []byte) []byte {
+	key := sha256.Sum256([]byte("dockhop-status-v1\x00" + l.key()))
+	m := hmac.New(sha256.New, key[:])
+	m.Write(body)
+	return m.Sum(nil)
+}
+
+// VerifyStatus 检查迁入结果的签名。
+func (l Link) VerifyStatus(body, sig []byte) bool {
+	return hmac.Equal(l.SignStatus(body), sig)
 }

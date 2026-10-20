@@ -47,6 +47,18 @@ jobs:
           name: dist
           path: dist
 
+  # 在真实的 Docker 上验收迁出：迁移包内容、停机期间被强制结束后恢复、停机前的磁盘检查。
+  integration:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: 验收测试
+        run: go test -tags integration ./test/integration -v -timeout 20m
+
   # 程序是静态编译的，在不同发行版里都应能直接运行（不需要任何依赖）。
   distros:
     needs: check

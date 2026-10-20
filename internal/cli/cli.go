@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/lx969788249/dockhop/internal/backup"
 	"github.com/lx969788249/dockhop/internal/crypto"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -36,6 +37,8 @@ type Env struct {
 	Context  context.Context
 	HomeDir  func() (string, error)
 	Platform string // 例如 linux/amd64
+	Args     []string
+	verbose  bool
 }
 
 func (e *Env) fill() {
@@ -129,6 +132,8 @@ func Run(args []string, env Env) int {
 	if len(rest) > 0 {
 		cmd, rest = rest[0], rest[1:]
 	}
+	env.verbose = verbose
+	env.Args = args
 	screen := ui.New(env.Stderr, env.TTY, nil)
 	screen.SetVerbose(verbose)
 	err := dispatch(cmd, rest, &env, screen)
@@ -201,9 +206,28 @@ func menu(env *Env, screen *ui.Screen) error {
 // errNotReady 是还没开发完的功能。
 var errNotReady = errors.New("还在开发中")
 
-func runOut(env *Env, screen *ui.Screen, opts OutOptions) error {
-	screen.Error("迁出功能还在开发中", "现在请先使用 docker_migrate：https://github.com/lx969788249/docker_migrate")
-	return errNotReady
+func runOut(env *Env, _ *ui.Screen, opts OutOptions) error {
+	t, err := startTask(env, "out")
+	if err != nil {
+		return err
+	}
+	if err := backup.RecoverInterrupted(env.Context, t.docker, t.home, t.screen, t.prompt); err != nil {
+		t.screen.Error(err.Error(), "")
+		t.finish(false)
+		return errReported
+	}
+	err = backup.Run(env.Context, backup.Deps{
+		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
+		Home: t.home, Version: env.Version, Getenv: env.Getenv,
+	}, backup.Options{
+		Include: opts.Include, NoStop: opts.NoStop, StopShared: opts.StopShared, Snapshot: opts.Snapshot,
+		Port: opts.Port, Host: opts.Host, Workdir: opts.Workdir,
+	})
+	t.finish(err == nil)
+	if errors.Is(err, backup.ErrReported) {
+		return errReported
+	}
+	return err
 }
 
 // readLink 取得迁移链接：命令里写了就用，否则在终端里请用户粘贴。

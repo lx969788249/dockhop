@@ -10,5 +10,6 @@ require (
 
 require (
 	filippo.io/hpke v0.4.0 // indirect
+	github.com/klauspost/compress v1.20.3 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 )

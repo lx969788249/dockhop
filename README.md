@@ -12,8 +12,8 @@ DockHop 是 [docker_migrate](https://github.com/lx969788249/docker_migrate) 的 
 |---|---|---|
 | 0 | 补充验证 | ✅ |
 | 1 | 程序骨架：命令和选项、屏幕输出、日志、Docker 客户端、加密和链接、诊断、`run.sh`、自动发布 | ✅ |
-| 2 | 迁出和迁移包格式 | 进行中 |
-| 3 | 迁入 | — |
+| 2 | 迁出和迁移包格式 | ✅ |
+| 3 | 迁入 | 进行中 |
 | 4 | 发布 1.0.0 | — |
 
 ## 开发
@@ -35,5 +35,11 @@ scripts/test-run-sh.sh dist         # 测试 run.sh（需要 Linux）
 | `internal/logging` | 运行日志、隐藏密钥和密码、诊断文件 |
 | `internal/docker` | 精简的 Docker 接口客户端（容器配置按原始 JSON 读写） |
 | `internal/crypto` | 迁移链接和加密（age） |
-| `internal/host` | 系统、磁盘、监听端口 |
+| `internal/host` | 系统、磁盘、监听端口、文件锁 |
+| `internal/spec` | 迁出、迁入共用的规则：系统路径、容器依赖、可写层改动、秘密变量 |
+| `internal/compose` | 调用服务器上的 docker compose |
+| `internal/bundle` | 迁移包格式：写入、解开、清单、迁移计划 |
+| `internal/transfer` | 下载服务（断点续传、进度、迁入结果通知）、对外地址探测 |
+| `internal/backup` | 迁出 |
+| `test/integration` | 在真实 Docker 上的验收测试（`go test -tags integration ./test/integration`） |
 | `scripts` | `run.sh` 模板、编译和测试脚本 |

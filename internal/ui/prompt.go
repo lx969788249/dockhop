@@ -113,3 +113,6 @@ func (p *Prompter) Ask(label string, valid func(string) error) (string, error) {
 		return line, nil
 	}
 }
+
+// ReadLine 等用户输入一行（例如按回车结束传输）。
+func (p *Prompter) ReadLine() (string, error) { return p.readLine() }
