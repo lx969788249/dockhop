@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: 代码格式
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: go vet
+        run: go vet ./...
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      - name: 单元测试
+        run: go test -race ./...
+      - name: 脚本检查
+        run: |
+          go install mvdan.cc/sh/v3/cmd/shfmt@v3.10.0
+          shellcheck -S warning scripts/*.sh scripts/run.sh.in run.sh
+          "$(go env GOPATH)/bin/shfmt" -d -i 2 -ci scripts/*.sh run.sh
+          # run.sh 是 scripts/run.sh.in 填上版本号和校验值后的样子，除了这几行应完全一致。
+          norm() { sed -E 's/^(VERSION|SHA256_[A-Z0-9]+)=".*"$/\1=""/' "$1"; }
+          diff -u <(norm scripts/run.sh.in) <(norm run.sh) || { echo "run.sh 应由 scripts/run.sh.in 生成，请修改模板"; exit 1; }
+      - name: 编译三个架构
+        run: scripts/build.sh 0.0.0-ci dist
+      - name: run.sh 下载、核对、运行
+        run: scripts/test-run-sh.sh dist
+      - name: 在真实 Docker 上运行
+        run: |
+          ./dist/dockhop-linux-amd64 version
+          cd "$(mktemp -d)"
+          "$GITHUB_WORKSPACE/dist/dockhop-linux-amd64" diagnose
+          grep -q "版本：" dockhop-diagnose-*.txt
+          grep -q "===== 监听端口 =====" dockhop-diagnose-*.txt
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dist
+          path: dist
+
+  # 程序是静态编译的，在不同发行版里都应能直接运行（不需要任何依赖）。
+  distros:
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian:12, ubuntu:24.04, rockylinux:8, alpine:3.20]
+    name: distro (${{ matrix.image }})
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist
+      - name: 运行
+        run: |
+          chmod +x dist/dockhop-linux-amd64
+          docker run --rm -v "$PWD/dist:/dist" "${{ matrix.image }}" sh -c '
+            /dist/dockhop-linux-amd64 version &&
+            /dist/dockhop-linux-amd64 --help >/dev/null &&
+            cd /tmp && /dist/dockhop-linux-amd64 diagnose &&
+            grep -q "连不上 Docker" dockhop-diagnose-*.txt'

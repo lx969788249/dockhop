@@ -1,0 +1,46 @@
+name: release
+
+# 推送 v1.2.3 这样的标签时自动发布：编译三个架构、生成校验值、创建 GitHub Release，
+# 并把带新版本号和校验值的 run.sh 提交到 main（一行命令用的就是它）。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: 确认标签就在 main 上
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: 测试
+        run: |
+          git checkout "$GITHUB_SHA"
+          go test ./...
+      - name: 编译
+        run: scripts/build.sh "${GITHUB_REF_NAME#v}" dist
+      - name: 测试 run.sh
+        run: scripts/test-run-sh.sh dist
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/dockhop-linux-* dist/SHA256SUMS dist/run.sh \
+            --title "DockHop ${GITHUB_REF_NAME#v}" --generate-notes
+      - name: 更新 main 上的 run.sh
+        run: |
+          git checkout main
+          cp dist/run.sh run.sh
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "发布 ${GITHUB_REF_NAME}：更新 run.sh 的版本号和校验值"
+          git push origin main
