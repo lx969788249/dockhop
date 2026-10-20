@@ -260,6 +260,14 @@ func TestOutBundleContents(t *testing.T) {
 		outside := tarEntries(t, bundle.OpenStream(dst, "compose/"+mp.Name+"/outside", mp.OutParts))
 		if outside[strings.TrimPrefix(filepath.Join(f.dir, "outside.env"), "/")].content != "FROM_OUTSIDE=yes\n" {
 			t.Errorf("项目目录以外的 env_file 没有迁移：%v", mp.Outside)
+			c := composeCmd(t)
+			t.Logf("Compose 版本：%s", try(c[0], append(c[1:], "version")...))
+			for _, l := range strings.Split(readLogs(home), "\n") {
+				if strings.Contains(l, "Compose") || strings.Contains(l, "引用") {
+					t.Log(l)
+				}
+			}
+			t.Log(try(c[0], append(c[1:], "-p", f.project, "-f", filepath.Join(f.dir, "proj", "compose.yml"), "config", "--format", "json", "--no-env-resolution")...))
 		}
 	}
 
