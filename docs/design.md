@@ -124,38 +124,38 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/dockhop/main/run
 ```
 
 ```
-1) 把这台服务器上的服务搬出去（旧服务器）
-2) 接收搬过来的服务（新服务器）
+1) 迁出：打包这台服务器上的服务，生成迁移链接（在旧服务器上运行）
+2) 迁入：将服务迁到这台服务器（在新服务器上运行）
 3) 收集诊断信息
 ```
 
-**命令**：用子命令代替一堆开关，名字直接说明在哪台服务器上用。bash 版叫“备份/恢复”，容易让人以为是备份工具，这里改成“搬出/接收”。
+**命令**：用子命令代替一堆开关。中文叫“迁出 / 迁入”，方向一看就懂，“迁入”也自然包含恢复；英文命令对应 `out` / `in`，和项目名连起来读就是 “dock hop out / dock hop in”。bash 版叫“备份 / 恢复”，容易让人以为是备份工具。屏幕上的步骤标题和结果摘要也统一用“迁出 / 迁入”。
 
 | 命令 | 用途 | 对应 bash 版 |
 |---|---|---|
-| `dockhop send` | 旧服务器：选择容器、打包、提供下载 | `--backup` |
-| `dockhop receive [链接]` | 新服务器：预检、下载、恢复 | `--restore=URL` |
-| `dockhop receive --check 链接` | 只做预检，不下载、不改动 | `--check=URL` |
-| `dockhop receive --file 迁移包 链接` | 用别的方式带过来的迁移包恢复（新功能，C9） | 手动解压后运行 `restore.sh` |
+| `dockhop out` | 迁出（旧服务器）：选择容器、打包、提供下载 | `--backup` |
+| `dockhop in [链接]` | 迁入（新服务器）：预检、下载、恢复 | `--restore=URL` |
+| `dockhop check 链接` | 只检查新服务器能不能迁入，不下载、不改动 | `--check=URL` |
+| `dockhop in --file 迁移包 链接` | 用别的方式带过来的迁移包恢复（新功能，C9） | 手动解压后运行 `restore.sh` |
 | `dockhop diagnose` | 生成诊断文件 | `--diagnose` |
 | `dockhop version` | 显示版本 | — |
 
-通过一行命令运行时，参数接在后面即可，例如 `bash <(curl …/run.sh) receive '链接'`。
+通过一行命令运行时，参数接在后面即可，例如 `bash <(curl …/run.sh) in '链接'`。
 
 **选项**：用户会主动选择的东西做成命令选项，环境变量只留给少数全局设置（附录 B 有和 bash 版的完整对照）：
 
 | 选项 | 用途 |
 |---|---|
-| `send --include a,b` | 只迁移指定的容器（或它们所在的 Compose 项目），不显示菜单 |
-| `send --no-stop` | 不停机打包（数据可能不一致，会提示） |
-| `send --stop-shared` | 非交互运行时，允许临时停止和所选容器共用数据的其他容器 |
-| `send --snapshot auto\|always\|never` | 容器内未挂载的改动：有改动才快照（默认）/ 总是 / 不迁移 |
-| `send --port 端口`、`send --host 地址` | 下载服务的端口（默认 8080，被占用自动后移）、链接里的地址（默认自动探测） |
-| `receive --yes` | 非交互运行时，预检发现的问题自动采用推荐做法 |
-| `receive --existing replace\|skip\|fail` | 新服务器已有同名服务时：替换（可回滚，默认）/ 跳过 / 停止 |
-| `receive --skip-check` | 跳过迁移前预检 |
-| `receive --health-timeout 秒数` | 健康检查至少等待的时间（默认 60 秒，并会按容器自己的检查间隔自动加长） |
-| `receive --keep-files` | 恢复成功后保留下载和解压的文件 |
+| `out --include a,b` | 只迁移指定的容器（或它们所在的 Compose 项目），不显示菜单 |
+| `out --no-stop` | 不停机打包（数据可能不一致，会提示） |
+| `out --stop-shared` | 非交互运行时，允许临时停止和所选容器共用数据的其他容器 |
+| `out --snapshot auto\|always\|never` | 容器内未挂载的改动：有改动才快照（默认）/ 总是 / 不迁移 |
+| `out --port 端口`、`out --host 地址` | 下载服务的端口（默认 8080，被占用自动后移）、链接里的地址（默认自动探测） |
+| `in --yes` | 非交互运行时，预检发现的问题自动采用推荐做法 |
+| `in --existing replace\|skip\|fail` | 新服务器已有同名服务时：替换（可回滚，默认）/ 跳过 / 停止 |
+| `in --skip-check` | 跳过迁移前预检 |
+| `in --health-timeout 秒数` | 健康检查至少等待的时间（默认 60 秒，并会按容器自己的检查间隔自动加长） |
+| `in --keep-files` | 恢复成功后保留下载和解压的文件 |
 | `-v` / `--verbose` | 在屏幕上显示每一步的细节 |
 
 **环境变量**只有三个：
@@ -250,7 +250,7 @@ run.sh        一行命令的入口脚本（约 30 行）
 | 长度未知的数据 | 先写成文件再打进包 | 卷数据、镜像导出这类事先不知道大小的数据流，按固定大小（如 16MB）分段写进包里，内存占用固定，也不用先落盘 |
 | 加密和链接 | AES-256-CTR + HMAC-SHA256，链接约 330 个字符 | 分块认证加密，链接约 80 个字符，见 3.4.13 |
 
-打包前先估算大小（卷、目录、镜像），在**停机之前**检查工作目录所在磁盘的空间，不够就提示换目录（`DOCKHOP_HOME` 或 `send --workdir`），绝不在停机后才发现磁盘满了（解决 A5）。
+打包前先估算大小（卷、目录、镜像），在**停机之前**检查工作目录所在磁盘的空间，不够就提示换目录（`DOCKHOP_HOME` 或 `out --workdir`），绝不在停机后才发现磁盘满了（解决 A5）。
 
 **不兼容旧版**：Go 版只读写自己的格式，不读 bash 版的迁移包，也不为旧版保留任何代码分支。
 
@@ -390,7 +390,7 @@ http://203.0.113.7:8080/k3Jx9QmP2vLa/#Vn3q…（43 个字符的密钥）
 6. **镜像继续随迁移包传输**；“不打包镜像、新服务器在线拉取”以后再考虑。
 7. **版本号**：DockHop 是新项目，从 1.0.0 开始。切换后 docker_migrate 仓库保留，README 顶部指向 DockHop；约一个月内只修严重问题，之后归档（只读）。
 8. **名字和仓库**：项目改名 DockHop，命令名 `dockhop`，代码放在独立的新仓库 `lx969788249/dockhop`，和旧仓库隔离。
-9. **当作新项目设计**：命令改为子命令（`send` / `receive` / `diagnose`），用户的选择做成命令选项，环境变量只留 `DOCKHOP_HOME`、`DOCKHOP_KEEP_LOG`、`DOCKHOP_MIRROR` 三个，所有文件放在 `~/.dockhop`；链接改短（3.4.13）。
+9. **当作新项目设计**：命令改为子命令：迁出 `out`、迁入 `in`、检查 `check`、诊断 `diagnose`（名字由你定），用户的选择做成命令选项，环境变量只留 `DOCKHOP_HOME`、`DOCKHOP_KEEP_LOG`、`DOCKHOP_MIRROR` 三个，所有文件放在 `~/.dockhop`；链接改短（3.4.13）。
 
 ---
 
@@ -424,15 +424,15 @@ http://203.0.113.7:8080/k3Jx9QmP2vLa/#Vn3q…（43 个字符的密钥）
 
 | bash 版 | DockHop |
 |---|---|
-| `PORT` | `send --port` |
-| `ADVERTISE_HOST` | `send --host` |
-| `DOCKER_MIGRATE_SNAPSHOT` | `send --snapshot` |
-| `STOP_SHARED_MOUNTS` | `send --stop-shared` |
-| `RESTORE_EXISTING` | `receive --existing` |
-| `RESTORE_AUTO_RESOLVE` | `receive --yes` |
-| `RESTORE_SKIP_PREFLIGHT` | `receive --skip-check` |
-| `RESTORE_HEALTH_TIMEOUT` | `receive --health-timeout` |
-| `RESTORE_KEEP` | `receive --keep-files` |
+| `PORT` | `out --port` |
+| `ADVERTISE_HOST` | `out --host` |
+| `DOCKER_MIGRATE_SNAPSHOT` | `out --snapshot` |
+| `STOP_SHARED_MOUNTS` | `out --stop-shared` |
+| `RESTORE_EXISTING` | `in --existing` |
+| `RESTORE_AUTO_RESOLVE` | `in --yes` |
+| `RESTORE_SKIP_PREFLIGHT` | `in --skip-check` |
+| `RESTORE_HEALTH_TIMEOUT` | `in --health-timeout` |
+| `RESTORE_KEEP` | `in --keep-files` |
 | `RESTORE_CLEAN_ALL` | 去掉：失败时本来就删除解密后的数据，只留加密包和日志 |
 | `RESTORE_BASE`、`RESTORE_ROLLBACK_BASE`、`RESTORE_LOCK_BASE`、`DOCKER_MIGRATE_LOCK_BASE`、`DOCKER_MIGRATE_LOG_DIR` | 统一由 `DOCKHOP_HOME` 决定 |
 | `DOCKER_MIGRATE_KEEP_LOG` | `DOCKHOP_KEEP_LOG` |
