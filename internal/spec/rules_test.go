@@ -76,6 +76,14 @@ func TestLayerChanges(t *testing.T) {
 	if strings.Join(deleted, ",") != "/usr/share/doc" {
 		t.Errorf("删除：%v", deleted)
 	}
+	// 镜像里本来没有 /sbin：--init 时 Docker 新建了 /sbin 来放 docker-init（实测 cdt-monitor）。
+	if WritableChanged([]docker.Change{{Path: "/sbin", Kind: 1}, {Path: "/sbin/docker-init", Kind: 1}}, nil) {
+		t.Error("为 docker-init 新建的 /sbin 不算改动")
+	}
+	keep, _ = LayerChanges([]docker.Change{{Path: "/sbin", Kind: 1}, {Path: "/sbin/docker-init", Kind: 1}, {Path: "/sbin/mytool", Kind: 1}}, nil)
+	if strings.Join(keep, ",") != "/sbin/mytool" {
+		t.Errorf("/sbin 里用户自己加的文件仍要迁移：%v", keep)
+	}
 }
 
 func TestSecretEnvValues(t *testing.T) {

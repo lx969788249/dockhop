@@ -209,6 +209,11 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		addIssue(Issue{Level: Stop, Kind: "compose", Title: "要迁移 Compose 项目，但新服务器没有安装 Docker Compose",
 			Hint: "先安装 Docker Compose（例如 apt install docker-compose-plugin）再重试"})
 	}
+	if hasProject && t.HasCompose && strings.HasPrefix(t.Compose, "1.") && !strings.HasPrefix(plan.Source.Compose, "1.") && plan.Source.Compose != "" {
+		addIssue(Issue{Level: Info, Kind: "old_compose",
+			Title: fmt.Sprintf("新服务器的 docker-compose 是老版本 %s，旧服务器用的是 Compose %s；有些写法老版本读不懂，迁入时可能失败（失败会自动还原）。"+
+				"建议先在新服务器安装新版 Docker Compose", t.Compose, plan.Source.Compose)})
+	}
 	if !t.Local && (len(plan.Binds) > 0 || hasProject) {
 		addIssue(Issue{Level: Stop, Kind: "remote_docker",
 			Title: "Docker 不在这台服务器上（DOCKER_HOST 指向了别的机器），没法把目录和 Compose 项目文件放到 Docker 所在的服务器",

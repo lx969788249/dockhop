@@ -273,3 +273,17 @@ func TestStripDigest(t *testing.T) {
 		}
 	}
 }
+
+func TestEvaluateOldCompose(t *testing.T) {
+	p := testPlan()
+	p.Source.Compose = "5.0.2"
+	tg := testTarget()
+	tg.Compose = "1.29.2"
+	if i := find(Evaluate(p, tg, &Decisions{}, Options{}), "old_compose"); i == nil || i.Level != Info {
+		t.Error("新服务器只有老的 docker-compose 时应提前提醒")
+	}
+	tg.Compose = "2.30.0"
+	if find(Evaluate(p, tg, &Decisions{}, Options{}), "old_compose") != nil {
+		t.Error("新版 Compose 不用提醒")
+	}
+}

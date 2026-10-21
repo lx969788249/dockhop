@@ -117,8 +117,10 @@ func layerChanges(changes []docker.Change, mounts []string, withRuntime bool) (k
 			parents[p] = true
 		}
 	}
+	// 挂载点和 Docker 放进去的文件，连同为它们新建的上级目录（例如镜像里本来没有
+	// /sbin，--init 时 Docker 为 /sbin/docker-init 建的 /sbin）都不算改动。
 	mountDirs := map[string]bool{}
-	for _, m := range mounts {
+	for _, m := range append(append([]string(nil), mounts...), managedPaths()...) {
 		for p := path.Clean(m); p != "/" && p != "."; p = path.Dir(p) {
 			mountDirs[p] = true
 		}
@@ -141,6 +143,14 @@ func layerChanges(changes []docker.Change, mounts []string, withRuntime bool) (k
 		}
 	}
 	return topmost(adds), topmost(dels)
+}
+
+func managedPaths() []string {
+	out := make([]string, 0, len(dockerManaged))
+	for p := range dockerManaged {
+		out = append(out, p)
+	}
+	return out
 }
 
 // topmost 去掉已经被上级路径包含的路径。

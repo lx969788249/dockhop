@@ -56,18 +56,19 @@ var ErrReported = errors.New("迁出失败")
 // run 保存一次迁出过程中的状态，出错或中断时据此收拾。
 type run struct {
 	Deps
-	opts      Options
-	started   time.Time
-	rid       string
-	workdir   string
-	stopped   []StoppedContainer // 已经停下、还没恢复的源容器
-	restored  int
-	toRestore int
-	downtime  time.Duration
-	tempTags  []string // 为导出旧版本镜像临时加的名字
-	server    *transfer.Server
-	status    string // 新服务器报告的迁入结果
-	summary   []string
+	opts           Options
+	started        time.Time
+	rid            string
+	workdir        string
+	stopped        []StoppedContainer // 已经停下、还没恢复的源容器
+	restored       int
+	toRestore      int
+	downtime       time.Duration
+	tempTags       []string // 为导出旧版本镜像临时加的名字
+	composeVersion string
+	server         *transfer.Server
+	status         string // 新服务器报告的迁入结果
+	summary        []string
 }
 
 // Run 执行迁出。不管成功、失败还是被中断，都会把源容器恢复原状、删除临时文件，
@@ -98,6 +99,7 @@ func (r *run) steps(ctx context.Context) error {
 	tool, terr := compose.Detect(ctx)
 	envSummary := "Docker " + info.ServerVersion
 	if terr == nil {
+		r.composeVersion = tool.Version
 		envSummary += " · Compose " + tool.Version
 		r.Log.Printf("Compose：%s", tool)
 	} else {
@@ -124,7 +126,7 @@ func (r *run) steps(ctx context.Context) error {
 	s.End(countText(sel))
 
 	s.Begin(3, 7, "读取配置")
-	col, err := collect(ctx, dc, tool, inv, sel, s, r.ignored())
+	col, err := collect(ctx, dc, tool, inv, sel, s, r.ignored(), r.opts.Snapshot != "never")
 	if err != nil {
 		return fail(s, err.Error(), "", "")
 	}
@@ -143,6 +145,13 @@ func (r *run) steps(ctx context.Context) error {
 	}
 	if err := r.confirmShared(col); err != nil {
 		return err
+	}
+	for _, it := range col.sel.items {
+		if size := col.layerBytes[it]; size > largeLayer {
+			s.Warn("容器 %s 里没挂载出来的改动有 %s，会在停机期间一起打包，停机时间会因此变长；"+
+				"如果是日志、缓存、崩溃转储这类没用的文件，可以先删掉再迁出，或者用 --snapshot never 不迁移容器里的改动",
+				it.name(), ui.HumanBytes(size))
+		}
 	}
 	for _, p := range col.projects {
 		for _, f := range p.skipped {
@@ -226,7 +235,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	info, _ := dc.Info(ctx)
 	hostname, _ := os.Hostname()
 	m := &bundle.Manifest{Format: bundle.Format, Version: bundle.Version, CreatedAt: time.Now().UTC(), DockHop: r.Version,
-		Source: bundle.Source{Hostname: hostname, Docker: dc.Server().Version, API: dc.APIVersion(), Arch: info.Architecture,
+		Source: bundle.Source{Hostname: hostname, Docker: dc.Server().Version, API: dc.APIVersion(), Arch: info.Architecture, Compose: r.composeVersion,
 			OS: info.OperatingSystem, CgroupVersion: info.CgroupVersion, LoggingDriver: info.LoggingDriver,
 			DefaultRuntime: info.DefaultRuntime, StorageDriver: info.Driver},
 		Images: bundle.Images{Refs: map[string]string{}}}
@@ -304,7 +313,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		}
 		s.Detail("容器 %s 里有没挂载出来的改动：%d 处新增或修改、%d 处删除，一起迁移", it.name(), len(keep), len(deleted))
 		rc := changesStream(ctx, dc, it.c.ID, keep)
-		parts, n, err := r.addStream(w, "changes/"+it.name(), "容器 "+it.name()+" 里的改动", rc, 0)
+		parts, n, err := r.addStream(w, "changes/"+it.name(), "容器 "+it.name()+" 里的改动", rc, col.layerBytes[it])
 		rc.Close()
 		if err != nil {
 			return nil, 0, fail(s, "打包容器 "+it.name()+" 里的改动失败", err.Error(), "")
@@ -379,7 +388,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	}
 	summary := fmt.Sprintf("%d 个卷 · %d 个目录 · %s", len(m.Volumes), len(m.Binds), ui.HumanBytes(packed))
 	if r.downtime > 0 {
-		summary += " · 停机 " + ui.Elapsed(r.downtime)
+		summary += " · 停机" + downtimeText(r.downtime)
 	}
 	s.End(summary)
 
@@ -436,6 +445,9 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		len(m.Containers), len(m.Volumes), len(m.Binds), len(refs), ui.HumanBytes(st.Size())))
 	return m, st.Size(), nil
 }
+
+// largeLayer：容器里没挂载出来的改动超过这么大时，停机前提醒。
+const largeLayer = 100 << 20
 
 // ownDirs 是 root 里面属于 DockHop 自己的目录（日志、工作目录、正在写的迁移包），
 // 打包挂载目录或项目目录时跳过，例如项目目录就是 /root、DockHop 的目录是 /root/.dockhop。
@@ -610,7 +622,7 @@ func (r *run) report(ctx context.Context, err error) error {
 	if r.toRestore > 0 {
 		line := fmt.Sprintf("源容器：已恢复 %d/%d", r.restored, r.toRestore)
 		if r.downtime > 0 {
-			line += "（停机 " + ui.Elapsed(r.downtime) + "）"
+			line += "（停机" + downtimeText(r.downtime) + "）"
 		}
 		if r.restored < r.toRestore {
 			line = fmt.Sprintf("源容器：只恢复了 %d/%d，请立即人工检查", r.restored, r.toRestore)
@@ -742,6 +754,14 @@ func (r *run) testPause(ctx context.Context, point string) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// downtimeText 是停机时长；不到一秒时不写“0 秒”。
+func downtimeText(d time.Duration) string {
+	if d < time.Second {
+		return "不到 1 秒"
+	}
+	return " " + ui.Elapsed(d)
 }
 
 func countText(sel *selection) string {

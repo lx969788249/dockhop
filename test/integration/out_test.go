@@ -464,3 +464,23 @@ func TestOutComposeDrift(t *testing.T) {
 		t.Errorf("按 Ctrl+C 结束传输应正常退出，退出码 %d", code)
 	}
 }
+
+// 容器里没挂载出来的改动很大时（真机实测：waline 容器里积攒了 6.6GB 崩溃转储），
+// 要在停机之前提醒：这些都得在停机期间打包。
+func TestOutLargeLayerWarns(t *testing.T) {
+	name := fmt.Sprintf("dmtest_big%d", os.Getpid())
+	t.Cleanup(func() { try("docker", "rm", "-f", name) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	sh(t, "docker", "run", "-d", "--name", name, "--label", "com.centurylinklabs.watchtower.enable=false", "alpine:3.20", "sleep", "600")
+	sh(t, "docker", "exec", name, "sh", "-c", "head -c 120000000 /dev/urandom >/core.1234")
+	p := start(t, []string{"DOCKHOP_HOME=" + t.TempDir()}, "out", "--include", name, "--host", "127.0.0.1", "--port", fmt.Sprint(freePort()+5))
+	p.waitFor(t, linkPattern, 5*time.Minute)
+	out := p.out()
+	warn := strings.Index(out, "里没挂载出来的改动有 114MB")
+	stop := strings.Index(out, "[4/7]")
+	if warn < 0 || warn > stop {
+		t.Errorf("应在停机之前提醒容器里的改动很大：\n%s", out)
+	}
+	_ = p.cmd.Process.Signal(os.Interrupt)
+	p.wait(t, time.Minute)
+}

@@ -104,6 +104,16 @@ func (c *Client) InspectContainer(ctx context.Context, id string) (*Container, j
 	return &ct, raw, nil
 }
 
+// ContainerSize 返回容器可写层的大小（容器里没挂载出来的改动），单位字节。
+// Docker 要现场统计，改动多时会慢一些，但不需要停止容器。
+func (c *Client) ContainerSize(ctx context.Context, id string) (int64, error) {
+	var out struct {
+		SizeRw int64 `json:"SizeRw"`
+	}
+	err := c.Get(ctx, "/containers/"+url.PathEscape(id)+"/json", url.Values{"size": {"1"}}, &out)
+	return out.SizeRw, err
+}
+
 // StopContainer 停止容器；timeout 为 nil 时用容器自己的停止等待时间。
 func (c *Client) StopContainer(ctx context.Context, id string, timeout *time.Duration) error {
 	q := url.Values{}

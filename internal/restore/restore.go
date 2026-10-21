@@ -271,7 +271,11 @@ func (r *run) check() error {
 	}
 	runner := &preflight.Runner{Screen: s, Prompt: r.Prompt, Auto: r.opts.Yes,
 		Collect: func() (*preflight.Target, error) {
-			return preflight.Collect(context.Background(), r.Docker, r.tool != nil)
+			v := ""
+			if r.tool != nil {
+				v = r.tool.Version
+			}
+			return preflight.Collect(context.Background(), r.Docker, v)
 		}}
 	res, err := runner.Run(r.plan, &r.d, preflight.Options{Existing: r.opts.Existing, BaseDir: r.workBase(),
 		BundleOnDisk: r.opts.File != "", Home: r.Home})
@@ -1144,7 +1148,13 @@ func (r *run) startServices(ctx context.Context) error {
 
 	for _, p := range r.projects {
 		if err := r.startProject(ctx, p); err != nil {
-			return fail(s, "Compose 项目 "+p.Name+" 启动失败："+err.Error(), "", "执行 docker compose -p "+p.Name+" logs 查看服务日志")
+			hint := "执行 docker compose -p " + p.Name + " logs 查看服务日志"
+			if r.tool != nil && r.tool.Legacy() {
+				hint = "新服务器的 docker-compose " + r.tool.Version + " 是老版本，可能读不懂这个项目配置文件里的新写法。" +
+					"安装新版 Docker Compose（Docker 官方源的 docker-compose-plugin，或者把 GitHub 上下载的 docker-compose 放到 " +
+					"/usr/local/lib/docker/cli-plugins/）后重新运行，迁移包已经下载好，不用重新下载"
+			}
+			return fail(s, "Compose 项目 "+p.Name+" 启动失败："+err.Error(), "", hint)
 		}
 	}
 

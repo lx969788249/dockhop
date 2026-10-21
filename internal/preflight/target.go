@@ -21,6 +21,7 @@ type Target struct {
 	VolumePlugins map[string]bool
 	MemTotal      int64
 	HasCompose    bool
+	Compose       string // 新服务器上 Compose 的版本
 	Local         bool
 	Containers    map[string]TargetContainer
 	Projects      map[string]bool
@@ -49,14 +50,14 @@ type TargetNetwork struct {
 }
 
 // Collect 读出新服务器的情况。读不到的部分留空，相应的检查就跳过。
-func Collect(ctx context.Context, dc *docker.Client, hasCompose bool) (*Target, error) {
+func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, error) {
 	info, err := dc.Info(ctx)
 	if err != nil {
 		return nil, err
 	}
 	t := &Target{
 		Arch: info.Architecture, DockerVersion: info.ServerVersion, DockerRoot: info.DockerRootDir,
-		MemTotal: info.MemTotal, HasCompose: hasCompose, Local: dc.Local(),
+		MemTotal: info.MemTotal, HasCompose: compose != "", Compose: compose, Local: dc.Local(),
 		Runtimes: map[string]bool{}, VolumePlugins: map[string]bool{},
 		Containers: map[string]TargetContainer{}, Projects: map[string]bool{},
 		Volumes: map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{}, DockerPorts: map[string]string{},

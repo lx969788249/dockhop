@@ -108,13 +108,32 @@ func (t *Tool) Exec(ctx context.Context, p Project, logf func(string, ...any), a
 		logf("%s", text)
 	}
 	if err != nil {
-		lines := strings.Split(text, "\n")
-		if len(lines) > 8 {
-			lines = lines[len(lines)-8:]
-		}
-		return fmt.Errorf("%s 失败：%s", strings.Join(args[:min(len(args), 2)], " "), strings.Join(lines, "\n"))
+		return fmt.Errorf("%s 失败：%s", strings.Join(args[:min(len(args), 2)], " "), keyLines(text))
 	}
 	return nil
+}
+
+// keyLines 从 Compose 的输出里挑出说明错误的那几行：从第一行写着 error、invalid 之类的
+// 行开始（报错后面常跟着很长的配置内容），最多 3 行，每行最多 200 个字符。
+func keyLines(text string) string {
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	start := len(lines) - 3
+	for i, l := range lines {
+		low := strings.ToLower(l)
+		if strings.Contains(low, "error") || strings.Contains(low, "invalid") || strings.Contains(low, "unsupported") ||
+			strings.Contains(low, "not found") || strings.Contains(low, "no such") || strings.Contains(low, "failed") {
+			start = i
+			break
+		}
+	}
+	start = max(start, 0)
+	out := lines[start:min(start+3, len(lines))]
+	for i, l := range out {
+		if r := []rune(strings.TrimSpace(l)); len(r) > 200 {
+			out[i] = string(r[:200]) + "…"
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 func run(ctx context.Context, dir string, argv []string) (string, error) {

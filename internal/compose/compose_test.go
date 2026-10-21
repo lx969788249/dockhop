@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -45,5 +46,17 @@ secrets:
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("项目目录以外写到的文件：\n实际 %v\n期望 %v", got, want)
+	}
+}
+
+func TestKeyLines(t *testing.T) {
+	// 老的 docker-compose 报错后面跟着整段配置内容，要留住说明错误的那一行。
+	text := "Creating network\nInvalid interpolation format for \"environment\" option in service \"waline\": \"{%- set x = r/^[0-9]+$/g -%}\n{%- if a -%}\n  b\n{%- endif -%}\""
+	got := keyLines(text)
+	if !strings.HasPrefix(got, "Invalid interpolation format") || strings.Count(got, "\n") != 2 {
+		t.Errorf("应从报错那一行开始、最多 3 行：%q", got)
+	}
+	if got := keyLines("a\nb\nc\nd"); got != "b\nc\nd" {
+		t.Errorf("没有报错字样时取最后 3 行：%q", got)
 	}
 }
