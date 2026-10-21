@@ -38,6 +38,13 @@ func TestLinkRoundTrip(t *testing.T) {
 func TestParseLinkErrors(t *testing.T) {
 	l, _ := NewLink("1.2.3.4", 8080)
 	good := l.String()
+	// 只改密钥里的一个字符（校验码会对不上）；不能用字符串替换，同样的字符可能出现在链接前面。
+	key := []byte(l.Secret())
+	if key[10] == 'q' {
+		key[10] = 'p'
+	} else {
+		key[10] = 'q'
+	}
 	cases := []struct {
 		in   string
 		want string
@@ -50,7 +57,7 @@ func TestParseLinkErrors(t *testing.T) {
 		{good[:len(good)-5], "密钥不完整"},
 		{"http://1.2.3.4:8080/x/#" + l.Secret(), "下载地址不完整"},
 		{"http://1.2.3.4:99999/" + l.Token + "/#" + l.Secret(), "端口不对"},
-		{strings.Replace(good, l.Secret()[10:12], "zz", 1), "密钥不对"},
+		{l.Base() + "#" + string(key), "密钥不对"},
 	}
 	for _, c := range cases {
 		_, err := ParseLink(c.in)
