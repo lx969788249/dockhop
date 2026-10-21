@@ -94,7 +94,22 @@ start_hosts() {
       sleep 1
     done
     docker cp "$DOCKHOP_BIN" "${host}:/usr/local/bin/dockhop"
+    show_storage "$host"
   done
+}
+
+# 显示模拟服务器的 Docker 版本和镜像存储方式。Docker 29 起新装的默认用 containerd 存储，
+# 镜像 ID、导出、docker diff 的行为都和以前不同，这些任务必须真的跑在 containerd 存储上。
+show_storage() {
+  local host="$1" info version store="经典存储"
+  info="$(docker exec "$host" docker info -f '{{.ServerVersion}} {{json .DriverStatus}}')"
+  version="${info%% *}"
+  [[ "$info" != *containerd* ]] || store="containerd 存储"
+  echo "  ${host##*_}：Docker ${version} · ${store}"
+  if ((${version%%.*} >= 29)) && [[ "$store" != "containerd 存储" ]]; then
+    echo "Docker ${version} 应默认使用 containerd 存储，测试没有覆盖到要测的情况" >&2
+    return 1
+  fi
 }
 
 # 镜像先在本机拉取再导入旧服务器：本机有缓存时不用重复下载。

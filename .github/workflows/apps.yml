@@ -36,7 +36,13 @@ jobs:
           - { app: tricky }
           - { app: unreachable }
           - { app: digest }
+          # Docker 29：默认用 containerd 存储，镜像 ID、导出、docker diff 的行为都和以前不同。
+          - { app: tricky, old: "29", new: "29" }
+          - { app: wordpress, old: "29", new: "29" }
+          - { app: digest, old: "29", new: "29" }
           # 不同 Docker 版本之间迁移：老版本 → 新版本、新版本 → 老版本。
+          - { app: tricky, old: "20.10", new: "29" }
+          - { app: tricky, old: "29", new: "20.10" }
           - { app: tricky, old: "20.10", new: "27.5" }
           - { app: tricky, old: "27.5", new: "20.10" }
           - { app: wordpress, old: "20.10", new: "27.5" }

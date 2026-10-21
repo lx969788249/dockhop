@@ -11,6 +11,13 @@ expect_contains "独立容器的数据" "$(docker exec dm_standalone cat /data/s
 expect_contains "外部网络的网段" "$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' dm_shared)" "10.123.0.0/24"
 expect_contains "独立容器的固定 IP" \
   "$(docker inspect -f '{{(index .NetworkSettings.Networks "dm_shared").IPAMConfig.IPv4Address}}' dm_standalone)" "10.123.0.50"
+expect_contains "独立容器里新增的文件" "$(docker exec dm_standalone cat /etc/dockhop-added)" "layer-added"
+if docker exec dm_standalone test -e /etc/motd; then
+  echo "独立容器里删除的文件不应再出现" >&2
+  exit 1
+fi
+echo "  ✓ 独立容器里删除的文件"
+expect_contains "Compose 服务里新增的目录" "$(docker exec "$(service_container dm_tricky worker)" cat /opt/worker/note.txt)" "worker-layer"
 if docker ps -a --format '{{.Names}}' | grep -q debug; then
   echo "profiles 里的 debug 服务不应该被创建" >&2
   exit 1
