@@ -14,6 +14,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/backup"
 	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/restore"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -93,7 +94,7 @@ const helpText = `DockHop：一条链接，把 Docker 服务连同数据从旧�
 迁入选项：
   --file 迁移包        用别的方式（scp、网盘等）带过来的迁移包，不再下载
   --yes                不能提问时，预检发现的问题自动采用推荐做法
-  --existing 方式      已有同名服务时：replace 替换（可回滚，默认）、skip 跳过、fail 停止
+  --existing 方式      已有同名服务时：replace 替换（失败时自动还原）、skip 跳过、fail 停止；不写时会询问
   --skip-check         跳过迁移前预检
   --health-timeout 秒  健康检查至少等待的秒数（默认 60，会按容器自己的检查间隔自动加长）
   --keep-files         迁入成功后保留下载和解压的文件
@@ -111,6 +112,14 @@ const helpText = `DockHop：一条链接，把 Docker 服务连同数据从旧�
 
 // Run 运行一条命令，返回退出码。
 func Run(args []string, env Env) int {
+	// 迁入时在临时容器里运行的内部命令（清空数据卷、删除文件），不出现在帮助里。
+	if len(args) >= 1 && (args[0] == "__clear" || args[0] == "__remove") {
+		if err := restore.Helper(args[0], args[1:]); err != nil {
+			fmt.Fprintln(env.Stderr, err)
+			return ExitFailed
+		}
+		return ExitOK
+	}
 	env.fill()
 	verbose := false
 	// 通用选项可以写在子命令前后任意位置。
@@ -197,14 +206,11 @@ func menu(env *Env, screen *ui.Screen) error {
 	case 1:
 		return runOut(env, screen, OutOptions{Snapshot: "auto", Port: 8080})
 	case 2:
-		return runIn(env, screen, InOptions{Existing: "replace", HealthTimeout: defaultHealthTimeout}, false)
+		return runIn(env, screen, InOptions{HealthTimeout: defaultHealthTimeout}, false)
 	default:
 		return runDiagnose(env, screen)
 	}
 }
-
-// errNotReady 是还没开发完的功能。
-var errNotReady = errors.New("还在开发中")
 
 func runOut(env *Env, _ *ui.Screen, opts OutOptions) error {
 	t, err := startTask(env, "out")
@@ -261,13 +267,33 @@ func runIn(env *Env, screen *ui.Screen, opts InOptions, checkOnly bool) error {
 		}
 		return err
 	}
-	_ = link
-	name := "迁入"
-	if checkOnly {
-		name = "迁入前检查"
+	if opts.File != "" {
+		if _, err := os.Stat(opts.File); err != nil {
+			screen.Error("找不到迁移包 "+opts.File, "确认 --file 后面的路径写对了")
+			return errReported
+		}
 	}
-	screen.Error(name+"功能还在开发中", "现在请先使用 docker_migrate：https://github.com/lx969788249/docker_migrate")
-	return errNotReady
+	kind := "in"
+	if checkOnly {
+		kind = "check"
+	}
+	t, err := startTask(env, kind)
+	if err != nil {
+		return err
+	}
+	t.redactor.AddSecret(link.Secret())
+	err = restore.Run(env.Context, restore.Deps{
+		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
+		Home: t.home, Version: env.Version, Getenv: env.Getenv,
+	}, restore.Options{
+		Link: link, File: opts.File, Yes: opts.Yes, Existing: opts.Existing, SkipCheck: opts.SkipCheck,
+		HealthTimeout: opts.HealthTimeout, KeepFiles: opts.KeepFiles, CheckOnly: checkOnly,
+	})
+	t.finish(err == nil)
+	if errors.Is(err, restore.ErrReported) {
+		return errReported
+	}
+	return err
 }
 
 // errReported 表示错误已经显示过了，只需要返回失败的退出码。
@@ -291,7 +317,7 @@ func exitCode(err error, stderr io.Writer) int {
 	case errors.Is(err, io.EOF):
 		fmt.Fprintln(stderr, "\n已取消。")
 		return ExitInterrupted
-	case errors.Is(err, errReported), errors.Is(err, errNotReady), errors.Is(err, flag.ErrHelp):
+	case errors.Is(err, errReported), errors.Is(err, flag.ErrHelp):
 		return ExitFailed
 	default:
 		fmt.Fprintln(stderr, "✗ "+err.Error())

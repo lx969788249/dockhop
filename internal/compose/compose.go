@@ -88,6 +88,35 @@ func (t *Tool) Services(ctx context.Context, p Project) (map[string]Service, err
 	return cfg.Services, nil
 }
 
+// Exec 在项目目录里执行一条 compose 命令（例如 up --no-start），输出写进日志。
+// 失败时返回最后几行输出。
+func (t *Tool) Exec(ctx context.Context, p Project, logf func(string, ...any), args ...string) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	argv := append([]string{}, t.cmd...)
+	argv = append(argv, "-p", p.Name, "--project-directory", p.WorkingDir)
+	for _, f := range p.Files {
+		argv = append(argv, "-f", f)
+	}
+	argv = append(argv, args...)
+	logf("$ %s", strings.Join(argv, " "))
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = p.WorkingDir
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if text != "" {
+		logf("%s", text)
+	}
+	if err != nil {
+		lines := strings.Split(text, "\n")
+		if len(lines) > 8 {
+			lines = lines[len(lines)-8:]
+		}
+		return fmt.Errorf("%s 失败：%s", strings.Join(args[:min(len(args), 2)], " "), strings.Join(lines, "\n"))
+	}
+	return nil
+}
+
 func run(ctx context.Context, dir string, argv []string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()

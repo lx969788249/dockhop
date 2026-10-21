@@ -107,7 +107,7 @@ func (f *fixture) teardown() {
 	for _, n := range strings.Fields(try("docker", "network", "ls", "-q", "--filter", "name="+f.prefix)) {
 		try("docker", "network", "rm", n)
 	}
-	for _, img := range strings.Fields(try("docker", "images", "-q", "dockhop-snapshot")) {
+	for _, img := range strings.Fields(try("docker", "images", "-q", "dockhop-image")) {
 		try("docker", "rmi", "-f", img)
 	}
 }
@@ -182,11 +182,13 @@ func TestOutBundleContents(t *testing.T) {
 			t.Errorf("没选中的容器 %s 只应临时停止，不应迁移", n)
 		}
 	}
-	if names[f.web].SnapshotImage == "" {
-		t.Error("web 改过 /etc，应有快照镜像")
+	if ch := names[f.web].Changes; ch == nil || strings.Join(ch.Paths, ",") != "/etc/dockhop-changed" {
+		t.Errorf("web 改过 /etc，应只迁移改动的文件：%+v", ch)
+	} else if e := tarEntries(t, bundle.OpenStream(dst, "changes/"+f.web, ch.Parts))["etc/dockhop-changed"]; e.content != "changed\n" {
+		t.Errorf("容器里改动的文件不对：%+v", e)
 	}
-	if names[f.worker].SnapshotImage != "" {
-		t.Error("worker 没有改动，不应做快照")
+	if names[f.worker].Changes != nil || names[f.app].Changes != nil {
+		t.Error("worker、app 没有改动（挂载点不算），不应迁移改动")
 	}
 	if names[f.app].Project != f.project {
 		t.Errorf("app 应属于项目 %s：%+v", f.project, names[f.app])
@@ -266,13 +268,13 @@ func TestOutBundleContents(t *testing.T) {
 		}
 	}
 
-	// 镜像：docker save 的格式，快照镜像在里面。
+	// 镜像：docker save 的格式。
 	imgs := tarEntries(t, bundle.OpenStream(dst, "images", m.Images.Parts))
 	if _, ok := imgs["manifest.json"]; !ok {
 		t.Error("镜像导出不完整")
 	}
-	if !strings.Contains(imgs["manifest.json"].content, "dockhop-snapshot") {
-		t.Error("快照镜像应在镜像导出里")
+	if len(m.Images.Refs) != 1 {
+		t.Errorf("都用 alpine:3.20，只应导出一个镜像：%v", m.Images.Refs)
 	}
 
 	// 迁移计划：端口、固定 IP、项目都在。
@@ -302,8 +304,8 @@ func TestOutBundleContents(t *testing.T) {
 	if left, _ := filepath.Glob(filepath.Join(home, "work", "*")); len(left) > 0 {
 		t.Errorf("工作目录没有清理：%v", left)
 	}
-	if imgs := try("docker", "images", "-q", "dockhop-snapshot"); imgs != "" {
-		t.Errorf("临时快照镜像没有删除：%s", imgs)
+	if imgs := try("docker", "images", "-q", "dockhop-image"); imgs != "" {
+		t.Errorf("临时镜像名没有删除：%s", imgs)
 	}
 	if h := try("docker", "ps", "-aq", "--filter", "label=dockhop.helper=1"); h != "" {
 		t.Errorf("临时容器没有删除：%s", h)

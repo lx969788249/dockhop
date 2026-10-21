@@ -64,7 +64,7 @@ type run struct {
 	restored  int
 	toRestore int
 	downtime  time.Duration
-	snapshots []string // 临时快照镜像
+	tempTags  []string // 为导出旧版本镜像临时加的名字
 	server    *transfer.Server
 	status    string // 新服务器报告的迁入结果
 	summary   []string
@@ -279,27 +279,40 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		r.testPause(ctx, "after-stop")
 	}
 
-	snapshotOf := map[*item]string{}
+	// 容器里没挂载出来的改动：只打包改动的文件，迁入时写进新建的容器。
+	oldImageOf := map[*item]string{}
+	changesOf := map[*item]*bundle.Changes{}
+	var packed int64
 	for i, it := range col.sel.items {
 		s.Count("检查容器里的改动", i+1, len(col.sel.items), it.name())
-		reason, err := snapshotReason(ctx, dc, it, r.opts.Snapshot)
+		moved, keep, deleted, err := layerState(ctx, dc, it, r.opts.Snapshot)
 		if err != nil {
 			return nil, 0, fail(s, "检查容器 "+it.name()+" 的改动失败", err.Error(), "")
 		}
-		if reason == "" {
+		if moved != "" {
+			// 镜像名已经指向别的版本：给容器实际用的旧版本临时起个名字，导出它。
+			tag := strings.ToLower(it.c.ID[:12])
+			if err := dc.TagImage(ctx, it.c.Image, "dockhop-image", tag); err != nil {
+				return nil, 0, fail(s, "容器 "+it.name()+" 的镜像没法导出", err.Error(), "")
+			}
+			r.tempTags = append(r.tempTags, "dockhop-image:"+tag)
+			oldImageOf[it] = "dockhop-image:" + tag
+			s.Detail("容器 %s 的%s，迁移它实际用的旧版本镜像", it.name(), moved)
+		}
+		if len(keep)+len(deleted) == 0 {
 			continue
 		}
-		tag := strings.ToLower(r.rid + "-" + it.c.ID[:12])
-		s.Detail("容器 %s 创建快照（%s）", it.name(), reason)
-		if _, err := dc.Commit(ctx, it.c.ID, "dockhop-snapshot", tag, false); err != nil {
-			return nil, 0, fail(s, "容器 "+it.name()+" 的快照失败", err.Error(), "")
+		s.Detail("容器 %s 里有没挂载出来的改动：%d 处新增或修改、%d 处删除，一起迁移", it.name(), len(keep), len(deleted))
+		rc := changesStream(ctx, dc, it.c.ID, keep)
+		parts, n, err := r.addStream(w, "changes/"+it.name(), "容器 "+it.name()+" 里的改动", rc, 0)
+		rc.Close()
+		if err != nil {
+			return nil, 0, fail(s, "打包容器 "+it.name()+" 里的改动失败", err.Error(), "")
 		}
-		ref := "dockhop-snapshot:" + tag
-		r.snapshots = append(r.snapshots, ref)
-		snapshotOf[it] = ref
+		packed += n
+		changesOf[it] = &bundle.Changes{Paths: keep, Deleted: deleted, Bytes: n, Parts: parts}
 	}
 
-	var packed int64
 	for i, v := range col.volumes {
 		rc, err := openVolume(ctx, dc, v, fmt.Sprintf("dockhop-helper-%s-%d", r.rid, i+1))
 		if err != nil {
@@ -314,7 +327,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		m.Volumes = append(m.Volumes, bundle.Volume{Name: v.name, Driver: v.driver, Anonymous: v.anonymous, Bytes: n, Parts: parts})
 	}
 	for _, b := range col.binds {
-		rc := hostTar{ctx: ctx, roots: []string{b.path}, base: "/", logf: r.Log.Printf}.stream()
+		rc := hostTar{ctx: ctx, roots: []string{b.path}, base: "/", excludes: r.ownDirs(b.path), logf: r.Log.Printf}.stream()
 		parts, n, err := r.addStream(w, "binds/"+b.id, "目录 "+b.path, rc, b.bytes)
 		rc.Close()
 		if err != nil {
@@ -324,13 +337,14 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		m.Binds = append(m.Binds, bundle.Bind{ID: b.id, Path: b.path, Link: b.link, Dir: b.dir, Bytes: b.bytes, Parts: parts})
 	}
 	for _, p := range col.projects {
-		mp := bundle.Project{Name: p.u.project, WorkingDir: p.u.workingDir, ConfigFiles: p.u.files,
+		mp := bundle.Project{Name: p.u.project, WorkingDir: p.u.workingDir, ConfigFiles: p.u.files, ConfigArgs: p.u.fileArgs,
 			Outside: p.outside, Skipped: p.skipped, ConfigDrift: p.drift}
 		for _, it := range p.u.items {
 			mp.Services = append(mp.Services, it.c.Config.Labels[labelService])
 		}
 		if !p.inBind {
-			rc := hostTar{ctx: ctx, roots: []string{p.u.workingDir}, base: p.u.workingDir, excludes: p.excludes, bigLimit: bigFileLimit, logf: r.Log.Printf}.stream()
+			excludes := append(append([]string(nil), p.excludes...), r.ownDirs(p.u.workingDir)...)
+			rc := hostTar{ctx: ctx, roots: []string{p.u.workingDir}, base: p.u.workingDir, excludes: excludes, bigLimit: bigFileLimit, logf: r.Log.Printf}.stream()
 			parts, n, err := r.addStream(w, "compose/"+p.u.project+"/dir", "Compose 项目 "+p.u.project, rc, p.dirBytes)
 			rc.Close()
 			if err != nil {
@@ -373,16 +387,12 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	refSet := map[string]string{}
 	for _, it := range col.sel.items {
 		ref := it.c.Config.Image
-		id := it.c.Image
-		if snap := snapshotOf[it]; snap != "" {
-			ref = snap
-			if img, err := dc.InspectImage(ctx, snap); err == nil {
-				id = img.ID
-			}
+		if old := oldImageOf[it]; old != "" {
+			ref = old
 		}
-		refSet[ref] = id
+		refSet[ref] = it.c.Image
 		m.Containers = append(m.Containers, bundle.Container{Name: it.name(), ID: it.c.ID, Image: it.c.Config.Image, ImageID: it.c.Image,
-			SnapshotImage: snapshotOf[it], Project: projectOf(col, it), Service: it.c.Config.Labels[labelService],
+			OldImage: oldImageOf[it], Changes: changesOf[it], Project: projectOf(col, it), Service: it.c.Config.Labels[labelService],
 			State: stateName(it.c.State.Status, it.c.State.Paused)})
 	}
 	refs := make([]string, 0, len(refSet))
@@ -401,10 +411,14 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		return nil, 0, fail(s, "导出镜像失败", err.Error(), "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
 	}
 	m.Images.Bytes, m.Images.Parts = n, parts
-	r.removeSnapshots()
+	r.removeTempTags()
 	s.End(fmt.Sprintf("%d 个镜像 · %s", len(refs), ui.HumanBytes(n)))
 
 	s.Begin(6, 7, "生成迁移包")
+	// 包里也放一份迁移计划：用 --file 迁入时没有下载服务，靠它做迁入前检查。
+	if err := w.AddJSON("plan.json", buildPlan(m, col, 0)); err != nil {
+		return nil, 0, fail(s, "写入迁移包失败", err.Error(), "")
+	}
 	if err := w.AddJSON("manifest.json", m); err != nil {
 		return nil, 0, fail(s, "写入迁移包失败", err.Error(), "")
 	}
@@ -421,6 +435,18 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	r.summary = append(r.summary, fmt.Sprintf("迁移包：%d 个容器 · %d 个卷 · %d 个目录 · %d 个镜像 · %s",
 		len(m.Containers), len(m.Volumes), len(m.Binds), len(refs), ui.HumanBytes(st.Size())))
 	return m, st.Size(), nil
+}
+
+// ownDirs 是 root 里面属于 DockHop 自己的目录（日志、工作目录、正在写的迁移包），
+// 打包挂载目录或项目目录时跳过，例如项目目录就是 /root、DockHop 的目录是 /root/.dockhop。
+func (r *run) ownDirs(root string) []string {
+	var out []string
+	for _, d := range []string{r.Home, filepath.Dir(r.workdir)} {
+		if d != "" && (d == root || strings.HasPrefix(d, root+"/")) {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // addStream 把一条数据流写进迁移包，同时显示进度。
@@ -555,7 +581,7 @@ func (r *run) cleanup() {
 		}
 		r.stopped = nil
 	}
-	r.removeSnapshots()
+	r.removeTempTags()
 	removeHelpers(ctx, r.Docker)
 	if r.workdir != "" {
 		if err := os.RemoveAll(r.workdir); err != nil {
@@ -564,15 +590,16 @@ func (r *run) cleanup() {
 	}
 }
 
-func (r *run) removeSnapshots() {
+// removeTempTags 删掉为导出旧版本镜像临时加的名字（只删名字，镜像本身还在用）。
+func (r *run) removeTempTags() {
 	ctx := context.Background()
 	var left []string
-	for _, ref := range r.snapshots {
+	for _, ref := range r.tempTags {
 		if err := r.Docker.RemoveImage(ctx, ref); err != nil && !docker.IsNotFound(err) {
 			left = append(left, ref)
 		}
 	}
-	r.snapshots = left
+	r.tempTags = left
 }
 
 // report 打印结果摘要。

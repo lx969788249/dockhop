@@ -26,7 +26,7 @@ type InOptions struct {
 	Link          string
 	File          string
 	Yes           bool
-	Existing      string // replace、skip、fail
+	Existing      string // replace、skip、fail；空表示询问
 	SkipCheck     bool
 	HealthTimeout time.Duration
 	KeepFiles     bool
@@ -136,11 +136,11 @@ func parseOut(args []string) (OutOptions, error) {
 const defaultHealthTimeout = 60 * time.Second
 
 func parseIn(args []string, needLink bool) (InOptions, error) {
-	o := InOptions{Existing: "replace", HealthTimeout: defaultHealthTimeout}
+	o := InOptions{HealthTimeout: defaultHealthTimeout}
 	fs := flag.NewFlagSet("in", flag.ContinueOnError)
 	fs.StringVar(&o.File, "file", "", "")
 	fs.BoolVar(&o.Yes, "yes", false, "")
-	fs.StringVar(&o.Existing, "existing", "replace", "")
+	fs.StringVar(&o.Existing, "existing", "", "")
 	fs.BoolVar(&o.SkipCheck, "skip-check", false, "")
 	seconds := fs.Int("health-timeout", 60, "")
 	fs.BoolVar(&o.KeepFiles, "keep-files", false, "")
@@ -159,7 +159,7 @@ func parseIn(args []string, needLink bool) (InOptions, error) {
 		return o, usageErr("只需要一个迁移链接，多出来的是：%s。链接里有特殊字符，记得用单引号括起来", strings.Join(rest[1:], " "))
 	}
 	switch o.Existing {
-	case "replace", "skip", "fail":
+	case "", "replace", "skip", "fail":
 	default:
 		return o, usageErr("--existing 只能是 replace、skip 或 fail，不能是 %s", o.Existing)
 	}

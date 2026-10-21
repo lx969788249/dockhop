@@ -50,8 +50,10 @@ type Container struct {
 		Devices []struct {
 			PathOnHost string `json:"PathOnHost"`
 		} `json:"Devices"`
-		Memory       int64                    `json:"Memory"`
-		PortBindings map[string][]PortBinding `json:"PortBindings"`
+		Memory         int64                    `json:"Memory"`
+		PortBindings   map[string][]PortBinding `json:"PortBindings"`
+		Tmpfs          map[string]string        `json:"Tmpfs"`
+		ReadonlyRootfs bool                     `json:"ReadonlyRootfs"`
 	} `json:"HostConfig"`
 	Mounts          []Mount `json:"Mounts"`
 	NetworkSettings struct {
@@ -142,6 +144,12 @@ func (c *Client) RemoveContainer(ctx context.Context, id string, force bool) err
 	return c.Delete(ctx, "/containers/"+url.PathEscape(id), q)
 }
 
+// RemoveContainerAndVolumes 删除容器（连同运行中的），以及 Docker 为它自动创建的
+// 匿名卷；用户指定名字挂载的卷不会被删。
+func (c *Client) RemoveContainerAndVolumes(ctx context.Context, id string) error {
+	return c.Delete(ctx, "/containers/"+url.PathEscape(id), url.Values{"force": {"1"}, "v": {"1"}})
+}
+
 // Change 是容器可写层里的一处改动。Kind：0 修改，1 新增，2 删除。
 type Change struct {
 	Path string `json:"Path"`
@@ -168,6 +176,18 @@ func (c *Client) Commit(ctx context.Context, id, repo, tag string, pause bool) (
 	return out.ID, err
 }
 
+// CommitWithConfig 把容器存成镜像，cfg 里给出的字段（如 Entrypoint、Cmd、User）覆盖
+// 容器自己的配置；没给出的沿用容器的。返回镜像 ID。注意要清空入口命令时得给空列表 []，
+// 给 null 等于没给。
+func (c *Client) CommitWithConfig(ctx context.Context, id, repo, tag string, cfg map[string]any) (string, error) {
+	q := url.Values{"container": {id}, "repo": {repo}, "tag": {tag}, "pause": {"0"}}
+	var out struct {
+		ID string `json:"Id"`
+	}
+	err := c.Post(ctx, "/commit", q, cfg, &out)
+	return out.ID, err
+}
+
 // CreateContainer 用原始配置创建容器，返回容器 ID。
 func (c *Client) CreateContainer(ctx context.Context, name string, spec any) (string, error) {
 	q := url.Values{}
@@ -186,10 +206,11 @@ func (c *Client) GetArchive(ctx context.Context, id, path string) (io.ReadCloser
 	return c.Stream(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/archive", url.Values{"path": {path}}, nil, "")
 }
 
-// PutArchive 把 tar 流解到容器里的 path 下，保留文件的属主。
+// PutArchive 把 tar 流解到容器里的 path 下，保留 tar 里记录的属主和权限。
+// 注意不能加 copyUIDGID：它的意思是把所有文件改成容器用户的属主，正好相反。
 func (c *Client) PutArchive(ctx context.Context, id, path string, r io.Reader) error {
 	rc, err := c.Stream(ctx, http.MethodPut, "/containers/"+url.PathEscape(id)+"/archive",
-		url.Values{"path": {path}, "copyUIDGID": {"true"}, "noOverwriteDirNonDir": {"true"}}, r, "application/x-tar")
+		url.Values{"path": {path}, "noOverwriteDirNonDir": {"true"}}, r, "application/x-tar")
 	if err != nil {
 		return err
 	}

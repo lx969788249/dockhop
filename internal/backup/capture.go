@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -110,32 +111,90 @@ func stopOne(ctx context.Context, dc *docker.Client, c StoppedContainer) error {
 	return nil
 }
 
-// snapshotReason 说明容器为什么需要快照；不需要时返回空。默认只在可写层确实有
-// 改动、或原镜像标签已经指向别的版本时快照，其他容器保留原镜像名，以后照常升级。
-func snapshotReason(ctx context.Context, dc *docker.Client, it *item, mode string) (string, error) {
+// layerState 检查容器的镜像和可写层：moved 说明原来的镜像名为什么不能用（已经指向
+// 别的版本或已删除）；keep、deleted 是要迁移的新增或修改的路径、删除的路径。
+// --snapshot never 时不迁移改动，always 时运行时目录里的改动也迁移。
+func layerState(ctx context.Context, dc *docker.Client, it *item, mode string) (moved string, keep, deleted []string, err error) {
 	img, err := dc.InspectImage(ctx, it.c.Config.Image)
 	switch {
 	case err != nil && docker.IsNotFound(err):
-		return "原镜像标签已经不存在", nil
+		moved = "镜像名 " + it.c.Config.Image + " 已经不存在"
 	case err != nil:
-		return "", err
+		return "", nil, nil, err
 	case img.ID != it.c.Image:
-		return "原镜像标签已经指向别的版本", nil
+		moved = "镜像名 " + it.c.Config.Image + " 已经指向别的版本"
 	}
-	switch mode {
-	case "always":
-		return "按 --snapshot always", nil
-	case "never":
-		return "", nil
+	if mode == "never" || it.c.HostConfig.ReadonlyRootfs {
+		return moved, nil, nil, nil // 只读的容器里不会有改动
 	}
 	changes, err := dc.ContainerChanges(ctx, it.c.ID)
 	if err != nil {
-		return "", err
+		return "", nil, nil, err
 	}
-	if spec.WritableChanged(changes) {
-		return "容器里有没挂载出来的改动", nil
+	var mounts []string
+	for _, m := range it.c.Mounts {
+		mounts = append(mounts, m.Destination)
 	}
-	return "", nil
+	for dest := range it.c.HostConfig.Tmpfs {
+		mounts = append(mounts, dest) // --tmpfs 不在 Mounts 里
+	}
+	keep, deleted = spec.LayerChanges(changes, mounts)
+	if mode == "always" {
+		keep, deleted = spec.AllLayerChanges(changes, mounts)
+	}
+	return moved, keep, deleted, nil
+}
+
+// changesStream 把容器里改动过的路径打成一个 tar（路径相对于根目录），通过 Docker
+// 接口读取，容器停着也能读。
+func changesStream(ctx context.Context, dc *docker.Client, id string, paths []string) io.ReadCloser {
+	pr, pw := io.Pipe()
+	go func() {
+		tw := tar.NewWriter(pw)
+		err := func() error {
+			for _, p := range paths {
+				rc, err := dc.GetArchive(ctx, id, p)
+				if err != nil {
+					if docker.IsNotFound(err) {
+						continue // 打包时文件已经没了
+					}
+					return fmt.Errorf("读取容器里的 %s 失败：%v", p, err)
+				}
+				// 接口返回的路径相对于 p 的上级目录，改成相对于根目录。
+				prefix := strings.TrimPrefix(path.Dir(p), "/")
+				tr := tar.NewReader(rc)
+				for {
+					h, err := tr.Next()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						rc.Close()
+						return err
+					}
+					h.Name = path.Join(prefix, h.Name)
+					if h.Typeflag == tar.TypeDir {
+						h.Name += "/"
+					}
+					if h.Typeflag == tar.TypeLink {
+						h.Linkname = path.Join(prefix, h.Linkname)
+					}
+					if err := tw.WriteHeader(h); err != nil {
+						rc.Close()
+						return err
+					}
+					if _, err := io.Copy(tw, tr); err != nil {
+						rc.Close()
+						return err
+					}
+				}
+				rc.Close()
+			}
+			return tw.Close()
+		}()
+		pw.CloseWithError(err)
+	}()
+	return pr
 }
 
 // openVolume 读出卷里的全部内容（tar 流，路径以 dockhop-data/ 开头）。用迁移涉及的
@@ -157,10 +216,10 @@ func openVolume(ctx context.Context, dc *docker.Client, v *volumeInfo, name stri
 	}
 	rc, err := dc.GetArchive(ctx, id, "/dockhop-data")
 	if err != nil {
-		_ = dc.RemoveContainer(context.WithoutCancel(ctx), id, true)
+		_ = dc.RemoveContainerAndVolumes(context.WithoutCancel(ctx), id)
 		return nil, fmt.Errorf("读取数据卷 %s 失败：%v", v.name, err)
 	}
-	return &cleanupReader{ReadCloser: rc, cleanup: func() { _ = dc.RemoveContainer(context.WithoutCancel(ctx), id, true) }}, nil
+	return &cleanupReader{ReadCloser: rc, cleanup: func() { _ = dc.RemoveContainerAndVolumes(context.WithoutCancel(ctx), id) }}, nil
 }
 
 type cleanupReader struct {
@@ -313,7 +372,7 @@ func removeHelpers(ctx context.Context, dc *docker.Client) {
 	}
 	for _, c := range list {
 		if c.Labels[helperLabel] == "1" {
-			_ = dc.RemoveContainer(ctx, c.ID, true)
+			_ = dc.RemoveContainerAndVolumes(ctx, c.ID)
 		}
 	}
 }

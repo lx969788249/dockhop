@@ -37,6 +37,7 @@ type unit struct {
 	project    string // 为空表示独立容器
 	workingDir string
 	files      []string // Compose 配置文件（绝对路径）
+	fileArgs   []string // 启动时 -f 的原样写法（老的 docker-compose 会把相对路径原样记在标签里）
 	items      []*item
 	panel      bool
 	note       string
@@ -97,7 +98,7 @@ func buildInventory(ctx context.Context, dc *docker.Client, screen *ui.Screen) (
 				key := proj + "|" + wdir
 				u := projects[key]
 				if u == nil {
-					u = &unit{project: proj, workingDir: wdir, files: files}
+					u = &unit{project: proj, workingDir: wdir, files: files, fileArgs: fileArgs(labels[labelConfigFiles], files)}
 					projects[key] = u
 					order = append(order, u)
 				}
@@ -150,12 +151,33 @@ func composeLocation(labels map[string]string) (string, []string, string) {
 	if st, err := os.Stat(wdir); err != nil || !st.IsDir() {
 		return "", nil, "项目目录 " + wdir + " 不在这台服务器上"
 	}
+	var kept []string
 	for _, f := range files {
 		if _, err := os.Stat(f); err != nil {
+			// 迁入时为快照镜像临时加的覆盖文件，用完就删了，不算缺失。
+			if strings.HasPrefix(filepath.Base(f), "dockhop-override-") {
+				continue
+			}
 			return "", nil, "配置文件 " + f + " 不在这台服务器上"
 		}
+		kept = append(kept, f)
 	}
-	return wdir, files, ""
+	return wdir, kept, ""
+}
+
+// fileArgs 是启动时 -f 的原样写法：去掉迁入时临时加的覆盖文件，其余和标签里一样。
+func fileArgs(label string, kept []string) []string {
+	keep := map[string]bool{}
+	for _, f := range kept {
+		keep[filepath.Base(f)] = true
+	}
+	var out []string
+	for _, f := range splitConfigFiles(label) {
+		if keep[filepath.Base(f)] {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // splitConfigFiles 拆分配置文件列表：Compose 用逗号连接多个 -f 文件；没有逗号时

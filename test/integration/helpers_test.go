@@ -35,6 +35,7 @@ func TestMain(m *testing.M) {
 		dir, _ := os.MkdirTemp("", "dockhop-bin")
 		bin = filepath.Join(dir, "dockhop")
 		cmd := exec.Command("go", "build", "-o", bin, "../../cmd/dockhop")
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0") // 静态编译：迁入时要在临时容器里运行它
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
 			fmt.Println("编译失败：", err)

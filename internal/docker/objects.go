@@ -24,6 +24,9 @@ type Info struct {
 	Swarm           struct {
 		LocalNodeState string `json:"LocalNodeState"`
 	} `json:"Swarm"`
+	Plugins struct {
+		Volume []string `json:"Volume"`
+	} `json:"Plugins"`
 }
 
 // Info 返回 Docker 的概况。

@@ -2,6 +2,7 @@ package spec
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/lx969788249/dockhop/internal/docker"
@@ -53,21 +54,27 @@ func TestDependencies(t *testing.T) {
 	}
 }
 
-func TestWritableChanged(t *testing.T) {
-	// 只有父目录因为子项变化被标记、以及运行时目录里的改动：不算改动。
+func TestLayerChanges(t *testing.T) {
+	// 只有父目录因为子项变化被标记、运行时目录、Docker 管理的文件、挂载点：不算改动。
 	quiet := []docker.Change{
 		{Path: "/var", Kind: 0}, {Path: "/var/run", Kind: 0}, {Path: "/var/run/nginx.pid", Kind: 1},
-		{Path: "/tmp/x", Kind: 1}, {Path: "/root/.cache/pip", Kind: 1},
+		{Path: "/tmp/x", Kind: 1}, {Path: "/root/.cache/pip", Kind: 1}, {Path: "/etc", Kind: 0}, {Path: "/etc/hosts", Kind: 0},
+		{Path: "/srv", Kind: 1}, {Path: "/srv/data", Kind: 1}, // 新版 Docker 为挂载 /srv/data 创建的目录
 	}
-	if WritableChanged(quiet) {
-		t.Error("只有运行时文件变化时不应算改动")
+	if WritableChanged(quiet, []string{"/srv/data"}) {
+		t.Error("只有运行时文件和挂载点时不应算改动")
 	}
-	real := append(quiet, docker.Change{Path: "/etc/app.conf", Kind: 0})
-	if !WritableChanged(real) {
-		t.Error("改了 /etc/app.conf 应算改动")
+	keep, deleted := LayerChanges(append(quiet,
+		docker.Change{Path: "/etc/app.conf", Kind: 0},
+		docker.Change{Path: "/opt/tool", Kind: 1}, docker.Change{Path: "/opt/tool/bin", Kind: 1}, docker.Change{Path: "/opt/tool/bin/x", Kind: 1},
+		docker.Change{Path: "/srv/notes.txt", Kind: 1},
+		docker.Change{Path: "/usr/share/doc", Kind: 2}, docker.Change{Path: "/usr/share/doc/a", Kind: 2},
+	), []string{"/srv/data"})
+	if strings.Join(keep, ",") != "/etc/app.conf,/opt/tool,/srv/notes.txt" {
+		t.Errorf("新增和修改：%v", keep)
 	}
-	if !WritableChanged([]docker.Change{{Path: "/usr/local/bin/tool", Kind: 1}}) {
-		t.Error("新增文件应算改动")
+	if strings.Join(deleted, ",") != "/usr/share/doc" {
+		t.Errorf("删除：%v", deleted)
 	}
 }
 

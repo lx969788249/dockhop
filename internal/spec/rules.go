@@ -5,6 +5,7 @@ package spec
 import (
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/lx969788249/dockhop/internal/docker"
@@ -89,28 +90,79 @@ func Dependencies(c *docker.Container) []string {
 	return deps
 }
 
-// 运行时临时目录里的改动不算可写层改动。
-var runtimeDir = regexp.MustCompile(`^/(tmp|var/tmp|run|var/run|var/cache|root/\.cache|dev|proc|sys)(/|$)`)
+// 运行时临时目录里的改动不算可写层改动；Docker 自己管理的几个文件也不算。
+var (
+	runtimeDir    = regexp.MustCompile(`^/(tmp|var/tmp|run|var/run|var/cache|root/\.cache|dev|proc|sys)(/|$)`)
+	dockerManaged = map[string]bool{"/etc/hosts": true, "/etc/hostname": true, "/etc/resolv.conf": true, "/.dockerenv": true,
+		"/sbin/docker-init": true} // --init 时 Docker 放进去的程序
+)
 
-// WritableChanged 表示可写层里有没有值得迁移的改动：只因为子项变化而被标记为
-// “修改”的父目录、运行时临时目录里的改动都不算。
-func WritableChanged(changes []docker.Change) bool {
+// LayerChanges 从 docker diff 的结果里找出值得迁移的改动：新增或修改的路径（只取最上层，
+// 新增的目录整个算一项）和删除的路径。这些不算：运行时临时目录、Docker 自己管理的文件、
+// 挂载点（新版 Docker 会把为挂载创建的空目录也算作新增）和它们的上级目录、只因为子项
+// 变化而被标记为“修改”的目录。
+func LayerChanges(changes []docker.Change, mounts []string) (keep, deleted []string) {
+	return layerChanges(changes, mounts, false)
+}
+
+// AllLayerChanges 和 LayerChanges 一样，只是运行时临时目录里的改动也算（--snapshot always）。
+func AllLayerChanges(changes []docker.Change, mounts []string) (keep, deleted []string) {
+	return layerChanges(changes, mounts, true)
+}
+
+func layerChanges(changes []docker.Change, mounts []string, withRuntime bool) (keep, deleted []string) {
 	parents := map[string]bool{}
 	for _, c := range changes {
 		for p := path.Dir(c.Path); p != "/" && p != "."; p = path.Dir(p) {
 			parents[p] = true
 		}
 	}
-	for _, c := range changes {
-		if c.Kind == 0 && parents[c.Path] {
-			continue
+	mountDirs := map[string]bool{}
+	for _, m := range mounts {
+		for p := path.Clean(m); p != "/" && p != "."; p = path.Dir(p) {
+			mountDirs[p] = true
 		}
-		if runtimeDir.MatchString(c.Path) {
-			continue
-		}
-		return true
 	}
-	return false
+	var adds, dels []string
+	for _, c := range changes {
+		p := path.Clean(c.Path)
+		if (!withRuntime && runtimeDir.MatchString(p)) || dockerManaged[p] || mountDirs[p] || p == "/dev" || strings.HasPrefix(p, "/dev/") || strings.HasPrefix(p, "/proc") || strings.HasPrefix(p, "/sys") {
+			continue
+		}
+		switch c.Kind {
+		case 2:
+			dels = append(dels, p)
+		case 0:
+			if !parents[p] {
+				adds = append(adds, p)
+			}
+		default:
+			adds = append(adds, p)
+		}
+	}
+	return topmost(adds), topmost(dels)
+}
+
+// topmost 去掉已经被上级路径包含的路径。
+func topmost(paths []string) []string {
+	sort.Strings(paths)
+	var out []string
+	for _, p := range paths {
+		if len(out) > 0 {
+			last := out[len(out)-1]
+			if p == last || strings.HasPrefix(p, last+"/") {
+				continue
+			}
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// WritableChanged 表示可写层里有没有值得迁移的改动。
+func WritableChanged(changes []docker.Change, mounts []string) bool {
+	keep, deleted := LayerChanges(changes, mounts)
+	return len(keep)+len(deleted) > 0
 }
 
 // 名字像密码、密钥、令牌的环境变量，它们的值要在日志里隐藏。

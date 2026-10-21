@@ -10,9 +10,11 @@
 //	networks/<名字>.json       自定义网络的完整配置
 //	volumes/<名字>.json        数据卷的完整配置；volumes/<名字>/part-*  卷里的数据（tar）
 //	binds/<编号>/part-*        宿主机目录或文件（tar，路径相对于根目录）
+//	changes/<容器名>/part-*     容器里没挂载出来的改动（tar，路径相对于根目录）
 //	compose/<项目>/dir/part-*      Compose 项目目录（tar，路径相对于项目目录）
 //	compose/<项目>/outside/part-*  项目目录以外被引用的文件（tar，路径相对于根目录）
 //	images/part-*              镜像（docker save 的输出）
+//	plan.json                  迁移计划（和下载服务提供的那份相同，只是没有迁移包大小）
 //	manifest.json              清单，最后写入
 package bundle
 
@@ -57,21 +59,35 @@ type Source struct {
 
 // Container 是迁移的一个容器。
 type Container struct {
-	Name          string `json:"name"`
-	ID            string `json:"id"`
-	Image         string `json:"image"`    // 创建时用的镜像名
-	ImageID       string `json:"image_id"` // 镜像 ID
-	SnapshotImage string `json:"snapshot_image,omitempty"`
-	Project       string `json:"project,omitempty"`
-	Service       string `json:"service,omitempty"`
-	State         string `json:"state"` // running、paused、exited、created……
+	Name    string `json:"name"`
+	ID      string `json:"id"`
+	Image   string `json:"image"`    // 创建时用的镜像名
+	ImageID string `json:"image_id"` // 镜像 ID
+	// OldImage：旧服务器上镜像名已经指向别的版本（或已删除）时，容器实际用的旧版本镜像
+	// 临时起的名字（dockhop-image:<ID 前 12 位>），迁入时用它创建容器。
+	OldImage string   `json:"old_image,omitempty"`
+	Changes  *Changes `json:"changes,omitempty"`
+	Project  string   `json:"project,omitempty"`
+	Service  string   `json:"service,omitempty"`
+	State    string   `json:"state"` // running、paused、exited、created……
+}
+
+// Changes 是容器里没挂载出来的改动（docker diff）：新增和修改的文件在 changes/<容器名> 下，
+// 删除的路径列在 Deleted 里。不用 docker commit 加 docker save：新版 Docker（containerd
+// 存储）导出 commit 出来的镜像时只有清单，没有内容（第 3 阶段实测 Docker 29.2）。
+type Changes struct {
+	Paths   []string `json:"paths"`
+	Deleted []string `json:"deleted,omitempty"`
+	Bytes   int64    `json:"bytes"`
+	Parts   int      `json:"parts"`
 }
 
 // Project 是迁移的一个 Compose 项目，整组迁移。
 type Project struct {
 	Name        string   `json:"name"`
 	WorkingDir  string   `json:"working_dir"`
-	ConfigFiles []string `json:"config_files"`
+	ConfigFiles []string `json:"config_files"`          // 绝对路径
+	ConfigArgs  []string `json:"config_args,omitempty"` // 启动时 -f 的原样写法（可能是相对于项目目录的路径）
 	Services    []string `json:"services"`
 	Outside     []string `json:"outside,omitempty"`      // 项目目录以外一起迁移的文件
 	Skipped     []string `json:"skipped,omitempty"`      // 太大没有迁移的文件
