@@ -23,13 +23,24 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      # 只用 include 列出每个任务：同一个应用的不同 Docker 版本组合才不会被合并成一个任务。
       matrix:
-        app: [wordpress, nextcloud, gitea, vaultwarden, uptime-kuma, halo, memos, tricky, unreachable, digest]
         include:
+          - { app: wordpress }
+          - { app: nextcloud }
+          - { app: gitea }
+          - { app: vaultwarden }
+          - { app: uptime-kuma }
+          - { app: halo }
+          - { app: memos }
+          - { app: tricky }
+          - { app: unreachable }
+          - { app: digest }
           # 不同 Docker 版本之间迁移：老版本 → 新版本、新版本 → 老版本。
           - { app: tricky, old: "20.10", new: "27.5" }
           - { app: tricky, old: "27.5", new: "20.10" }
           - { app: wordpress, old: "20.10", new: "27.5" }
+          - { app: memos, old: "27.5", new: "20.10" }
     name: ${{ matrix.app }}${{ matrix.old && format(' ({0} → {1})', matrix.old, matrix.new) || '' }}
     steps:
       - uses: actions/checkout@v5

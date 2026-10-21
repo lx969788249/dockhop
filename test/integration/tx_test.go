@@ -210,6 +210,13 @@ func TestInSafetyStops(t *testing.T) {
 	if exists("container", f.web) {
 		t.Error("停下时不应创建任何容器")
 	}
+	// 经过软链接的上级目录指进挂载目录，也算重叠。
+	via := filepath.Join(t.TempDir(), "via")
+	os.Symlink(f.dir, via)
+	out, code = m.in(t, filepath.Join(via, "home"), nil)
+	if code == 0 || !strings.Contains(out, "重叠") {
+		t.Fatalf("经过软链接指进挂载目录时也应停下：%d", code)
+	}
 
 	// 附录 C-13：同名卷存储方式不同，在清空之前就停下（--yes 也不能自动处理）。
 	sh(t, "docker", "volume", "rm", f.vol)
