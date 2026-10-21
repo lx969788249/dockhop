@@ -432,7 +432,7 @@ http://203.0.113.7:8080/k3Jx9QmP2vLa/#a7j8zg6qtzkg8ddwxnzl94th3c4ns7ckdzjxu0w0fy
 | 1 | 骨架：子命令和选项、界面输出、日志、Docker 客户端、加密和链接、诊断、`run.sh`、自动发布 | ✅ 已完成：`dockhop --help` / `version` / `diagnose` 可用；界面输出有快照测试；加密、链接、Docker 客户端、日志脱敏都有测试；在 Docker 20.10 和 29.2 两台服务器上实测通过；程序约 6.5MB | 1 天 |
 | 2 | **备份端和迁移包格式**：选择容器、Compose 整体迁移、停机快照、打包、下载服务、进度、中断记录 | ✅ 已完成：在 CI 和两台服务器（Docker 20.10 + 老 docker-compose 1.29、Docker 29.2 + Compose v5）上通过验收测试：迁移包内容逐项核对（容器原始配置、卷的属主权限软链接、匿名卷、挂载目录和软链接目录、Compose 项目目录和目录外的 env_file、镜像和快照）、停机期间被强制结束后下次运行恢复容器、磁盘不够时在停机前停下 | 1.5–2 天 |
 | 3 | **恢复端**：预检、下载（断点续传）、事务、容器重建、Compose、完成通知、中断补救 | ✅ 已完成：`test/apps` 8 个应用 + 断网 + digest 镜像（连不上 / 连得上镜像仓库）在 CI 通过，另有 4 个不同 Docker 版本之间的组合（20.10 ↔ 27.5，两个方向）；保真测试对 12 个容器逐字段全量比较，在 CI 和两台服务器（Docker 20.10 + docker-compose 1.29、Docker 29.2 + Compose v5）上通过；附录 C 的 18 个场景，以及 Ctrl+C、kill -9 后下次运行还原，全部通过；迁移后在原目录 `docker compose up` 不重建任何容器。实测发现的 Docker 行为差异见 2.2 | 2–2.5 天 |
-| 4 | 发布：DockHop 仓库公开，发布 1.0.0；docker_migrate 的 README 顶部指向 DockHop | 两台真服务器实测一次完整迁移（你协助） | 半天 |
+| 4 | 发布：DockHop 仓库公开，发布 1.0.0；docker_migrate 的 README 顶部指向 DockHop | ✅ 两台真服务器上迁移了 3 个真实服务（结果见 2.3），发布 1.0.0。按你的决定：仓库暂不公开（一行命令要等公开后才能用），docker_migrate 暂不改动 | 半天 |
 | 5 | 约一个月后归档 docker_migrate 仓库 | 你确认后执行 | — |
 
 合计实际工作约 5–7 天。

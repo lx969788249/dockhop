@@ -2,7 +2,9 @@
 
 一条链接，把 Docker 服务连同数据从旧服务器迁到新服务器。
 
-DockHop 是 [docker_migrate](https://github.com/lx969788249/docker_migrate) 的 Go 重写版，**还没有发布正式版本**。迁出和迁入都已完成并通过验收，正在准备发布 1.0.0；在那之前需要迁移请先用 docker_migrate。
+DockHop 是 [docker_migrate](https://github.com/lx969788249/docker_migrate) 的 Go 重写版，当前版本 1.0.0。
+
+> 仓库目前不公开：下面的一行命令要从 GitHub 下载程序，仓库公开之后才能用。在那之前，从 Releases 页面下载对应架构的 `dockhop-linux-*`，核对 `SHA256SUMS` 后拷到服务器上，用 `./dockhop` 代替一行命令运行，用法完全一样。
 
 ## 怎么用
 
@@ -70,7 +72,7 @@ DockHop 是 [docker_migrate](https://github.com/lx969788249/docker_migrate) 的 
 | 1 | 程序骨架：命令和选项、屏幕输出、日志、Docker 客户端、加密和链接、诊断、`run.sh`、自动发布 | ✅ |
 | 2 | 迁出和迁移包格式 | ✅ |
 | 3 | 迁入 | ✅ |
-| 4 | 发布 1.0.0 | 下一步 |
+| 4 | 发布 1.0.0 | ✅（仓库暂不公开） |
 
 ### 本地开发
 
