@@ -205,3 +205,13 @@ func TestPrompter(t *testing.T) {
 		t.Fatalf("不能交互时应返回 ErrNotInteractive：%v", err)
 	}
 }
+
+func TestBanner(t *testing.T) {
+	if got := Banner("1.0.1", false); got != "DockHop 1.0.1\n" {
+		t.Errorf("不是终端时只写一行：%q", got)
+	}
+	got := Banner("1.0.1", true)
+	if !strings.Contains(got, "|____/") || !strings.Contains(got, "DockHop 1.0.1") || !strings.Contains(got, Tagline) {
+		t.Errorf("终端里应显示 logo、版本和一句话介绍：%q", got)
+	}
+}

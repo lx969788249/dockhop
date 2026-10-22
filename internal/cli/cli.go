@@ -161,23 +161,27 @@ func dispatch(cmd string, args []string, env *Env, screen *ui.Screen) error {
 		if err != nil {
 			return err
 		}
+		banner(env)
 		return runOut(env, screen, opts)
 	case "in":
 		opts, err := parseIn(args, false)
 		if err != nil {
 			return err
 		}
+		banner(env)
 		return runIn(env, screen, opts, false)
 	case "check":
 		opts, err := parseIn(args, true)
 		if err != nil {
 			return err
 		}
+		banner(env)
 		return runIn(env, screen, opts, true)
 	case "diagnose":
 		if len(args) > 0 {
 			return usageErr("diagnose 不需要参数")
 		}
+		banner(env)
 		return runDiagnose(env, screen)
 	default:
 		if strings.HasPrefix(cmd, "-") {
@@ -187,13 +191,16 @@ func dispatch(cmd string, args []string, env *Env, screen *ui.Screen) error {
 	}
 }
 
+// banner 在开始一项任务前显示程序的名字和版本。
+func banner(env *Env) { fmt.Fprint(env.Stderr, ui.Banner(env.Version, env.TTY)) }
+
 func menu(env *Env, screen *ui.Screen) error {
 	p := ui.NewPrompter(env.Input, env.Stderr)
 	if !p.Interactive() {
 		fmt.Fprint(env.Stdout, helpText)
 		return usageErr("没有可以输入的终端，请直接写明命令，例如 dockhop out 或 dockhop in '链接'")
 	}
-	screen.Println("DockHop " + env.Version + "：一条链接，把 Docker 服务连同数据迁到新服务器。\n")
+	banner(env)
 	choice, err := p.Choose([]string{
 		"迁出：打包这台服务器上的服务，生成迁移链接（在旧服务器上运行）",
 		"迁入：将服务迁到这台服务器（在新服务器上运行）",
