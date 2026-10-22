@@ -126,7 +126,7 @@ func TestInLinkMessages(t *testing.T) {
 func TestMenu(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
 	r := runCLI(t, "1\n", nil)
-	if !strings.Contains(r.stderr, "迁出：打包这台服务器上的服务") || !strings.Contains(r.stderr, "迁入：将服务迁到这台服务器（在新服务器上运行）") {
+	if !strings.Contains(r.stderr, "1) 迁出\n") || !strings.Contains(r.stderr, "2) 迁入\n") || !strings.Contains(r.stderr, "3) 收集诊断信息\n") {
 		t.Fatalf("菜单文字不对：%q", r.stderr)
 	}
 	if r.code != ExitFailed || !strings.Contains(r.stderr, "连不上 Docker") || !strings.Contains(r.stderr, "systemctl start docker") {

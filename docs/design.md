@@ -195,8 +195,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/dockhop/main/run
 ```
 
 ```
-1) 迁出：打包这台服务器上的服务，生成迁移链接（在旧服务器上运行）
-2) 迁入：将服务迁到这台服务器（在新服务器上运行）
+1) 迁出
+2) 迁入
 3) 收集诊断信息
 ```
 

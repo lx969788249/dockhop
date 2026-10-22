@@ -202,8 +202,8 @@ func menu(env *Env, screen *ui.Screen) error {
 	}
 	banner(env)
 	choice, err := p.Choose([]string{
-		"迁出：打包这台服务器上的服务，生成迁移链接（在旧服务器上运行）",
-		"迁入：将服务迁到这台服务器（在新服务器上运行）",
+		"迁出",
+		"迁入",
 		"收集诊断信息",
 	}, 1)
 	if err != nil {
