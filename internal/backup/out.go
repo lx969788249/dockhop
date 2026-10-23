@@ -542,8 +542,11 @@ func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bund
 				s.Println("新服务器已迁入成功，自动结束传输。")
 				return nil
 			}
-			r.status = "failed"
+			r.status = st.Result
 			msg := "新服务器迁入失败"
+			if st.Result == "partial" {
+				msg = "新服务器只迁入了一部分"
+			}
 			if st.Message != "" {
 				msg += "：" + st.Message
 			}
@@ -633,6 +636,8 @@ func (r *run) report(ctx context.Context, err error) error {
 	switch r.status {
 	case "success":
 		lines = append(lines, "新服务器：迁入成功")
+	case "partial":
+		lines = append(lines, "新服务器：只迁入了一部分（详情见新服务器上的结果）")
 	case "failed":
 		lines = append(lines, "新服务器：迁入失败（详情见新服务器上的结果）")
 	}

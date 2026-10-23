@@ -22,7 +22,7 @@ import (
 
 // Status 是新服务器迁入结束后发给旧服务器的结果。
 type Status struct {
-	Result  string `json:"result"` // success 或 failed
+	Result  string `json:"result"` // success、partial（只迁入了一部分）或 failed
 	Message string `json:"message,omitempty"`
 }
 
@@ -208,7 +208,7 @@ func (s *Server) receiveStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var st Status
-	if err := json.Unmarshal(body, &st); err != nil || (st.Result != "success" && st.Result != "failed") {
+	if err := json.Unmarshal(body, &st); err != nil || (st.Result != "success" && st.Result != "partial" && st.Result != "failed") {
 		http.Error(w, "", http.StatusBadRequest)
 		return
 	}

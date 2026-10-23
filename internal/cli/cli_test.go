@@ -95,8 +95,8 @@ func TestParseOptions(t *testing.T) {
 		t.Fatalf("parseOut：%+v %v", o, err)
 	}
 	// 选项和链接可以前后穿插。
-	i, err := parseIn([]string{"--yes", "LINK", "--existing", "skip", "--health-timeout", "120", "--keep-files"}, false)
-	if err != nil || i.Link != "LINK" || !i.Yes || i.Existing != "skip" || i.HealthTimeout != 120*time.Second || !i.KeepFiles {
+	i, err := parseIn([]string{"--yes", "LINK", "--existing", "skip", "--health-timeout", "120", "--keep-files", "--keep-succeeded"}, false)
+	if err != nil || i.Link != "LINK" || !i.Yes || i.Existing != "skip" || i.HealthTimeout != 120*time.Second || !i.KeepFiles || !i.KeepSucceeded {
 		t.Fatalf("parseIn：%+v %v", i, err)
 	}
 	d, _ := parseIn(nil, false)

@@ -226,7 +226,7 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 		if i.Kind == "existing_project" {
 			what, keep = "项目", "保留已有的，跳过这个项目"
 		}
-		c, err := choose("替换它（推荐，迁入失败时会自动还原）", keep, "取消迁入")
+		c, err := choose("替换它（推荐，迁入失败时会放回原来的）", keep, "取消迁入")
 		if err != nil {
 			return err
 		}

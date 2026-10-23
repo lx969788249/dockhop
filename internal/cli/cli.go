@@ -94,10 +94,11 @@ const helpText = `DockHop：一条链接，把 Docker 服务连同数据从旧�
 迁入选项：
   --file 迁移包        用别的方式（scp、网盘等）带过来的迁移包，不再下载
   --yes                不能提问时，预检发现的问题自动采用推荐做法
-  --existing 方式      已有同名服务时：replace 替换（失败时自动还原）、skip 跳过、fail 停止；不写时会询问
+  --existing 方式      已有同名服务时：replace 替换（失败时放回原来的）、skip 跳过、fail 停止；不写时会询问
   --skip-check         跳过迁移前预检
   --health-timeout 秒  健康检查至少等待的秒数（默认 60，会按容器自己的检查间隔自动加长）
   --keep-files         迁入成功后保留下载和解压的文件
+  --keep-succeeded     有服务没能启动时，不提问，保留已经正常运行的（默认全部删除）
 
 通用选项：
   -v, --verbose        在屏幕上显示每一步的细节
@@ -295,6 +296,7 @@ func runIn(env *Env, screen *ui.Screen, opts InOptions, checkOnly bool) error {
 	}, restore.Options{
 		Link: link, File: opts.File, Yes: opts.Yes, Existing: opts.Existing, SkipCheck: opts.SkipCheck,
 		HealthTimeout: opts.HealthTimeout, KeepFiles: opts.KeepFiles, CheckOnly: checkOnly,
+		KeepSucceeded: opts.KeepSucceeded,
 	})
 	t.finish(err == nil)
 	if errors.Is(err, restore.ErrReported) {

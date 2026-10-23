@@ -211,7 +211,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 	}
 	if hasProject && t.HasCompose && strings.HasPrefix(t.Compose, "1.") && !strings.HasPrefix(plan.Source.Compose, "1.") && plan.Source.Compose != "" {
 		addIssue(Issue{Level: Info, Kind: "old_compose",
-			Title: fmt.Sprintf("新服务器的 docker-compose 是老版本 %s，旧服务器用的是 Compose %s；有些写法老版本读不懂，迁入时可能失败（失败会自动还原）。"+
+			Title: fmt.Sprintf("新服务器的 docker-compose 是老版本 %s，旧服务器用的是 Compose %s；有些写法老版本读不懂，迁入时可能失败（失败会自动删除迁入的内容）。"+
 				"建议先在新服务器安装新版 Docker Compose", t.Compose, plan.Source.Compose)})
 	}
 	if !t.Local && (len(plan.Binds) > 0 || hasProject) {
@@ -297,7 +297,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 				Hint:  "删除这个容器，或者去掉 --existing fail"})
 		case "replace":
 			addIssue(Issue{Level: Info, Kind: "existing_container", Container: c.Name,
-				Title: "新服务器上已有同名容器 " + c.Name + "，会被替换（迁入失败时自动还原）"})
+				Title: "新服务器上已有同名容器 " + c.Name + "，会被替换（迁入失败时放回原来的）"})
 		case "skip":
 			addIssue(Issue{Level: Info, Kind: "existing_container", Container: c.Name,
 				Title: "新服务器上已有同名容器 " + c.Name + "，保留它、不迁入这个容器"})
@@ -326,7 +326,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 				Hint:  "删除这个项目的容器，或者去掉 --existing fail"})
 		case "replace":
 			addIssue(Issue{Level: Info, Kind: "existing_project", Project: p,
-				Title: "新服务器上已有同名的 Compose 项目 " + p + "，会被替换（迁入失败时自动还原）"})
+				Title: "新服务器上已有同名的 Compose 项目 " + p + "，会被替换（迁入失败时放回原来的）"})
 		case "skip":
 			addIssue(Issue{Level: Info, Kind: "existing_project", Project: p,
 				Title: "新服务器上已有同名的 Compose 项目 " + p + "，保留它、不迁入这个项目"})
@@ -338,7 +338,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 	if o.Existing == "skip" && existingTargets > 0 && (len(plan.Volumes) > 0 || len(plan.Binds) > 0) {
 		addIssue(Issue{Level: Stop, Kind: "skip_with_data",
 			Title: "--existing skip 时无法判断共用的数据属于谁；迁移包里有数据卷或目录，为了不覆盖已有数据，已停止",
-			Hint:  "改用 --existing replace（失败时自动还原），或者先处理新服务器上的同名服务"})
+			Hint:  "改用 --existing replace（失败时放回原来的），或者先处理新服务器上的同名服务"})
 	}
 	for _, v := range plan.Volumes {
 		if !usedVolumes[v.Name] || d.KeepVolume(v.Name) || spec.IsAnonymousVolume(v.Name) {
@@ -353,7 +353,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 				Title: "新服务器已有同名数据卷 " + v.Name + "，但它的存储方式和旧服务器不同"})
 		} else {
 			addIssue(Issue{Level: Info, Kind: "volume_replace", Volume: v.Name,
-				Title: "数据卷 " + v.Name + " 已存在，迁移过来的数据会替换它（失败时自动还原）"})
+				Title: "数据卷 " + v.Name + " 已存在，迁移过来的数据会替换它（失败时放回原来的）"})
 		}
 	}
 

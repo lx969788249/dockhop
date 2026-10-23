@@ -1,7 +1,8 @@
 // Package restore 是迁入：在新服务器上检查、下载迁移包、恢复数据和服务。
 //
 // 对新服务器的每一处改动都先记进事务日志（journal.go）。任何一步失败或被中断，
-// 都按日志把新服务器还原到迁入前的状态；全部服务验证通过后才“提交”。
+// 都按日志删除这次迁入的内容、把被替换的原有服务放回去；全部服务验证通过后才“提交”。
+// 一次迁入多组服务、只有一部分没能启动时，可以选择只删除没启动的（groups.go）。
 package restore
 
 import (
@@ -39,6 +40,7 @@ type Options struct {
 	HealthTimeout time.Duration
 	KeepFiles     bool
 	CheckOnly     bool // 只检查，不下载、不改动
+	KeepSucceeded bool // 有的服务没能启动时，不提问，保留已经正常运行的
 }
 
 // Deps 是迁入需要的外部条件。
@@ -82,10 +84,15 @@ type run struct {
 	rbDir   string
 	undo    *undo
 	vio     *volumeIO
-	targets map[string]bool // 被替换的已有容器名
-	shared  []Entry         // 临时停止的、和迁入的数据共用卷或目录的容器
+	targets map[string]bool   // 被替换的已有容器名
+	shared  []Entry           // 临时停止的、和迁入的数据共用卷或目录的容器
+	groups  []*group          // 要迁入的服务分成的组（见 groups.go）
+	groupOf map[string]string // 容器、项目、卷、目录、网络 → 所在组
+
+	done []string // 同一个链接上次已经迁入、这次跳过的服务
 
 	committed      bool
+	partial        bool // 只保留了一部分服务
 	rollbackDone   bool
 	rollbackIssues []string
 	cleanupLeft    []string
@@ -172,9 +179,11 @@ func (r *run) run(ctx context.Context) error {
 		if err := r.fetchPlan(ctx); err != nil {
 			return err
 		}
-		if err := r.check(); err != nil {
+		summary, err := r.check(ctx)
+		if err != nil {
 			return err
 		}
+		s.End(summary)
 		if r.opts.CheckOnly {
 			return nil
 		}
@@ -182,25 +191,38 @@ func (r *run) run(ctx context.Context) error {
 		if err := r.download(ctx); err != nil {
 			return err
 		}
-		if err := r.unpack(ctx); err != nil {
+		summary, err = r.unpack(ctx)
+		if err != nil {
 			return err
 		}
+		if err := r.checkCompose(ctx); err != nil {
+			return err
+		}
+		s.End(summary)
 	} else {
 		s.Begin(2, r.steps, "解开迁移包")
 		r.bundlePath = r.opts.File
 		if err := r.prepareWorkdir(""); err != nil {
 			return err
 		}
-		if err := r.unpack(ctx); err != nil {
+		summary, err := r.unpack(ctx)
+		if err != nil {
 			return err
 		}
+		s.End(summary)
 		s.Begin(3, r.steps, "迁入前检查")
-		if err := r.check(); err != nil {
+		summary, err = r.check(ctx)
+		if err != nil {
 			return err
 		}
 		if r.opts.CheckOnly {
+			s.End(summary)
 			return nil
 		}
+		if err := r.checkCompose(ctx); err != nil {
+			return err
+		}
+		s.End(summary)
 	}
 
 	s.Begin(4, r.steps, "加载镜像")
@@ -240,7 +262,7 @@ func (r *run) fetchPlan(ctx context.Context) error {
 	s.Note("连接旧服务器 " + r.opts.Link.Host)
 	raw, err := r.client().FetchPlan(ctx, r.opts.Link)
 	if errors.Is(err, transfer.ErrNoPlan) {
-		s.Warn("旧服务器没有提供迁移计划，跳过迁入前检查（问题会在迁入过程中发现并自动还原）")
+		s.Warn("旧服务器没有提供迁移计划，跳过迁入前检查（有问题会在迁入过程中发现，并自动删除迁入的内容）")
 		return nil
 	}
 	if err != nil {
@@ -258,16 +280,16 @@ func (r *run) fetchPlan(ctx context.Context) error {
 	return nil
 }
 
-func (r *run) check() error {
+// check 是迁入前检查，返回这一步的摘要。
+func (r *run) check(ctx context.Context) (string, error) {
 	s := r.Screen
+	r.skipDone(ctx)
 	if r.plan == nil {
-		s.End("跳过")
-		return nil
+		return "跳过", nil
 	}
 	if r.opts.SkipCheck {
 		s.Warn("按 --skip-check 跳过迁入前检查")
-		s.End("跳过")
-		return nil
+		return "跳过", nil
 	}
 	runner := &preflight.Runner{Screen: s, Prompt: r.Prompt, Auto: r.opts.Yes,
 		Collect: func() (*preflight.Target, error) {
@@ -282,9 +304,9 @@ func (r *run) check() error {
 	if err != nil {
 		var p *preflight.Problem
 		if errors.As(err, &p) {
-			return fail(s, p.Reason, "", p.Hint)
+			return "", fail(s, p.Reason, "", p.Hint)
 		}
-		return fail(s, err.Error(), "", "")
+		return "", fail(s, err.Error(), "", "")
 	}
 	b, _ := json.Marshal(r.d)
 	r.Log.Printf("检查时的选择：%s", b)
@@ -292,8 +314,7 @@ func (r *run) check() error {
 	if res.NeedBytes > 0 {
 		summary += " · 需要约 " + ui.HumanBytes(res.NeedBytes)
 	}
-	s.End(summary + " · 检查通过")
-	return nil
+	return summary + " · 检查通过", nil
 }
 
 func (r *run) workBase() string {
@@ -351,12 +372,12 @@ func (r *run) download(ctx context.Context) error {
 	return nil
 }
 
-// unpack 解密、解开迁移包，并在改动任何东西之前检查里面的每一份数据。
-func (r *run) unpack(ctx context.Context) error {
+// unpack 解密、解开迁移包，并在改动任何东西之前检查里面的每一份数据。返回这一步的摘要。
+func (r *run) unpack(ctx context.Context) (string, error) {
 	s := r.Screen
 	f, err := os.Open(r.bundlePath)
 	if err != nil {
-		return fail(s, "打不开迁移包 "+r.bundlePath, err.Error(), "")
+		return "", fail(s, "打不开迁移包 "+r.bundlePath, err.Error(), "")
 	}
 	st, _ := f.Stat()
 	p := s.StartProgress("校验并解开", st.Size(), "")
@@ -366,25 +387,25 @@ func (r *run) unpack(ctx context.Context) error {
 	if err != nil {
 		_ = os.RemoveAll(r.dataDir)
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return "", ctx.Err()
 		}
 		switch {
 		case errors.Is(err, crypto.ErrWrongKey):
-			return fail(s, err.Error(), "", "")
+			return "", fail(s, err.Error(), "", "")
 		case errors.Is(err, crypto.ErrCorrupted), errors.Is(err, bundle.ErrUnsafe):
 			hint := "在旧服务器重新运行迁出"
 			if r.downloaded {
 				_ = os.Remove(r.bundlePath)
 				hint = "已删除下载的文件，重新运行即可重新下载；如果再次出现，请在旧服务器重新运行迁出"
 			}
-			return fail(s, err.Error(), "", hint)
+			return "", fail(s, err.Error(), "", hint)
 		default:
-			return fail(s, "解开迁移包失败："+err.Error(), "", "执行 df -h 检查磁盘空间")
+			return "", fail(s, "解开迁移包失败："+err.Error(), "", "执行 df -h 检查磁盘空间")
 		}
 	}
 	m, err := bundle.ReadManifest(r.dataDir)
 	if err != nil {
-		return fail(s, err.Error(), "", "")
+		return "", fail(s, err.Error(), "", "")
 	}
 	r.m = m
 	if r.plan == nil {
@@ -394,10 +415,9 @@ func (r *run) unpack(ctx context.Context) error {
 		}
 	}
 	if err := r.scan(); err != nil {
-		return fail(s, err.Error(), "", "在旧服务器重新运行迁出")
+		return "", fail(s, err.Error(), "", "在旧服务器重新运行迁出")
 	}
-	s.End(fmt.Sprintf("%d 个容器 · %s · 校验通过", len(m.Containers), ui.HumanBytes(st.Size())))
-	return nil
+	return fmt.Sprintf("%d 个容器 · %s · 校验通过", len(m.Containers), ui.HumanBytes(st.Size())), nil
 }
 
 // scan 检查迁移包里所有的卷、目录和 Compose 文件（路径是否越界、有没有通过软链接
@@ -468,6 +488,96 @@ func (r *run) scan() error {
 		}
 	}
 	return nil
+}
+
+// checkCompose 在改动新服务器之前，用新服务器上的 docker compose 把每个 Compose 项目的
+// 配置文件读一遍。老版本读不懂新写法时在这里就停下，不用等到替换掉已有的服务、写完
+// 数据之后才发现。
+func (r *run) checkCompose(ctx context.Context) error {
+	s := r.Screen
+	var list []bundle.Project
+	for _, p := range r.m.Projects {
+		if has(r.d.SkipProjects, p.Name) {
+			continue
+		}
+		if r.opts.Existing == "skip" {
+			if cur, err := r.Docker.ContainersByLabel(ctx, "com.docker.compose.project="+p.Name); err == nil && len(cur) > 0 {
+				continue // 会按 --existing skip 保留新服务器上已有的
+			}
+		}
+		list = append(list, p)
+	}
+	if len(list) == 0 {
+		return nil
+	}
+	if r.tool == nil {
+		return fail(s, "新服务器没有安装 Docker Compose，没法启动 Compose 项目（还没有改动新服务器）", "",
+			"安装 Docker Compose（Docker 官方源的 docker-compose-plugin）后重新运行，迁移包已经下载好，不用重新下载")
+	}
+	for _, p := range list {
+		s.Note("检查 Compose 项目 " + p.Name + " 的配置文件")
+		if err := r.checkProject(ctx, p); err != nil {
+			hint := "检查这个项目的配置文件在新服务器的 docker compose " + r.tool.Version + " 上能不能用"
+			if r.tool.Legacy() {
+				hint = r.legacyHint()
+			}
+			return fail(s, "新服务器上的 docker compose 读不懂 Compose 项目 "+p.Name+" 的配置文件（还没有改动新服务器）", err.Error(), hint)
+		}
+	}
+	return nil
+}
+
+// checkProject 把项目目录解到临时目录里，执行 docker compose config -q。引用了项目目录
+// 以外的文件、或者用绝对路径引用文件时，临时目录里没有这些文件，相关的报错不算数。
+func (r *run) checkProject(ctx context.Context, p bundle.Project) error {
+	files := p.ConfigArgs
+	if len(files) == 0 {
+		files = p.ConfigFiles
+	}
+	stage := filepath.Join(r.workdir, "check-"+p.Name)
+	_ = os.RemoveAll(stage)
+	if err := os.MkdirAll(stage, 0o700); err != nil {
+		return nil
+	}
+	defer os.RemoveAll(stage)
+	if p.DirParts > 0 {
+		rc := bundle.OpenStream(r.dataDir, "compose/"+p.Name+"/dir", p.DirParts)
+		err := bundle.ExtractTree(rc, stage)
+		rc.Close()
+		if err != nil {
+			r.Log.Printf("没能解开 Compose 项目 %s 的文件来检查：%v", p.Name, err)
+			return nil
+		}
+	}
+	var args []string
+	for _, f := range files {
+		if filepath.IsAbs(f) {
+			if !within(f, p.WorkingDir) {
+				r.Log.Printf("Compose 项目 %s 的配置文件 %s 不在项目目录里，跳过检查", p.Name, f)
+				return nil
+			}
+			f, _ = filepath.Rel(p.WorkingDir, f)
+		}
+		f = filepath.Join(stage, f)
+		if !within(f, stage) {
+			r.Log.Printf("Compose 项目 %s 的配置文件 %s 不在项目目录里，跳过检查", p.Name, f)
+			return nil
+		}
+		args = append(args, f)
+	}
+	err := r.tool.Exec(ctx, compose.Project{Name: p.Name, WorkingDir: stage, Files: args}, r.Log.Printf, "config", "-q")
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	for _, path := range append(append([]string{p.WorkingDir + "/"}, p.Outside...), p.Skipped...) {
+		if strings.Contains(msg, path) {
+			r.Log.Printf("检查 Compose 项目 %s 时的报错涉及临时目录里没有的文件，不算数", p.Name)
+			return nil
+		}
+	}
+	msg = strings.TrimPrefix(msg, "config -q 失败：")
+	return errors.New(strings.ReplaceAll(msg, stage, p.WorkingDir))
 }
 
 // ---------- 加载镜像 ----------
@@ -622,6 +732,30 @@ func (r *run) prepare(ctx context.Context) error {
 		return fail(s, "按检查时的选择，没有要迁入的容器了", "", "")
 	}
 
+	// 新服务器上正在运行、和要写入的数据共用卷或目录的容器：要先临时停止，否则数据不一致。
+	volumes, binds := r.dataTargets()
+	self, _ := os.Hostname()
+	ignore := map[string]bool{}
+	for _, n := range strings.Split(r.Getenv("DOCKHOP_TEST_IGNORE"), ",") {
+		ignore[strings.TrimSpace(n)] = true
+	}
+	var writers []writer
+	for _, c := range existing {
+		name := c.Name()
+		if c.State != "running" && c.State != "paused" && c.State != "restarting" {
+			continue
+		}
+		if r.targets[name] || has(replaceProjects, c.Labels["com.docker.compose.project"]) || ignore[name] || (len(self) >= 12 && strings.HasPrefix(c.ID, self)) {
+			continue
+		}
+		full, _, err := dc.InspectContainer(ctx, c.ID)
+		if err != nil || !usesData(full, volumes, binds) {
+			continue
+		}
+		writers = append(writers, writer{summary: c, full: full})
+	}
+	r.buildGroups(writers)
+
 	// 开始事务：之后的每一处改动都先记日志。
 	if err := os.RemoveAll(r.rbDir); err != nil {
 		return fail(s, "无法清理回滚资料目录 "+r.rbDir, err.Error(), "")
@@ -641,28 +775,10 @@ func (r *run) prepare(ctx context.Context) error {
 	r.vio = &volumeIO{dc: dc, image: r.helperImage, helperBin: helper}
 	r.undo.vio = r.vio
 
-	// 新服务器上正在运行、和要写入的数据共用卷或目录的容器：先临时停止，否则数据不一致。
-	volumes, binds := r.dataTargets()
-	self, _ := os.Hostname()
-	ignore := map[string]bool{}
-	for _, n := range strings.Split(r.Getenv("DOCKHOP_TEST_IGNORE"), ",") {
-		ignore[strings.TrimSpace(n)] = true
-	}
 	stopped := 0
-	for _, c := range existing {
-		name := c.Name()
-		if c.State != "running" && c.State != "paused" && c.State != "restarting" {
-			continue
-		}
-		if r.targets[name] || has(replaceProjects, c.Labels["com.docker.compose.project"]) || ignore[name] || (len(self) >= 12 && strings.HasPrefix(c.ID, self)) {
-			continue
-		}
-		full, _, err := dc.InspectContainer(ctx, c.ID)
-		if err != nil || !usesData(full, volumes, binds) {
-			continue
-		}
-		state := stateOf(full)
-		e := Entry{Op: opStop, Name: name, ID: c.ID, State: state}
+	for _, w := range writers {
+		name := w.summary.Name()
+		e := Entry{Op: opStop, Name: name, ID: w.summary.ID, State: stateOf(w.full), Group: r.groupOf["w:"+name]}
 		if err := r.stopContainer(ctx, e); err != nil {
 			return err
 		}
@@ -677,6 +793,7 @@ func (r *run) prepare(ctx context.Context) error {
 		if !r.targets[it.m.Name] {
 			continue
 		}
+		r.in("c:" + it.m.Name)
 		c, _, err := dc.InspectContainer(ctx, it.m.Name)
 		if err != nil {
 			return fail(s, "读取已有容器 "+it.m.Name+" 失败", err.Error(), "")
@@ -711,11 +828,13 @@ func (r *run) prepare(ctx context.Context) error {
 
 	// 已有的同名 Compose 项目：记下每个容器的完整配置，停止，把有改动的存成回滚镜像，再删除。
 	for _, p := range replaceProjects {
+		r.in("p:" + p)
 		if err := r.backupProject(ctx, p, projects[p]); err != nil {
 			return err
 		}
 		backedUp += len(projects[p])
 	}
+	r.in("")
 	if r.testFail("prepare") {
 		return fail(s, "（测试）模拟备份已有服务时失败", "", "")
 	}
@@ -916,6 +1035,7 @@ func (r *run) restoreData(ctx context.Context) error {
 		if b, err := os.ReadFile(filepath.Join(r.dataDir, "volumes", v.Name+".json")); err == nil {
 			_ = json.Unmarshal(b, &meta)
 		}
+		r.in("v:" + v.Name)
 		cur, err := dc.InspectVolume(ctx, v.Name)
 		existed := err == nil
 		if err != nil && !docker.IsNotFound(err) {
@@ -969,16 +1089,19 @@ func (r *run) restoreData(ctx context.Context) error {
 		if !has(binds, b.Path) {
 			continue
 		}
+		r.in("b:" + b.Path)
 		if err := r.restoreBind(ctx, b); err != nil {
 			return fail(s, "目录 "+b.Path+" 恢复失败", err.Error(), "")
 		}
 		nb++
 	}
 	for _, p := range r.projects {
+		r.in("p:" + p.Name)
 		if err := r.installProject(p); err != nil {
 			return fail(s, "Compose 项目 "+p.Name+" 的文件没能放回原来的位置", err.Error(), "")
 		}
 	}
+	r.in("")
 	if r.testFail("after-data") {
 		return fail(s, "（测试）模拟恢复数据之后失败", "", "")
 	}
@@ -1118,21 +1241,18 @@ func (r *run) extractAndInstall(prefix string, parts int, dest string, skip func
 
 func (r *run) startServices(ctx context.Context) error {
 	s := r.Screen
-	// 先建独立网络，再启动 Compose 项目：Compose 自动分配网段时会占用第一个空闲网段，
+	// 先建好所有独立网络，再启动 Compose 项目：Compose 自动分配网段时会占用第一个空闲网段，
 	// 可能正是独立网络在旧服务器上用的网段。
-	used := map[string]bool{}
-	for _, it := range r.items {
-		for n := range it.c.NetworkSettings.Networks {
-			used[n] = true
-		}
-	}
 	for _, n := range r.m.Networks {
-		if !used[n] || n == "bridge" || n == "host" || n == "none" {
-			continue
+		g := r.groupByID(r.groupOf["n:"+n])
+		if g == nil || g.reason != "" || n == "bridge" || n == "host" || n == "none" {
+			continue // 没有要迁入的容器用它
 		}
+		r.in("n:" + n)
 		raw, err := os.ReadFile(filepath.Join(r.dataDir, "networks", n+".json"))
 		if err != nil {
-			return fail(s, "迁移包里缺少网络 "+n+" 的配置", err.Error(), "")
+			r.groupFailed(g, "迁移包里缺少网络 "+n+" 的配置："+err.Error(), "")
+			continue
 		}
 		var meta struct {
 			Labels map[string]string `json:"Labels"`
@@ -1142,50 +1262,117 @@ func (r *run) startServices(ctx context.Context) error {
 			continue // 交给 Compose 按项目文件创建
 		}
 		if err := r.ensureNetwork(ctx, n, raw); err != nil {
-			return fail(s, err.Error(), "", "检查是否和新服务器上已有网络的网段冲突")
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			r.groupFailed(g, err.Error(), "检查是否和新服务器上已有网络的网段冲突")
 		}
 	}
 
-	for _, p := range r.projects {
+	// 一组没能启动时，接着启动其他组，最后再决定怎么处理。
+	total, n := 0, 0
+	for _, it := range r.items {
+		if it.m.Project == "" || !r.projectRestored(it.m.Project) {
+			total++
+		}
+	}
+	for _, g := range r.groups {
+		if g.reason != "" {
+			continue
+		}
+		if err := r.startGroup(ctx, g, &n, total); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			r.groupFailed(g, err.Error(), groupHint(err))
+		}
+	}
+	r.in("")
+	ok, failed := r.splitGroups()
+	switch {
+	case len(failed) == 0:
+		s.End(r.countText())
+		return nil
+	case len(ok) == 0:
+		return ErrReported
+	}
+	keep, err := r.decidePartial(ok, failed)
+	if err != nil || !keep {
+		return ErrReported
+	}
+	s.End(fmt.Sprintf("%s 正常运行 · %s 没能启动", labels(ok), labels(failed)))
+	return nil
+}
+
+// startError 是一组服务没能启动的原因和建议。
+type startError struct{ reason, hint string }
+
+func (e *startError) Error() string { return e.reason }
+
+func groupHint(err error) string {
+	var se *startError
+	if errors.As(err, &se) {
+		return se.hint
+	}
+	return ""
+}
+
+// groupFailed 记下一组没能启动，并显示原因。
+func (r *run) groupFailed(g *group, reason, hint string) {
+	g.reason = reason
+	if len(r.groups) > 1 {
+		r.Log.Printf("这一组没能启动：%s", g.label())
+	}
+	_ = fail(r.Screen, reason, "", hint)
+}
+
+// startGroup 启动一组服务：先启动 Compose 项目，再按依赖顺序创建、启动独立容器。
+func (r *run) startGroup(ctx context.Context, g *group, n *int, total int) error {
+	for _, p := range g.projects {
+		r.in("p:" + p.Name)
 		if err := r.startProject(ctx, p); err != nil {
 			hint := "执行 docker compose -p " + p.Name + " logs 查看服务日志"
 			if r.tool != nil && r.tool.Legacy() {
-				hint = "新服务器的 docker-compose " + r.tool.Version + " 是老版本，可能读不懂这个项目配置文件里的新写法。" +
-					"安装新版 Docker Compose（Docker 官方源的 docker-compose-plugin，或者把 GitHub 上下载的 docker-compose 放到 " +
-					"/usr/local/lib/docker/cli-plugins/）后重新运行，迁移包已经下载好，不用重新下载"
+				hint = r.legacyHint()
 			}
-			return fail(s, "Compose 项目 "+p.Name+" 启动失败："+err.Error(), "", hint)
+			return &startError{"Compose 项目 " + p.Name + " 启动失败：" + err.Error(), hint}
 		}
 	}
-
 	var standalone []*citem
-	for _, it := range r.items {
+	for _, it := range g.items {
 		if it.m.Project == "" || !r.projectRestored(it.m.Project) {
 			standalone = append(standalone, it)
 		}
 	}
-	for i, it := range dependencyOrder(standalone, r.nameOfOld) {
-		s.Count("启动容器", i+1, len(standalone), it.m.Name)
+	for _, it := range dependencyOrder(standalone, r.nameOfOld) {
+		r.in("c:" + it.m.Name)
+		*n++
+		r.Screen.Count("启动容器", *n, total, it.m.Name)
 		if err := r.createContainer(ctx, it); err != nil {
-			return fail(s, err.Error(), "", "")
+			return &startError{err.Error(), ""}
 		}
 		if err := r.transplantAnonymous(ctx, it, it.newID); err != nil {
-			return fail(s, err.Error(), "", "")
+			return &startError{err.Error(), ""}
 		}
 		if err := r.applyChanges(ctx, it); err != nil {
-			return fail(s, err.Error(), "", "")
+			return &startError{err.Error(), ""}
 		}
 		if it.running() {
 			if err := r.startAndVerify(ctx, it, it.newID); err != nil {
-				return fail(s, err.Error(), "", "执行 docker logs "+it.m.Name+" 查看应用日志")
+				return &startError{err.Error(), "执行 docker logs " + it.m.Name + " 查看应用日志"}
 			}
 		}
 		if r.testFail("container:" + it.m.Name) {
-			return fail(s, "（测试）模拟容器 "+it.m.Name+" 失败", "", "")
+			return &startError{"（测试）模拟容器 " + it.m.Name + " 失败", ""}
 		}
 	}
-	s.End(r.countText())
 	return nil
+}
+
+func (r *run) legacyHint() string {
+	return "新服务器的 docker-compose " + r.tool.Version + " 是老版本，可能读不懂这个项目配置文件里的新写法。" +
+		"安装新版 Docker Compose（Docker 官方源的 docker-compose-plugin，或者把 GitHub 上下载的 docker-compose 放到 " +
+		"/usr/local/lib/docker/cli-plugins/）后重新运行，迁移包已经下载好，不用重新下载"
 }
 
 func (r *run) startProject(ctx context.Context, p bundle.Project) error {
@@ -1328,14 +1515,17 @@ func (r *run) countText() string {
 
 func (r *run) commit(ctx context.Context) error {
 	s := r.Screen
-	// 先把临时停下的共用数据的容器恢复；恢复不了就整体还原。
+	if ok, failed := r.splitGroups(); len(failed) > 0 {
+		return r.commitPartial(ctx, ok, failed)
+	}
+	// 先把临时停下的共用数据的容器恢复；恢复不了就全部删除。
 	for i := len(r.shared) - 1; i >= 0; i-- {
 		e := r.shared[i]
 		if err := restoreState(ctx, r.Docker, e.ID, e.State); err != nil {
 			return fail(s, "新服务已验证，但临时停下的容器 "+e.Name+" 没能恢复", err.Error(), "")
 		}
 	}
-	// 这是不可逆的提交点：之后不再还原。
+	// 这是不可逆的提交点：之后不再删除。
 	if err := r.j.add(Entry{Op: opCommit}); err != nil {
 		return fail(s, err.Error(), "", "")
 	}
@@ -1350,21 +1540,27 @@ func (r *run) commit(ctx context.Context) error {
 			r.cleanupLeft = append(r.cleanupLeft, r.rbDir)
 		}
 	}
+	r.clearDone()
 	if len(r.cleanupLeft) > 0 {
 		s.Warn("服务和数据都已迁入，但有些回滚资料没能删除：%s", strings.Join(r.cleanupLeft, "；"))
 		s.Fail()
 		return ErrReported
 	}
-	for _, it := range r.items {
-		switch {
-		case it.m.OldImage != "":
-			s.Warn("%s 用的是旧版本镜像（旧服务器上的镜像名 %s 已经指向别的版本），迁入后保持原样，镜像名为 %s", it.m.Name, it.c.Config.Image, it.img)
-		case it.m.Changes != nil:
-			s.Warn("%s 里没挂载出来的改动已一起迁入；以后用新镜像重建这个容器时，这些改动会丢失", it.m.Name)
-		}
-	}
+	r.warnKept(r.items)
 	s.End("全部服务验证通过")
 	return nil
+}
+
+// warnKept 提醒迁入的容器里需要知道的情况。
+func (r *run) warnKept(items []*citem) {
+	for _, it := range items {
+		switch {
+		case it.m.OldImage != "":
+			r.Screen.Warn("%s 用的是旧版本镜像（旧服务器上的镜像名 %s 已经指向别的版本），迁入后保持原样，镜像名为 %s", it.m.Name, it.c.Config.Image, it.img)
+		case it.m.Changes != nil:
+			r.Screen.Warn("%s 里没挂载出来的改动已一起迁入；以后用新镜像重建这个容器时，这些改动会丢失", it.m.Name)
+		}
+	}
 }
 
 // ---------- 失败和收尾 ----------
@@ -1373,7 +1569,7 @@ func (r *run) rollback(ctx context.Context) {
 	if r.Screen.FailedStage() == "" {
 		r.Screen.Fail()
 	}
-	r.Screen.Println("迁入没有完成，正在把新服务器还原到迁入前的状态……")
+	r.Screen.Println("迁入没有完成，正在删除这次迁入的内容，让新服务器回到迁入前的样子……")
 	entries, err := readJournal(r.rbDir)
 	if err != nil {
 		r.rollbackIssues = []string{"事务日志读不了：" + err.Error()}
@@ -1443,35 +1639,61 @@ func (r *run) report(ctx context.Context, err error) error {
 	case success:
 		rep.Result = "✅ 迁入完成"
 		lines = append(lines, "容器："+r.countText())
+		if len(r.done) > 0 {
+			lines = append(lines, "上次已经迁入："+strings.Join(r.done, "、"))
+		}
 		status.Result = "success"
+	case r.partial:
+		ok, failed := r.splitGroups()
+		rep.Result = "⚠️ 只迁入了一部分"
+		lines = append(lines, "已经迁入、正常运行："+labels(ok))
+		if len(r.done) > 0 {
+			lines = append(lines, "上次已经迁入："+strings.Join(r.done, "、"))
+		}
+		if len(r.rollbackIssues) == 0 {
+			lines = append(lines, "没有迁入（已删除）："+labels(failed))
+		} else {
+			lines = append(lines, "没有迁入、也没能删干净："+labels(failed))
+			lines = append(lines, "重要：请先不要启动它们，按下面的情况人工处理")
+			for _, p := range r.rollbackIssues {
+				lines = append(lines, "  · "+p)
+			}
+			lines = append(lines, "回滚资料："+r.rbDir+"（下次运行迁入时会提示继续删除）")
+		}
+		if len(r.cleanupLeft) > 0 {
+			lines = append(lines, "有些回滚资料没能删除："+strings.Join(r.cleanupLeft, "；"))
+		}
+		lines = append(lines, "处理好问题后，重新运行同一条迁入命令：已经迁入的会跳过，只迁入剩下的")
+		status.Result = "partial"
+		status.Message = "没能启动：" + labels(failed)
 	case r.committed:
 		rep.Result = "⚠️ 服务和数据都已迁入，但清理没有完成"
 		lines = append(lines, "待清理的回滚资料："+r.rbDir)
 		status.Result = "success"
 	case r.rollbackDone && len(r.rollbackIssues) == 0:
 		if interrupted {
-			rep.Result = "⚠️ 迁入已中断，已安全还原"
+			rep.Result = "⚠️ 迁入已中断，迁入的内容已全部删除"
 		} else {
-			rep.Result = "❌ 迁入失败，已安全还原"
+			rep.Result = "❌ 迁入失败，迁入的内容已全部删除"
 		}
-		lines = append(lines, "新服务器：原来的服务和数据都已还原")
+		lines = append(lines, "新服务器：回到了迁入前的样子，原来的服务和数据都在")
 	case r.rollbackDone || len(r.rollbackIssues) > 0:
 		if interrupted {
-			rep.Result = "⚠️ 迁入已中断，自动还原没有完全成功"
+			rep.Result = "⚠️ 迁入已中断，迁入的内容没能全部删除"
 		} else {
-			rep.Result = "⚠️ 迁入失败，自动还原没有完全成功"
+			rep.Result = "⚠️ 迁入失败，迁入的内容没能全部删除"
 		}
 		lines = append(lines, "重要：请先不要启动相关容器，按下面的情况人工处理")
 		for _, p := range r.rollbackIssues {
 			lines = append(lines, "  · "+p)
 		}
-		lines = append(lines, "回滚资料："+r.rbDir+"（下次运行迁入时会提示继续还原）")
+		lines = append(lines, "回滚资料："+r.rbDir+"（下次运行迁入时会提示继续删除）")
 	case interrupted:
 		rep.Result = "⚠️ 迁入已中断（还没有改动新服务器）"
 	default:
 		rep.Result = "❌ 迁入失败（还没有改动新服务器）"
 	}
-	if f := r.Screen.Failure(); f != nil {
+	if f := r.Screen.Failure(); f != nil && status.Message == "" {
 		status.Message = f.Reason
 	}
 	lines = append(lines, r.d.Summary()...)
@@ -1511,7 +1733,7 @@ func fail(s *ui.Screen, reason, detail, hint string) error {
 
 // ---------- 中断补救 ----------
 
-// recoverInterrupted 检查上次迁入有没有被强制结束、留下没还原的改动。
+// recoverInterrupted 检查上次迁入有没有被强制结束、留下没删除的改动。
 func (r *run) recoverInterrupted(ctx context.Context) error {
 	s := r.Screen
 	entries, err := readJournal(r.rbDir)
@@ -1551,30 +1773,30 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 		return os.RemoveAll(r.rbDir)
 	}
 	s.Hold()
-	s.Println(fmt.Sprintf("上次迁入（%s）没有完成就被结束了，新服务器上有 %d 处改动还没还原。", when, changes))
+	s.Println(fmt.Sprintf("上次迁入（%s）没有完成就被结束了，新服务器上还留着它的 %d 处改动。", when, changes))
 	if r.Prompt.Interactive() {
-		c, err := r.Prompt.Choose([]string{"还原到上次迁入之前的状态（推荐）", "保留现在的状态，删除回滚资料", "退出，我先自己检查"}, 1)
+		c, err := r.Prompt.Choose([]string{"删除上次迁入的内容，回到上次迁入之前的样子（推荐）", "保留现在的样子，只删除回滚资料", "退出，我先自己检查"}, 1)
 		if err != nil {
 			return err
 		}
 		switch c {
 		case 2:
-			s.Warn("保留了上次迁入到一半的状态，没有还原")
+			s.Warn("保留了上次迁入到一半的样子，没有删除")
 			return os.RemoveAll(r.rbDir)
 		case 3:
 			return fail(s, "上次迁入留下的改动还没处理", "", "回滚资料在 "+r.rbDir+"；处理好之后重新运行")
 		}
 	} else {
-		s.Println("没有可以输入的终端，直接还原。")
+		s.Println("没有可以输入的终端，直接删除上次迁入的内容。")
 	}
 	problems := r.undo.rollback(ctx, entries)
 	if len(problems) > 0 {
 		for _, p := range problems {
 			s.Println("  · " + p)
 		}
-		return fail(s, "上次迁入的改动没能完全还原", "", "回滚资料在 "+r.rbDir+"，请人工处理后删除这个目录")
+		return fail(s, "上次迁入的内容没能全部删除", "", "回滚资料在 "+r.rbDir+"，请人工处理后删除这个目录")
 	}
-	s.Println("已还原上次迁入之前的状态。")
+	s.Println("已删除上次迁入的内容，回到了上次迁入之前的样子。")
 	removeHelpers(ctx, r.Docker)
 	return os.RemoveAll(r.rbDir)
 }

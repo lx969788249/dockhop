@@ -12,7 +12,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
-// undo 按事务日志把新服务器还原到迁入前的状态。迁入失败、被中断时在同一个进程里
+// undo 按事务日志撤销迁入：删除这次迁入的内容，把被替换的原有服务放回去。迁入失败、被中断时在同一个进程里
 // 执行；程序被强制结束时，下次运行再执行。
 type undo struct {
 	dc     *docker.Client
@@ -24,14 +24,14 @@ type undo struct {
 	defaults spec.SourceDefaults
 }
 
-// rollback 返回没能还原的地方；为空表示已经完全还原。
+// rollback 返回没能撤销的地方；为空表示已经全部撤销。
 //
 // 顺序和改动的顺序相反，分三遍：
-//  1. 先停止并删除这次新建的容器。没能全部删掉时停下：它们可能还在写数据，这时还原
-//     数据会被覆盖，回滚资料全部保留，交给人工处理。
-//  2. 再还原数据：网络、Compose 文件、目录、数据卷。
-//  3. 最后还原旧服务：重建旧 Compose 容器、旧容器改回原名、启动临时停下的容器。
-//     数据没能完全还原时，旧服务保持停止，以免在不完整的数据上运行。
+//  1. 先停止并删除这次新建的容器。没能全部删掉时停下：它们可能还在写数据，这时放回
+//     的数据会被覆盖，回滚资料全部保留，交给人工处理。
+//  2. 再处理数据：删除这次写入的网络、Compose 文件、目录、数据卷，放回原有的。
+//  3. 最后放回旧服务：重建旧 Compose 容器、旧容器改回原名、启动临时停下的容器。
+//     原有的数据没能全部放回时，旧服务保持停止，以免在不完整的数据上运行。
 func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 	var problems []string
 	note := func(format string, args ...any) {
@@ -50,7 +50,7 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 	}
 
 	// 第 1 遍：删除新建的容器。
-	u.screen.Note("还原：删除这次新建的容器")
+	u.screen.Note("删除这次新建的容器")
 	for i := len(entries) - 1; i >= 0; i-- {
 		e := entries[i]
 		switch e.Op {
@@ -80,12 +80,12 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		if u.fail("rollback-remove") {
 			note("（测试）模拟新容器没能删除")
 		}
-		note("新建的容器没能全部删除，为了安全没有还原数据，回滚资料全部保留")
+		note("新建的容器没能全部删除，为了安全没有动数据，回滚资料全部保留")
 		return problems
 	}
 
-	// 第 2 遍：还原数据。
-	u.screen.Note("还原：网络、文件、目录和数据卷")
+	// 第 2 遍：数据。
+	u.screen.Note("删除这次写入的网络、文件、目录和数据卷，放回原有的")
 	for i := len(entries) - 1; i >= 0; i-- {
 		e := entries[i]
 		switch e.Op {
@@ -98,7 +98,7 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		case opFile:
 			if e.Existed {
 				if _, err := os.Lstat(e.Backup); err != nil {
-					continue // 备份已经放回去了（之前还原过），或者还没来得及挪走原来的文件
+					continue // 备份已经放回去了（之前撤销过），或者还没来得及挪走原来的文件
 				}
 			}
 			if err := os.RemoveAll(e.Path); err != nil {
@@ -107,7 +107,7 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 			}
 			if e.Existed {
 				if err := moveOrCopy(e.Backup, e.Path); err != nil {
-					note("文件 %s 没能还原：%v", e.Path, err)
+					note("文件 %s 没能放回原来的：%v", e.Path, err)
 				}
 			}
 		case opMkdir:
@@ -125,15 +125,15 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		}
 	}
 	if u.fail("rollback-data") {
-		note("（测试）模拟数据没能还原")
+		note("（测试）模拟数据没能放回")
 	}
 	dataOK := len(problems) == 0
 	if !dataOK {
-		note("数据没能完全还原，原来的服务保持停止，请按回滚资料人工处理")
+		note("原有的数据没能全部放回，原来的服务保持停止，请按回滚资料人工处理")
 	}
 
-	// 第 3 遍：还原旧服务。
-	u.screen.Note("还原：原来的服务")
+	// 第 3 遍：旧服务。
+	u.screen.Note("放回新服务器上原来的服务")
 	images := map[string]string{}
 	for _, e := range entries {
 		if e.Op == opOldImages {
@@ -209,7 +209,7 @@ func (u *undo) undoBind(e Entry, note func(string, ...any)) {
 		}
 	}
 	if err := os.Rename(e.Backup, e.Path); err != nil {
-		note("目录 %s 没能还原：%v", e.Path, err)
+		note("目录 %s 没能放回原来的：%v", e.Path, err)
 	}
 }
 
@@ -225,7 +225,7 @@ func (u *undo) undoVolume(ctx context.Context, e Entry, note func(string, ...any
 		return
 	}
 	if !exists {
-		note("数据卷 %s 不见了，没法还原", e.Name)
+		note("数据卷 %s 不见了，没法放回原来的数据", e.Name)
 		return
 	}
 	f, err := os.Open(e.Backup)
@@ -240,7 +240,7 @@ func (u *undo) undoVolume(ctx context.Context, e Entry, note func(string, ...any
 	}
 	_, _ = f.Seek(0, 0)
 	if err := u.vio.replace(ctx, e.Name, f); err != nil {
-		note("数据卷 %s 没能还原：%v", e.Name, err)
+		note("数据卷 %s 没能放回原来的数据：%v", e.Name, err)
 	}
 }
 

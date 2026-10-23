@@ -78,8 +78,8 @@ func scriptFailure(s *Screen, clock *fakeClock) {
 	s.Fail()
 	s.PrintReport(Report{
 		Title:   "迁入结果",
-		Result:  "❌ 迁入失败，已安全回滚",
-		Lines:   []string{"失败步骤：" + s.FailedStage(), "新服务器：原来的服务和数据已还原"},
+		Result:  "❌ 迁入失败，迁入的内容已全部删除",
+		Lines:   []string{"失败步骤：" + s.FailedStage(), "新服务器：回到了迁入前的样子"},
 		Elapsed: 4 * time.Second,
 		LogPath: "/root/.dockhop/logs/in-20261021-120000-123.log",
 		LogTail: []string{"[12:00:04] $ docker volume create mysql_data", "[12:00:04]   → 退出码 1"},

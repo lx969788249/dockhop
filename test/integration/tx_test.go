@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ import (
 )
 
 // 事务和安全场景（设计文档附录 C）：新服务器上已经有同名的服务、数据时，迁入失败或
-// 被中断都要把新服务器还原到迁入前的样子；不安全的情况在改动任何东西之前停下。
+// 被中断都要删除迁入的内容、让新服务器回到迁入前的样子；不安全的情况在改动任何东西之前停下。
 
 // txFixture：旧服务器上一个独立容器 web（固定 IP、命名卷、挂载目录）。
 type txFixture struct {
@@ -128,7 +129,7 @@ func TestInReplaceAndRollback(t *testing.T) {
 	if code == 0 {
 		t.Fatal("模拟失败时迁入应失败")
 	}
-	mustContain(t, out, "❌ 迁入失败，已安全还原", "原来的服务和数据都已还原", "重新运行时不用重新下载")
+	mustContain(t, out, "❌ 迁入失败，迁入的内容已全部删除", "原来的服务和数据都在", "重新运行时不用重新下载")
 	f.targetIntact(t, oldID)
 	noLeftovers(t, home)
 
@@ -137,7 +138,7 @@ func TestInReplaceAndRollback(t *testing.T) {
 	if code == 0 {
 		t.Fatal("模拟写入失败时迁入应失败")
 	}
-	mustContain(t, out, "数据卷 "+f.vol+" 写入失败", "已安全还原")
+	mustContain(t, out, "数据卷 "+f.vol+" 写入失败", "迁入的内容已全部删除")
 	if strings.Contains(out, "下载迁移包 ✓") && !strings.Contains(out, "0 秒") {
 		t.Log("（重试时应直接用上次下载的文件）")
 	}
@@ -151,7 +152,7 @@ func TestInReplaceAndRollback(t *testing.T) {
 	}
 	_ = p.cmd.Process.Signal(os.Interrupt)
 	p.wait(t, 5*time.Minute)
-	mustContain(t, p.out(), "⚠️ 迁入已中断，已安全还原")
+	mustContain(t, p.out(), "⚠️ 迁入已中断，迁入的内容已全部删除")
 	f.targetIntact(t, oldID)
 
 	// 迁入到一半被 kill -9：下次运行时先还原，再正常迁入。
@@ -172,7 +173,7 @@ func TestInReplaceAndRollback(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("应成功，退出码 %d", code)
 	}
-	mustContain(t, out, "上次迁入", "已还原上次迁入之前的状态", "✅ 迁入完成")
+	mustContain(t, out, "上次迁入", "已删除上次迁入的内容", "✅ 迁入完成")
 	c := inspect(t, f.web)
 	if c["Id"] == oldID || c["Config"].(map[string]any)["Labels"].(map[string]any)["old"] != nil {
 		t.Error("web 应换成迁移过来的容器")
@@ -242,9 +243,9 @@ func TestInSafetyStops(t *testing.T) {
 	if code == 0 {
 		t.Fatal("应失败")
 	}
-	mustContain(t, out, "自动还原没有完全成功", "回滚资料：")
-	if strings.Contains(out, "已安全还原") {
-		t.Error("回滚没有完全成功时不能说已安全还原")
+	mustContain(t, out, "迁入的内容没能全部删除", "回滚资料：")
+	if strings.Contains(out, "已全部删除") {
+		t.Error("回滚没有完全成功时不能说已全部删除")
 	}
 	if _, err := os.Stat(filepath.Join(home, "rollback", "current", "journal.jsonl")); err != nil {
 		t.Errorf("回滚资料应保留：%v", err)
@@ -257,7 +258,7 @@ func TestInSafetyStops(t *testing.T) {
 		t.Fatal("清理失败时不应报告成功")
 	}
 	mustContain(t, out, "上次迁入", "只是标签和旧服务器不同", "服务和数据都已迁入，但清理没有完成")
-	if strings.Contains(out, "还原到迁入前") && strings.Contains(out, "迁入没有完成") {
+	if strings.Contains(out, "正在删除这次迁入的内容") {
 		t.Error("已经提交的迁入不能回滚")
 	}
 	if s := state(t, f.web); s != "running" {
@@ -345,7 +346,7 @@ func TestInStartFailureKeepsOld(t *testing.T) {
 	if code == 0 {
 		t.Fatal("应失败")
 	}
-	mustContain(t, out, "健康检查没有通过", "已安全还原")
+	mustContain(t, out, "健康检查没有通过", "迁入的内容已全部删除")
 	checkOld()
 
 	// 附录 C-8：没有健康检查的 web 启动后马上退出——判为失败，旧容器保留。
@@ -355,7 +356,7 @@ func TestInStartFailureKeepsOld(t *testing.T) {
 	if code == 0 {
 		t.Fatal("应失败")
 	}
-	mustContain(t, out, "启动后马上退出", "已安全还原")
+	mustContain(t, out, "启动后马上退出", "迁入的内容已全部删除")
 	checkOld()
 }
 
@@ -414,4 +415,140 @@ func TestInRejectsUnsafeBundle(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Error("用 --file 给的迁移包不能删")
 	}
+}
+
+// 一次迁入两个互不相干的服务、其中一个起不来：默认全部删除；--keep-succeeded 时只删除
+// 起不来的、保留正常运行的；处理好之后用同一个链接重新迁入，跳过已经迁入的、只迁入剩下的。
+func TestInPartial(t *testing.T) {
+	p := fmt.Sprintf("dmtest_pa%d", os.Getpid())
+	flag := filepath.Join("/run", p) // 系统路径：只重建挂载、不迁移内容，用来控制 bad 能不能启动
+	t.Cleanup(func() { removePrefixed(p); os.RemoveAll(flag) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	good, bad := p+"_good", p+"_bad"
+	os.MkdirAll(flag, 0o755)
+	os.WriteFile(filepath.Join(flag, "ok"), nil, 0o644)
+	for _, n := range []string{good, bad} {
+		sh(t, "docker", "volume", "create", n)
+		sh(t, "docker", "run", "--rm", "-v", n+":/v", "alpine:3.20", "sh", "-c", "echo "+n+" >/v/data.txt")
+	}
+	sh(t, "docker", "run", "-d", "--name", good, "--label", noWatchtower, "-v", good+":/data", "alpine:3.20", "sleep", "600")
+	sh(t, "docker", "run", "-d", "--name", bad, "--label", noWatchtower, "-v", bad+":/data", "-v", flag+":/flag",
+		"alpine:3.20", "sh", "-c", "test -e /flag/ok && exec sleep 600")
+	m := startOut(t, "--include", good+","+bad)
+
+	// 新服务器上什么都没有，bad 在新服务器上起不来。
+	removeAll(good, bad)
+	try("docker", "volume", "rm", good, bad)
+	os.Remove(filepath.Join(flag, "ok"))
+	home := t.TempDir()
+
+	// 默认（不能提问）：全部删除。
+	out, code := m.in(t, home, nil)
+	if code == 0 {
+		t.Fatal("应失败")
+	}
+	mustContain(t, out, "没能正常启动："+bad, "已经正常运行："+good, "全部删除这次迁入的内容", "迁入的内容已全部删除")
+	if exists("container", good) || exists("container", bad) || exists("volume", good) || exists("volume", bad) {
+		t.Error("全部删除后不应留下迁入的容器和卷")
+	}
+	noLeftovers(t, home)
+
+	// --keep-succeeded：保留 good，只删除 bad。
+	out, code = m.in(t, home, nil, "--keep-succeeded")
+	if code == 0 {
+		t.Fatal("只迁入了一部分时不能报告成功")
+	}
+	mustContain(t, out, "⚠️ 只迁入了一部分", "已经迁入、正常运行："+good, "没有迁入（已删除）："+bad, "重新运行同一条迁入命令")
+	if s := state(t, good); s != "running" {
+		t.Errorf("保留的服务应在运行：%s", s)
+	}
+	if got := volumeFiles(t, good); !strings.Contains(got, good) {
+		t.Errorf("保留的服务的数据：\n%s", got)
+	}
+	if exists("container", bad) || exists("volume", bad) {
+		t.Error("没启动的服务和它的数据应删除")
+	}
+	goodID := inspect(t, good)["Id"]
+	noLeftovers(t, home)
+	m.out.waitFor(t, regexp.MustCompile("新服务器只迁入了一部分"), time.Minute)
+
+	// 处理好问题后用同一个链接重新迁入：good 不动，只迁入 bad。
+	os.WriteFile(filepath.Join(flag, "ok"), nil, 0o644)
+	out, code = m.in(t, home, nil)
+	if code != 0 {
+		t.Fatalf("重新迁入应成功：%d", code)
+	}
+	mustContain(t, out, "上次已经迁入、这次跳过："+good, "✅ 迁入完成", "上次已经迁入："+good)
+	if inspect(t, good)["Id"] != goodID {
+		t.Error("已经迁入的服务不应重新创建")
+	}
+	if s := state(t, bad); s != "running" {
+		t.Errorf("bad 应在运行：%s", s)
+	}
+	if got := volumeFiles(t, bad); !strings.Contains(got, bad) {
+		t.Errorf("bad 的数据：\n%s", got)
+	}
+	m.waitOutSuccess(t)
+	if left, _ := filepath.Glob(filepath.Join(home, "state", "*")); len(left) > 0 {
+		t.Errorf("全部迁入后应删除记录：%v", left)
+	}
+	noLeftovers(t, home)
+}
+
+// 新服务器上的 docker compose 读不懂项目的配置文件时，在改动任何东西之前停下。
+func TestInComposePrecheck(t *testing.T) {
+	if exec.Command("docker", "compose", "version").Run() != nil {
+		t.Skip("没有 docker compose 插件")
+	}
+	p := fmt.Sprintf("dmtest_cc%d", os.Getpid())
+	project := p + "proj"
+	t.Cleanup(func() { removeProject(project); removePrefixed(p) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	proj := filepath.Join(t.TempDir(), "proj")
+	os.MkdirAll(proj, 0o755)
+	os.WriteFile(filepath.Join(proj, "compose.yml"), []byte(`services:
+  app:
+    image: alpine:3.20
+    command: ["sleep", "600"]
+    labels: {com.centurylinklabs.watchtower.enable: "false"}
+`), 0o644)
+	up := exec.Command("docker", "compose", "-p", project, "up", "-d")
+	up.Dir = proj
+	if b, err := up.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, b)
+	}
+	m := startOut(t, "--include", containerByLabel(t, project, "app"))
+	removeProject(project)
+	os.RemoveAll(proj) // 新服务器上还没有项目目录
+
+	// 假的 docker：compose config 一律报错，其他命令照常。
+	real, err := exec.LookPath("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := t.TempDir()
+	os.WriteFile(filepath.Join(fake, "docker"), []byte("#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = config ] && "+
+		"{ echo 'services.app Additional property bogus is not allowed' >&2; exit 15; }; done\nexec "+real+" \"$@\"\n"), 0o755)
+	home := t.TempDir()
+	out, code := m.in(t, home, []string{"PATH=" + fake + ":" + os.Getenv("PATH")})
+	if code == 0 {
+		t.Fatal("应失败")
+	}
+	mustContain(t, out, "读不懂 Compose 项目 "+project+" 的配置文件", "bogus", "还没有改动新服务器")
+	if c := try("docker", "ps", "-aq", "--filter", "label=com.docker.compose.project="+project); c != "" {
+		t.Errorf("不应创建项目的容器：%s", c)
+	}
+	if _, err := os.Stat(proj); err == nil {
+		t.Error("不应写入项目目录")
+	}
+
+	// 新服务器上的 docker compose 正常：迁入成功。
+	if _, code = m.in(t, home, nil); code != 0 {
+		t.Fatalf("应成功：%d", code)
+	}
+	if s := state(t, containerByLabel(t, project, "app")); s != "running" {
+		t.Errorf("app 应在运行：%s", s)
+	}
+	m.waitOutSuccess(t)
+	noLeftovers(t, home)
 }

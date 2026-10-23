@@ -30,6 +30,7 @@ type InOptions struct {
 	SkipCheck     bool
 	HealthTimeout time.Duration
 	KeepFiles     bool
+	KeepSucceeded bool
 }
 
 // UsageError 是用户输入的命令或选项不对，退出码 2。
@@ -144,6 +145,7 @@ func parseIn(args []string, needLink bool) (InOptions, error) {
 	fs.BoolVar(&o.SkipCheck, "skip-check", false, "")
 	seconds := fs.Int("health-timeout", 60, "")
 	fs.BoolVar(&o.KeepFiles, "keep-files", false, "")
+	fs.BoolVar(&o.KeepSucceeded, "keep-succeeded", false, "")
 	rest, err := parseArgs(fs, args)
 	if err != nil {
 		return o, err

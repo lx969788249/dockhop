@@ -11,10 +11,11 @@ import (
 )
 
 // 事务日志：迁入时对新服务器的每一处改动，都先在日志里追加一条记录（写到磁盘）
-// 再动手。失败、被 Ctrl+C 中断时按日志倒着还原；程序被强制结束（kill -9、断电）时，
-// 日志留在磁盘上，下次运行时据此还原。写下“已提交”之后就不再还原。
+// 再动手。失败、被 Ctrl+C 中断时按日志倒着撤销（删除这次迁入的内容，把被替换的
+// 原有服务放回去）；程序被强制结束（kill -9、断电）时，日志留在磁盘上，下次运行时
+// 据此撤销。写下“已提交”之后就不再撤销。
 //
-// 每一种还原操作都可以重复执行：还原到一半又被中断，下次再从头还原一遍也是安全的。
+// 每一种撤销操作都可以重复执行：撤销到一半又被中断，下次再从头撤销一遍也是安全的。
 
 // Op 是一种改动。
 type Op string
@@ -33,7 +34,7 @@ const (
 	opNetwork    Op = "network"     // 新建网络（Name）
 	opContainer  Op = "container"   // 新建容器（Name）
 	opComposeUp  Op = "compose_up"  // 启动 Compose 项目（Name、Networks：启动前已有的项目网络）
-	opCommit     Op = "commit"      // 已提交：新服务都验证通过，不再还原
+	opCommit     Op = "commit"      // 已提交：新服务都验证通过，不再撤销
 )
 
 // Entry 是日志里的一条记录。
@@ -51,6 +52,7 @@ type Entry struct {
 	Old      []OldContainer    `json:"old,omitempty"`
 	Images   map[string]string `json:"images,omitempty"` // 容器 ID → 回滚镜像
 	Names    []string          `json:"names,omitempty"`
+	Group    string            `json:"group,omitempty"` // 属于哪一组服务（见 groups.go）；为空表示整次迁入共用
 }
 
 // OldContainer 是新服务器上原有的 Compose 容器，回滚时据此原样重建。
@@ -64,9 +66,10 @@ type OldContainer struct {
 
 // Journal 是一个打开的事务日志。
 type Journal struct {
-	dir string
-	f   *os.File
-	n   int
+	dir   string
+	f     *os.File
+	n     int
+	group string // 之后的记录属于哪一组服务
 }
 
 func journalPath(dir string) string { return filepath.Join(dir, "journal.jsonl") }
@@ -91,6 +94,9 @@ func openJournal(dir string) (*Journal, error) {
 // add 追加一条记录并写到磁盘。写不进去时不能继续改动。
 func (j *Journal) add(e Entry) error {
 	e.Time = time.Now()
+	if e.Group == "" {
+		e.Group = j.group
+	}
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
@@ -139,6 +145,33 @@ func readJournal(dir string) ([]Entry, error) {
 		return out, err
 	}
 	return out, nil
+}
+
+// rewriteJournal 把日志换成 entries（先写临时文件再改名，换到一半断电也不会坏）。
+func rewriteJournal(dir string, entries []Entry) error {
+	tmp := journalPath(dir) + ".new"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		b, err := json.Marshal(e)
+		if err == nil {
+			_, err = f.Write(append(b, '\n'))
+		}
+		if err != nil {
+			f.Close()
+			return err
+		}
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, journalPath(dir))
 }
 
 func committed(entries []Entry) bool {

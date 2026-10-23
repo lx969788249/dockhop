@@ -186,3 +186,84 @@ func TestEntryJSON(t *testing.T) {
 		t.Errorf("日志记录应能原样读回：%s", b)
 	}
 }
+
+// 有关联的服务分在同一组，互不相干的分开；临时停止的已有容器跟着它用到的数据走。
+func TestBuildGroups(t *testing.T) {
+	mk := func(name, project, js string) *citem {
+		var c docker.Container
+		if err := json.Unmarshal([]byte(js), &c); err != nil {
+			t.Fatal(err)
+		}
+		c.Name = "/" + name
+		return &citem{m: bundle.Container{Name: name, Project: project}, c: &c}
+	}
+	r := &run{m: &bundle.Manifest{
+		Binds:    []bundle.Bind{{Path: "/srv/shared"}, {Path: "/srv/blog"}, {Path: "/var/run/docker.sock"}},
+		Volumes:  []bundle.Volume{{Name: "dbdata"}, {Name: "cache"}},
+		Projects: []bundle.Project{{Name: "blog", WorkingDir: "/srv/blog/app"}},
+	}}
+	r.projects = r.m.Projects
+	r.items = []*citem{
+		mk("web", "", `{"Mounts":[{"Type":"bind","Source":"/srv/shared/html"}],"NetworkSettings":{"Networks":{"bridge":{}}}}`),
+		mk("nginx", "", `{"Mounts":[{"Type":"bind","Source":"/srv/shared"},{"Type":"bind","Source":"/var/run/docker.sock"}]}`),
+		mk("blog-app-1", "blog", `{"NetworkSettings":{"Networks":{"blog_default":{}}}}`),
+		mk("blog-db-1", "blog", `{"Mounts":[{"Type":"volume","Name":"dbdata"}]}`),
+		mk("files", "", `{"Mounts":[{"Type":"bind","Source":"/srv/blog/uploads"}]}`),
+		mk("redis", "", `{"Mounts":[{"Type":"volume","Name":"cache"}],"NetworkSettings":{"Networks":{"bridge":{}}}}`),
+		mk("exporter", "", `{"HostConfig":{"NetworkMode":"container:redis"}}`),
+		mk("alone", "", `{"Mounts":[{"Type":"bind","Source":"/var/run/docker.sock"}]}`),
+	}
+	var w docker.Container
+	json.Unmarshal([]byte(`{"Mounts":[{"Type":"volume","Name":"cache"}]}`), &w)
+	r.buildGroups([]writer{{summary: docker.ContainerSummary{Names: []string{"/backup"}}, full: &w}})
+
+	var got []string
+	for _, g := range r.groups {
+		got = append(got, g.label())
+	}
+	want := []string{"web、nginx", "Compose 项目 blog、files", "redis、exporter", "alone"}
+	if strings.Join(got, " | ") != strings.Join(want, " | ") {
+		t.Fatalf("分组不对：\n现在：%v\n应该：%v", got, want)
+	}
+	if r.groupOf["v:dbdata"] != r.groupOf["p:blog"] || r.groupOf["b:/srv/blog"] != r.groupOf["p:blog"] {
+		t.Error("项目用到的卷、项目目录所在的挂载目录应和项目同组")
+	}
+	if r.groupOf["w:backup"] != r.groupOf["c:redis"] {
+		t.Error("临时停止的容器应和用同一个卷的服务同组")
+	}
+	if _, ok := r.groupOf["b:/var/run/docker.sock"]; ok {
+		t.Error("宿主机系统路径不应把服务连到一起")
+	}
+}
+
+// 只删除没启动的组时，日志里只留下这些组的改动（和开头的那条），之后再被强制结束也只会删它们。
+func TestRewriteJournal(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "rb")
+	j, err := openJournal(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.group = "1"
+	j.add(Entry{Op: opContainer, Name: "web"})
+	j.group = "2"
+	j.add(Entry{Op: opContainer, Name: "api"})
+	j.add(Entry{Op: opVolume, Name: "keep", Group: "1"})
+	j.close()
+	entries, _ := readJournal(dir)
+	var drop []Entry
+	for _, e := range entries {
+		if e.Op == opStart || e.Group == "2" {
+			drop = append(drop, e)
+		}
+	}
+	if len(drop) != 2 || entries[3].Group != "1" {
+		t.Fatalf("组记录不对：%+v", entries)
+	}
+	if err := rewriteJournal(dir, drop); err != nil {
+		t.Fatal(err)
+	}
+	back, _ := readJournal(dir)
+	if len(back) != 2 || back[0].Op != opStart || back[1].Name != "api" || committed(back) {
+		t.Fatalf("改写后的日志不对：%+v", back)
+	}
+}
