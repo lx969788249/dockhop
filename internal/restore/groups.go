@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
@@ -266,7 +267,9 @@ func (r *run) decidePartial(ok, failed []*group) (bool, error) {
 //  1. 恢复临时停下的、属于保留下来的组的容器（失败就整体删除，和全部成功时一样）；
 //  2. 日志里只留下没启动的组的改动（之后被强制结束，下次运行只会删除它们）；
 //  3. 按日志删除没启动的组；
-//  4. 删除保留下来的组的回滚资料，记下已经迁入的服务，重试时跳过。
+//  4. 删除保留下来的组的回滚资料（被替换的旧容器、回滚镜像、旧目录）。有删不掉的，
+//     日志改写成“已提交”加上这些记录，和全部成功时一样，下次运行迁入时接着删；
+//  5. 记下已经迁入的服务，重试时跳过。
 func (r *run) commitPartial(ctx context.Context, ok, failed []*group) error {
 	s := r.Screen
 	failedID := map[string]bool{}
@@ -305,7 +308,15 @@ func (r *run) commitPartial(ctx context.Context, ok, failed []*group) error {
 	r.rollbackIssues = r.undo.rollback(ctx, drop)
 	r.rollbackDone = true
 	r.cleanupLeft = r.undo.cleanupCommitted(ctx, keep)
-	if len(r.rollbackIssues) == 0 {
+	switch {
+	case len(r.rollbackIssues) > 0:
+		// 日志里还是没启动的组的改动，下次运行迁入时接着删除它们。
+		// 保留下来的组没删掉的回滚资料只能在结果里列出来，交给人工处理。
+	case len(r.cleanupLeft) > 0:
+		if err := rewriteJournal(r.rbDir, append(keep, Entry{Op: opCommit, Time: time.Now()})); err != nil {
+			r.cleanupLeft = append(r.cleanupLeft, "事务日志没能改写："+err.Error())
+		}
+	default:
 		if err := os.RemoveAll(r.rbDir); err != nil {
 			r.Log.Printf("回滚资料目录没能删除：%v", err)
 		}

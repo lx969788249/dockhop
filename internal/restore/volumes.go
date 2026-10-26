@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 
 	"github.com/lx969788249/dockhop/internal/docker"
@@ -149,14 +148,15 @@ func prepareHelper(home string) (string, error) {
 	return dst, os.Rename(tmp, dst)
 }
 
-// removeHelpers 删除上次被中断时留下的临时容器。
+// removeHelpers 删除上次被中断时留下的临时容器。只认标签，不看名字：用户自己的容器
+// 名字碰巧也以 dockhop-helper- 开头时不能删。
 func removeHelpers(ctx context.Context, dc *docker.Client) {
 	list, err := dc.Containers(ctx, true)
 	if err != nil {
 		return
 	}
 	for _, c := range list {
-		if strings.HasPrefix(c.Name(), "dockhop-helper-") {
+		if c.Labels[HelperLabel] == "1" {
 			_ = dc.RemoveContainerAndVolumes(ctx, c.ID)
 		}
 	}

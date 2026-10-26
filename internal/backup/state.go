@@ -8,10 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -35,6 +35,8 @@ type stoppedRecord struct {
 }
 
 func statePath(home string) string { return filepath.Join(home, "state", stateFile) }
+
+func lockPath(home string) string { return filepath.Join(home, "locks", "out.lock") }
 
 // writeStopped 在停机之前写下记录（先写临时文件再改名，不会留下写了一半的文件）。
 func writeStopped(home string, list []StoppedContainer) error {
@@ -61,14 +63,6 @@ func removeStopped(home string) error {
 	return err
 }
 
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
-}
-
 // RecoverInterrupted 检查上次迁出有没有被中断、留下停着的容器。有的话提示用户
 // （不能提问时直接恢复，因为那就是它们原来的状态），把它们恢复原状。
 func RecoverInterrupted(ctx context.Context, dc *docker.Client, home string, screen *ui.Screen, prompt *ui.Prompter) error {
@@ -79,13 +73,20 @@ func RecoverInterrupted(ctx context.Context, dc *docker.Client, home string, scr
 	if err != nil {
 		return err
 	}
+	// 迁出运行时一直拿着这把锁，进程结束（包括被 kill -9、断电）锁就自动释放。
+	// 拿不到锁说明那次迁出还在运行；不用进程号判断：重启后进程号可能被别的程序占用。
+	lock, err := host.TryLock(lockPath(home))
+	if errors.Is(err, host.ErrLocked) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer lock.Unlock()
 	var rec stoppedRecord
 	if err := json.Unmarshal(b, &rec); err != nil {
 		screen.Warn("上次迁出的停机记录读不懂，已忽略：%v", err)
 		return removeStopped(home)
-	}
-	if rec.PID != os.Getpid() && processAlive(rec.PID) {
-		return nil // 那次迁出还在运行
 	}
 	var still []StoppedContainer
 	for _, c := range rec.Containers {

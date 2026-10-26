@@ -1531,7 +1531,9 @@ func (r *run) commit(ctx context.Context) error {
 	}
 	r.committed = true
 	entries, err := readJournal(r.rbDir)
-	if err == nil {
+	if err != nil {
+		r.cleanupLeft = []string{"事务日志读不了（" + err.Error() + "），回滚资料没有删除"}
+	} else {
 		r.cleanupLeft = r.undo.cleanupCommitted(ctx, entries)
 	}
 	if len(r.cleanupLeft) == 0 {
@@ -1661,7 +1663,11 @@ func (r *run) report(ctx context.Context, err error) error {
 			lines = append(lines, "回滚资料："+r.rbDir+"（下次运行迁入时会提示继续删除）")
 		}
 		if len(r.cleanupLeft) > 0 {
-			lines = append(lines, "有些回滚资料没能删除："+strings.Join(r.cleanupLeft, "；"))
+			left := "有些回滚资料没能删除：" + strings.Join(r.cleanupLeft, "；")
+			if len(r.rollbackIssues) == 0 {
+				left += "（下次运行迁入时会接着删除）"
+			}
+			lines = append(lines, left)
 		}
 		lines = append(lines, "处理好问题后，重新运行同一条迁入命令：已经迁入的会跳过，只迁入剩下的")
 		status.Result = "partial"
@@ -1741,7 +1747,8 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 		return nil
 	}
 	if err != nil {
-		return fail(s, "上次迁入的事务日志读不了", err.Error(), "检查 "+r.rbDir)
+		return fail(s, "上次迁入的事务日志读不了，没法自动删除上次迁入的内容", err.Error(),
+			"回滚资料都保留在 "+r.rbDir+"（journal.jsonl 记着每一处改动），请人工处理后删除这个目录再重新运行")
 	}
 	img := ""
 	if list, err := r.Docker.Containers(ctx, true); err == nil && len(list) > 0 {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -265,5 +266,28 @@ func TestRewriteJournal(t *testing.T) {
 	back, _ := readJournal(dir)
 	if len(back) != 2 || back[0].Op != opStart || back[1].Name != "api" || committed(back) {
 		t.Fatalf("改写后的日志不对：%+v", back)
+	}
+}
+
+// 日志中间有一条记录损坏时，不知道漏掉的是哪一处改动，不能当它不存在。
+func TestJournalDamagedMiddleLine(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "rb")
+	j, err := openJournal(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.add(Entry{Op: opVolume, Name: "data"})
+	j.close()
+	f, _ := os.OpenFile(journalPath(dir), os.O_APPEND|os.O_WRONLY, 0o600)
+	f.WriteString("{\"op\":\"bind\",\"pa\x00\x00\n")
+	f.WriteString(`{"op":"container","name":"web"}` + "\n")
+	f.Close()
+	if _, err := readJournal(dir); !errors.Is(err, ErrJournalDamaged) {
+		t.Fatalf("中间损坏应报错：%v", err)
+	}
+	// 读得懂但不是日志记录的行也算损坏。
+	os.WriteFile(journalPath(dir), []byte(`{"op":"start"}`+"\n"+`{"x":1}`+"\n"+`{"op":"commit"}`+"\n"), 0o600)
+	if _, err := readJournal(dir); !errors.Is(err, ErrJournalDamaged) {
+		t.Fatalf("没有 op 的记录应算损坏：%v", err)
 	}
 }

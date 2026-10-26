@@ -161,6 +161,10 @@ func noLeftovers(t *testing.T, home string) {
 	if h := try("docker", "ps", "-aq", "--filter", "label=dockhop.helper=1"); h != "" {
 		t.Errorf("临时容器没有删除：%s", h)
 	}
+	// 做带删除改动的镜像用的临时容器没有标签（标签会进到镜像里），按名字查。
+	if h := try("docker", "ps", "-a", "--filter", "name=dockhop-helper-[0-9]", "--format", "{{.Names}}"); h != "" {
+		t.Errorf("临时容器没有删除：%s", h)
+	}
 	if left, _ := filepath.Glob(filepath.Join(home, "rollback", "*")); len(left) > 0 {
 		t.Errorf("回滚资料没有删除：%v", left)
 	}

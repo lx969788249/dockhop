@@ -75,7 +75,7 @@ type run struct {
 // 最后打印结果摘要。
 func Run(ctx context.Context, d Deps, o Options) error {
 	r := &run{Deps: d, opts: o, started: time.Now(), rid: randomID()}
-	lock, err := host.TryLock(filepath.Join(d.Home, "locks", "out.lock"))
+	lock, err := host.TryLock(lockPath(d.Home))
 	if err != nil {
 		d.Screen.Error(err.Error(), "")
 		return ErrReported

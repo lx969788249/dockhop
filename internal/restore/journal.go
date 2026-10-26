@@ -33,6 +33,7 @@ const (
 	opMkdir      Op = "mkdir"       // 新建目录（Path）
 	opNetwork    Op = "network"     // 新建网络（Name）
 	opContainer  Op = "container"   // 新建容器（Name）
+	opHelper     Op = "helper"      // 新建临时容器（Name），用完就删
 	opComposeUp  Op = "compose_up"  // 启动 Compose 项目（Name、Networks：启动前已有的项目网络）
 	opCommit     Op = "commit"      // 已提交：新服务都验证通过，不再撤销
 )
@@ -123,8 +124,12 @@ func (j *Journal) close() {
 	}
 }
 
+// ErrJournalDamaged 表示事务日志中间有读不懂的记录：不知道漏掉的是哪一处改动，
+// 不能自动撤销，回滚资料要全部保留、交给人工处理。
+var ErrJournalDamaged = errors.New("事务日志中间有一条记录损坏了")
+
 // readJournal 读出日志里的全部记录。最后一行写了一半（写的时候断电）时忽略那一行：
-// 记录总是在改动之前写的，没写完说明那处改动还没发生。
+// 记录总是在改动之前写的，没写完说明那处改动还没发生。别的行读不懂时返回错误。
 func readJournal(dir string) ([]Entry, error) {
 	f, err := os.Open(journalPath(dir))
 	if err != nil {
@@ -132,17 +137,22 @@ func readJournal(dir string) ([]Entry, error) {
 	}
 	defer f.Close()
 	var out []Entry
+	bad := 0 // 读不懂的那一行的行号
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 64<<20)
-	for sc.Scan() {
+	for n := 1; sc.Scan(); n++ {
+		if bad > 0 {
+			return nil, fmt.Errorf("%w（第 %d 行）", ErrJournalDamaged, bad)
+		}
 		var e Entry
-		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
+		if err := json.Unmarshal(sc.Bytes(), &e); err != nil || e.Op == "" {
+			bad = n
 			continue
 		}
 		out = append(out, e)
 	}
-	if err := sc.Err(); err != nil && !errors.Is(err, bufio.ErrTooLong) {
-		return out, err
+	if err := sc.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

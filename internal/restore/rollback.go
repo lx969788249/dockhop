@@ -41,7 +41,7 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 	}
 	oldIDs := map[string]bool{}
 	for _, e := range entries {
-		if e.ID != "" {
+		if e.ID != "" && e.Op != opHelper {
 			oldIDs[e.ID] = true
 		}
 		for _, o := range e.Old {
@@ -60,6 +60,8 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 					note("本次新建的容器 %s 没能删除：%v", e.Name, err)
 				}
 			}
+		case opHelper:
+			u.removeHelper(ctx, e, note)
 		case opComposeUp:
 			list, err := u.dc.ContainersByLabel(ctx, "com.docker.compose.project="+e.Name)
 			if err != nil {
@@ -160,6 +162,13 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		}
 	}
 	return problems
+}
+
+// removeHelper 删除 DockHop 自己的临时容器（按日志里记下的名字，名字里带着进程号）。
+func (u *undo) removeHelper(ctx context.Context, e Entry, note func(string, ...any)) {
+	if err := u.dc.RemoveContainerAndVolumes(ctx, e.Name); err != nil && !docker.IsNotFound(err) {
+		note("临时容器 %s 没能删除：%v", e.Name, err)
+	}
 }
 
 func (u *undo) removeComposeNetworks(ctx context.Context, e Entry, note func(string, ...any)) {
@@ -398,6 +407,8 @@ func (u *undo) cleanupCommitted(ctx context.Context, entries []Entry) []string {
 	}
 	for _, e := range entries {
 		switch e.Op {
+		case opHelper:
+			u.removeHelper(ctx, e, func(f string, a ...any) { left = append(left, fmt.Sprintf(f, a...)) })
 		case opRename:
 			if err := u.dc.RemoveContainer(ctx, e.ID, true); err != nil && !docker.IsNotFound(err) {
 				left = append(left, fmt.Sprintf("改名备份的旧容器 %s：%v", e.Backup, err))

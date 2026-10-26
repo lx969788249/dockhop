@@ -85,7 +85,13 @@ func (r *run) changedImage(ctx context.Context, it *citem, base string) (string,
 		tmp["User"] = "0:0"
 		commitCfg["User"] = bc.User
 	}
-	id, err := dc.CreateContainer(ctx, fmt.Sprintf("dockhop-helper-%s-%d", runID, r.vio.n.Add(1)), tmp)
+	// 这个临时容器不能带 dockhop.helper 标签：commit 时标签会进到镜像里，再跟着镜像到
+	// 迁入的容器上。所以记进事务日志，程序被强制结束后由回滚或提交后的清理删除。
+	name := fmt.Sprintf("dockhop-helper-%s-%d", runID, r.vio.n.Add(1))
+	if err := r.j.add(Entry{Op: opHelper, Name: name}); err != nil {
+		return "", err
+	}
+	id, err := dc.CreateContainer(ctx, name, tmp)
 	if err != nil {
 		return "", err
 	}

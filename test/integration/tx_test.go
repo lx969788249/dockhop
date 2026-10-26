@@ -432,6 +432,10 @@ func TestInPartial(t *testing.T) {
 		sh(t, "docker", "run", "--rm", "-v", n+":/v", "alpine:3.20", "sh", "-c", "echo "+n+" >/v/data.txt")
 	}
 	sh(t, "docker", "run", "-d", "--name", good, "--label", noWatchtower, "-v", good+":/data", "alpine:3.20", "sleep", "600")
+	// 用户自己的容器，名字碰巧以 dockhop-helper- 开头（没有 DockHop 的标签）：迁出、迁入时都不能删。
+	decoy := "dockhop-helper-" + p
+	sh(t, "docker", "run", "-d", "--name", decoy, "--label", noWatchtower, "-v", "/keep", "alpine:3.20", "sleep", "600")
+	decoyID := inspect(t, decoy)["Id"]
 	sh(t, "docker", "run", "-d", "--name", bad, "--label", noWatchtower, "-v", bad+":/data", "-v", flag+":/flag",
 		"alpine:3.20", "sh", "-c", "test -e /flag/ok && exec sleep 600")
 	m := startOut(t, "--include", good+","+bad)
@@ -453,12 +457,17 @@ func TestInPartial(t *testing.T) {
 	}
 	noLeftovers(t, home)
 
-	// --keep-succeeded：保留 good，只删除 bad。
-	out, code = m.in(t, home, nil, "--keep-succeeded")
+	// --keep-succeeded：保留 good，只删除 bad。同时模拟保留下来的部分清理回滚资料失败：
+	// 不能把记录一起删掉，下次运行要接着清理。
+	out, code = m.in(t, home, []string{"DOCKHOP_TEST_FAIL=commit-cleanup"}, "--keep-succeeded")
 	if code == 0 {
 		t.Fatal("只迁入了一部分时不能报告成功")
 	}
-	mustContain(t, out, "⚠️ 只迁入了一部分", "已经迁入、正常运行："+good, "没有迁入（已删除）："+bad, "重新运行同一条迁入命令")
+	mustContain(t, out, "⚠️ 只迁入了一部分", "已经迁入、正常运行："+good, "没有迁入（已删除）："+bad, "重新运行同一条迁入命令",
+		"有些回滚资料没能删除", "下次运行迁入时会接着删除")
+	if b, err := os.ReadFile(filepath.Join(home, "rollback", "current", "journal.jsonl")); err != nil || !strings.Contains(string(b), `"op":"commit"`) {
+		t.Errorf("清理没完成时应保留标为已提交的日志：%v\n%s", err, b)
+	}
 	if s := state(t, good); s != "running" {
 		t.Errorf("保留的服务应在运行：%s", s)
 	}
@@ -469,7 +478,6 @@ func TestInPartial(t *testing.T) {
 		t.Error("没启动的服务和它的数据应删除")
 	}
 	goodID := inspect(t, good)["Id"]
-	noLeftovers(t, home)
 	m.out.waitFor(t, regexp.MustCompile("新服务器只迁入了一部分"), time.Minute)
 
 	// 处理好问题后用同一个链接重新迁入：good 不动，只迁入 bad。
@@ -481,6 +489,9 @@ func TestInPartial(t *testing.T) {
 	mustContain(t, out, "上次已经迁入、这次跳过："+good, "✅ 迁入完成", "上次已经迁入："+good)
 	if inspect(t, good)["Id"] != goodID {
 		t.Error("已经迁入的服务不应重新创建")
+	}
+	if !exists("container", decoy) || inspect(t, decoy)["Id"] != decoyID || state(t, decoy) != "running" {
+		t.Error("名字以 dockhop-helper- 开头、但不是 DockHop 创建的容器被删了")
 	}
 	if s := state(t, bad); s != "running" {
 		t.Errorf("bad 应在运行：%s", s)
