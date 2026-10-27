@@ -8,10 +8,10 @@
 # 设置了 DOCKHOP_MIRROR=镜像站地址 时只用这个镜像站。
 set -euo pipefail
 
-VERSION="1.0.7"
-SHA256_AMD64="ef55c33fb54d1bc799f924f259ff0649cf45cc5857cf47a26b0c0cb5d4018d8c"
-SHA256_ARM64="d670feb5f0244b3b9eabed5571bebe9ca41f1ecf55cd63d70cd2dfe90d77c8da"
-SHA256_ARMV7="75e3580f0f87aa605c0490f1f56e3c8aa5bb21ad2bb0f79a56930bd79ec86422"
+VERSION="1.0.8"
+SHA256_AMD64="160871120fc189201d8287a0fb8bf0eb72aae72a4c6a7c6a2bcbbea6a5c440ce"
+SHA256_ARM64="d5ecfb76cee75065b2bebe5e98b6d0c4ce11660d7b29c9df3486dc0ead1067ab"
+SHA256_ARMV7="0964324b86b0328a0bacd578efebeca7c77821c9f9cd1c4f99f0bfae18a65178"
 RELEASES="https://github.com/lx969788249/dockhop/releases/download"
 
 fail() {
