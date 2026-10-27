@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -73,7 +74,6 @@ func scriptSuccess(s *Screen, clock *fakeClock) {
 
 // 一次失败的迁入：失败原因只保留第一条，附日志位置；建议只在结果摘要里写一次。
 func scriptFailure(s *Screen, clock *fakeClock) {
-	s.ReportFollows()
 	s.Begin(8, 9, "恢复数据")
 	clock.advance(4 * time.Second)
 	s.Error("数据卷 mysql_data 写入失败：磁盘空间不足", "执行 df -h 查看剩余空间，清理后重试")
@@ -158,7 +158,7 @@ func TestProgressLifecycle(t *testing.T) {
 	p.Write(make([]byte, 1024))
 	p.Done(nil)
 	s.End("1 个卷")
-	if !strings.HasSuffix(out.String(), "[4/7] 停机并打包 \033[1;32m✓\033[0m 1 个卷\n") {
+	if !strings.HasSuffix(out.String(), "[4/7] 停机并打包 \033[32m✓\033[0m 1 个卷\n") {
 		t.Fatalf("进度结束后应回到步骤行：%q", out.String())
 	}
 }
@@ -209,16 +209,16 @@ func TestRedrawAfterQuestions(t *testing.T) {
 	s.Println("    1) web")
 	s.Warn("自动加入 db")
 	s.End("web")
-	screen := out.String()[strings.LastIndex(out.String(), ClearScreen)+len(ClearScreen):]
-	want := "DockHop\n\n[1/6] 检查环境 \033[1;32m✓\033[0m Docker 29\n    \033[1;33m!\033[0m 自动加入 db\n" +
-		"[2/6] 选择要迁移的服务 \033[1;32m✓\033[0m web\n"
+	screen := out.String()[strings.LastIndex(out.String(), clearScreen)+len(clearScreen):]
+	want := "DockHop\n\n[1/6] 检查环境 \033[32m✓\033[0m Docker 29\n    \033[33m!\033[0m 自动加入 db\n" +
+		"[2/6] 选择要迁移的服务 \033[32m✓\033[0m web\n"
 	if screen != want {
 		t.Errorf("清屏重画后：\n实际 %q\n期望 %q", screen, want)
 	}
 	// 没问过问题的步骤不清屏。
 	s.Begin(3, 6, "读取配置")
 	s.End("")
-	if strings.Count(out.String(), ClearScreen) != 1 {
+	if strings.Count(out.String(), clearScreen) != 1 {
 		t.Errorf("没问过问题的步骤不应清屏：%q", out.String())
 	}
 	// 不是终端时、--verbose 时从不清屏。
@@ -230,8 +230,68 @@ func TestRedrawAfterQuestions(t *testing.T) {
 		x.Hold()
 		x.End("web")
 	}
-	if strings.Contains(pout.String(), ClearScreen) || strings.Contains(vout.String(), ClearScreen) {
+	if strings.Contains(pout.String(), clearScreen) || strings.Contains(vout.String(), clearScreen) {
 		t.Errorf("不是终端时、--verbose 时不应清屏：%q %q", pout.String(), vout.String())
+	}
+}
+
+// Start 在终端里先清屏再显示程序名字；不是终端时只写名字。
+func TestStart(t *testing.T) {
+	s, out, _ := newScreen(true)
+	s.SetBanner("DockHop\n")
+	s.Start()
+	if out.String() != clearScreen+"DockHop\n" {
+		t.Errorf("终端里：%q", out.String())
+	}
+	p, pout, _ := newScreen(false)
+	p.SetBanner("DockHop\n")
+	p.Start()
+	p.Refresh()
+	if pout.String() != "DockHop\n" {
+		t.Errorf("不是终端时：%q", pout.String())
+	}
+}
+
+// Error 当场只写原因（建议在结果摘要里）；Problem 用在没有结果摘要的地方，当场写出建议。
+func TestErrorAndProblem(t *testing.T) {
+	s, out, _ := newScreen(false)
+	s.Error("磁盘满了", "清理磁盘")
+	if out.String() != "✗ 磁盘满了\n" || s.Failure().Hint != "清理磁盘" {
+		t.Errorf("Error：%q %+v", out.String(), s.Failure())
+	}
+	p, pout, _ := newScreen(false)
+	p.Problem("连不上 Docker", "systemctl start docker")
+	if pout.String() != "✗ 连不上 Docker\n  建议：systemctl start docker\n" {
+		t.Errorf("Problem：%q", pout.String())
+	}
+}
+
+// 颜色只上色、不加粗：有的终端里加粗的中文会显示成乱码。
+func TestColorsNotBold(t *testing.T) {
+	s, _, _ := newScreen(true)
+	for _, c := range []string{s.Green("链接"), s.Orange("⚠ 请不要关闭这个窗口")} {
+		if strings.Contains(c, "\033[1") {
+			t.Errorf("不应加粗：%q", c)
+		}
+	}
+	p, _, _ := newScreen(false)
+	if p.Green("链接") != "链接" {
+		t.Error("不是终端时不应上色")
+	}
+}
+
+func TestNames(t *testing.T) {
+	if got := Names([]string{"a", "b"}); got != "a、b" {
+		t.Errorf("两个：%q", got)
+	}
+	if got := Names([]string{"a", "b", "c", "d", "e", "f", "g"}); got != "a、b、c、d、e 等 7 项" {
+		t.Errorf("七个：%q", got)
+	}
+}
+
+func TestCanceled(t *testing.T) {
+	if !Canceled(context.Canceled) || !Canceled(fmt.Errorf("读取：%w", io.EOF)) || Canceled(errors.New("别的错误")) {
+		t.Error("Canceled 判断不对")
 	}
 }
 

@@ -332,7 +332,7 @@ func (r *run) commitPartial(ctx context.Context, ok, failed []*group) error {
 	if err := r.saveDone(items); err != nil {
 		s.Warn("没能记下已经迁入的服务（%v），重新迁入时会提示它们已存在", err)
 	}
-	r.warnKept(items)
+	r.noteKept(items)
 	if len(r.rollbackIssues) > 0 {
 		s.Fail()
 	} else {

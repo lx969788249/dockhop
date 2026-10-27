@@ -16,6 +16,11 @@ var ErrNotInteractive = errors.New("没有可以输入的终端")
 // ErrCancelled 表示用户在回答问题时取消了（Ctrl+C），取消的说明已经显示过了。
 var ErrCancelled = errors.New("已取消")
 
+// Canceled 表示 err 是用户在回答问题时按了 Ctrl+C（程序被结束）或 Ctrl+D（输入结束）。
+func Canceled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, io.EOF)
+}
+
 // Prompter 向用户提问。in 为 nil 表示不能交互。
 type Prompter struct {
 	in    *bufio.Reader

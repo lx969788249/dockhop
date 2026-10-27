@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/spec"
@@ -48,6 +49,30 @@ func (u *unit) label() string {
 		return u.items[0].name()
 	}
 	return u.project
+}
+
+// tags 是菜单里写在名字后面 [ ] 里的补充说明：没在运行的写状态，项目写容器数。
+func (u *unit) tags() []string {
+	if u.project != "" {
+		if len(u.items) > 1 {
+			return []string{fmt.Sprintf("%d 个容器", len(u.items))}
+		}
+		return nil
+	}
+	var tags []string
+	switch c := u.items[0].c; {
+	case c.State.Paused:
+		tags = append(tags, "暂停")
+	case !c.State.Running:
+		tags = append(tags, "已停止")
+	}
+	if u.panel {
+		tags = append(tags, "面板自身，回车时不包含")
+	}
+	if u.note != "" {
+		tags = append(tags, u.note)
+	}
+	return tags
 }
 
 type inventory struct {
@@ -243,28 +268,13 @@ func chooseUnits(inv *inventory, include []string, screen *ui.Screen, prompt *ui
 		return nil, fmt.Errorf("没有可以输入的终端，无法显示菜单。请用 --include 容器1,容器2 指定要迁移的容器")
 	}
 	screen.Hold()
-	// 菜单只写名字，状态、容器数这些补充说明放在名字后面的 [ ] 里；项目目录不显示，
-	// 一长串路径只会让名字更难找。
+	// 菜单只写名字和 [ ] 里的补充说明；项目目录不显示，一长串路径只会让名字更难找。
 	var standalone, projects []string
 	panels := false
+	width := len(strconv.Itoa(len(inv.units)))
 	for i, u := range inv.units {
-		line := fmt.Sprintf("    %*d) %s", len(strconv.Itoa(len(inv.units))), i+1, u.label())
-		var tags []string
-		if u.project == "" {
-			if st := stateText(u.items[0].c); st != "运行中" {
-				tags = append(tags, st)
-			}
-			if u.panel {
-				tags = append(tags, "面板自身，回车时不包含")
-				panels = true
-			}
-			if u.note != "" {
-				tags = append(tags, u.note)
-			}
-		} else if len(u.items) > 1 {
-			tags = append(tags, fmt.Sprintf("%d 个容器", len(u.items)))
-		}
-		for _, t := range tags {
+		line := fmt.Sprintf("    %*d) %s", width, i+1, u.label())
+		for _, t := range u.tags() {
 			line += "  [" + t + "]"
 		}
 		if u.project == "" {
@@ -272,6 +282,7 @@ func chooseUnits(inv *inventory, include []string, screen *ui.Screen, prompt *ui
 		} else {
 			projects = append(projects, line)
 		}
+		panels = panels || u.panel
 	}
 	if len(standalone) > 0 {
 		screen.Println("  单独的容器：")
@@ -287,10 +298,11 @@ func chooseUnits(inv *inventory, include []string, screen *ui.Screen, prompt *ui
 			screen.Println("    · " + s)
 		}
 	}
-	question := "\n请输入要迁移的序号，多个用逗号隔开（例如 1,3），直接回车迁移全部："
+	question := "\n请输入要迁移的序号，多个用逗号隔开（例如 1,3），直接回车迁移全部"
 	if panels {
-		question = "\n请输入要迁移的序号，多个用逗号隔开（例如 1,3），直接回车迁移全部（不含面板自身）："
+		question += "（不含面板自身）"
 	}
+	question += "："
 	var chosen []*unit
 	_, err := prompt.Ask(question, func(s string) error {
 		chosen = nil
@@ -306,11 +318,9 @@ func chooseUnits(inv *inventory, include []string, screen *ui.Screen, prompt *ui
 			return nil
 		}
 		seen := map[int]bool{}
-		for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == '，' || r == ' ' || r == '、' }) {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
+		// 逗号、中文逗号、顿号、空格都可以用来分开。
+		separator := func(r rune) bool { return unicode.IsSpace(r) || strings.ContainsRune(",，、", r) }
+		for _, part := range strings.FieldsFunc(s, separator) {
 			n, err := strconv.Atoi(part)
 			if err != nil || n < 1 || n > len(inv.units) {
 				return fmt.Errorf("序号 %s 不对，请输入 1 到 %d 之间的数字", part, len(inv.units))
@@ -326,17 +336,6 @@ func chooseUnits(inv *inventory, include []string, screen *ui.Screen, prompt *ui
 		return nil
 	})
 	return chosen, err
-}
-
-func stateText(c *docker.Container) string {
-	switch {
-	case c.State.Paused:
-		return "暂停"
-	case c.State.Running:
-		return "运行中"
-	default:
-		return "已停止"
-	}
 }
 
 // withDependencies 把选中容器依赖的容器（借用网络、进程、IPC，--link、

@@ -28,9 +28,10 @@ import (
 type Level int
 
 const (
-	Info Level = iota
-	Ask
-	Stop
+	Note Level = iota // 只是说一声，不影响迁移，也不用处理
+	Info              // 要让用户留意，但不用选择
+	Ask               // 要用户选择怎么处理
+	Stop              // 没法继续
 )
 
 // Issue 是检查发现的一个问题。
@@ -202,7 +203,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 			Hint:  "容器镜像只能在相同 CPU 类型的服务器上运行，请换一台和旧服务器相同类型的服务器"})
 	}
 	if older(t.DockerVersion, plan.Source.Docker) {
-		addIssue(Issue{Level: Info, Kind: "docker_version",
+		addIssue(Issue{Level: Note, Kind: "docker_version",
 			Title: fmt.Sprintf("新服务器的 Docker（%s）比旧服务器（%s）旧，一般不影响迁移", t.DockerVersion, plan.Source.Docker)})
 	}
 	if hasProject && !t.HasCompose {

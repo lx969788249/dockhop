@@ -45,9 +45,11 @@ func TestLoggerLifecycle(t *testing.T) {
 		l.Printf("第 %d 行", i)
 	}
 	l.Printf("链接密钥 topsecret-value\n第二行")
-	tail := l.Tail(3)
-	if len(tail) != 3 || !strings.HasSuffix(tail[1], "链接密钥 ***") || !strings.HasSuffix(tail[2], "第二行") {
-		t.Fatalf("Tail：%q", tail)
+	b, _ := os.ReadFile(l.Path())
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	last := lines[len(lines)-2:]
+	if strings.Contains(string(b), "topsecret-value") || !strings.HasSuffix(last[0], "链接密钥 ***") || !strings.HasSuffix(last[1], "第二行") {
+		t.Fatalf("密钥应隐藏、多行内容应各占一行：%q", last)
 	}
 	if !l.Finish(false, false) {
 		t.Fatal("失败时应保留日志")

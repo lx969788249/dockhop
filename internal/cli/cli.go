@@ -40,7 +40,10 @@ type Env struct {
 	Platform string     // 例如 linux/amd64
 	Width    func() int // 终端有多少列；0 表示不知道
 	Args     []string
-	verbose  bool
+
+	// 一次运行只有一个屏幕和一个提问器：同一个终端输入只能有一个地方在读。
+	screen *ui.Screen
+	prompt *ui.Prompter
 }
 
 func (e *Env) fill() {
@@ -143,19 +146,20 @@ func Run(args []string, env Env) int {
 	if len(rest) > 0 {
 		cmd, rest = rest[0], rest[1:]
 	}
-	env.verbose = verbose
 	env.Args = args
-	screen := ui.New(env.Stderr, env.TTY, nil)
-	screen.SetVerbose(verbose)
-	screen.SetWidth(env.Width)
-	err := dispatch(cmd, rest, &env, screen)
+	env.screen = ui.New(env.Stderr, env.TTY, nil)
+	env.screen.SetVerbose(verbose)
+	env.screen.SetWidth(env.Width)
+	env.screen.SetBanner(ui.Banner(env.Version, env.TTY))
+	env.prompt = ui.NewPrompter(env.Input, env.Stderr).WithContext(env.Context)
+	err := dispatch(cmd, rest, &env)
 	return exitCode(err, env.Stderr)
 }
 
-func dispatch(cmd string, args []string, env *Env, screen *ui.Screen) error {
+func dispatch(cmd string, args []string, env *Env) error {
 	switch cmd {
 	case "":
-		return menu(env, screen)
+		return menu(env)
 	case "version":
 		fmt.Fprintf(env.Stdout, "DockHop %s（%s）\n", env.Version, env.Platform)
 		return nil
@@ -164,28 +168,28 @@ func dispatch(cmd string, args []string, env *Env, screen *ui.Screen) error {
 		if err != nil {
 			return err
 		}
-		banner(env)
-		return runOut(env, screen, opts)
+		env.screen.Start()
+		return runOut(env, opts)
 	case "in":
 		opts, err := parseIn(args, false)
 		if err != nil {
 			return err
 		}
-		banner(env)
-		return runIn(env, screen, opts, false)
+		env.screen.Start()
+		return runIn(env, opts, false)
 	case "check":
 		opts, err := parseIn(args, true)
 		if err != nil {
 			return err
 		}
-		banner(env)
-		return runIn(env, screen, opts, true)
+		env.screen.Start()
+		return runIn(env, opts, true)
 	case "diagnose":
 		if len(args) > 0 {
 			return usageErr("diagnose 不需要参数")
 		}
-		banner(env)
-		return runDiagnose(env, screen)
+		env.screen.Start()
+		return runDiagnose(env)
 	default:
 		if strings.HasPrefix(cmd, "-") {
 			return usageErr("不认识的选项 %s，运行 dockhop --help 查看用法", cmd)
@@ -194,56 +198,39 @@ func dispatch(cmd string, args []string, env *Env, screen *ui.Screen) error {
 	}
 }
 
-// banner 在开始一项任务前清屏，显示程序的名字和版本：屏幕上只留下这次任务的内容。
-func banner(env *Env) {
-	if env.TTY {
-		fmt.Fprint(env.Stderr, ui.ClearScreen)
-	}
-	fmt.Fprint(env.Stderr, ui.Banner(env.Version, env.TTY))
-}
-
-// fresh 回答完菜单之后清屏重新开始；不是终端时什么都不做（不能清屏，也不用再写一遍名字）。
-func fresh(env *Env) {
-	if env.TTY {
-		banner(env)
-	}
-}
-
-func menu(env *Env, screen *ui.Screen) error {
-	p := ui.NewPrompter(env.Input, env.Stderr).WithContext(env.Context)
-	if !p.Interactive() {
+func menu(env *Env) error {
+	if !env.prompt.Interactive() {
 		fmt.Fprint(env.Stdout, helpText)
 		return usageErr("没有可以输入的终端，请直接写明命令，例如 dockhop out 或 dockhop in '链接'")
 	}
-	banner(env)
-	choice, err := p.Choose([]string{"迁出", "迁入", "收集诊断信息"}, 1)
+	env.screen.Start()
+	choice, err := env.prompt.Choose([]string{"迁出", "迁入", "收集诊断信息"}, 1)
 	if err != nil {
 		return err
 	}
 	switch choice {
 	case 1:
-		fresh(env)
-		return runOut(env, screen, OutOptions{Snapshot: "auto", Port: 8080})
+		env.screen.Refresh()
+		return runOut(env, OutOptions{Snapshot: "auto", Port: 8080})
 	case 2:
-		return runIn(env, screen, InOptions{HealthTimeout: defaultHealthTimeout}, false) // 粘贴完链接再清屏
+		return runIn(env, InOptions{HealthTimeout: defaultHealthTimeout}, false) // 粘贴完链接再清屏
 	default:
-		fresh(env)
-		return runDiagnose(env, screen)
+		env.screen.Refresh()
+		return runDiagnose(env)
 	}
 }
 
-func runOut(env *Env, _ *ui.Screen, opts OutOptions) error {
+func runOut(env *Env, opts OutOptions) error {
 	t, err := startTask(env, "out")
 	if err != nil {
 		return err
 	}
 	if err := backup.RecoverInterrupted(env.Context, t.docker, t.home, t.screen, t.prompt); err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
-			t.finish(false)
+		t.finish(false)
+		if ui.Canceled(err) {
 			return err
 		}
-		t.screen.Error(err.Error(), "")
-		t.finish(false)
+		t.screen.Problem(err.Error(), "")
 		return errReported
 	}
 	err = backup.Run(env.Context, backup.Deps{
@@ -263,15 +250,14 @@ func runOut(env *Env, _ *ui.Screen, opts OutOptions) error {
 // readLink 取得迁移链接：命令里写了就用，否则在终端里请用户粘贴。
 func readLink(env *Env, given string) (crypto.Link, error) {
 	if given != "" {
-		return crypto.ParseLink(linkIn(given))
+		return crypto.ParseLink(given)
 	}
-	p := ui.NewPrompter(env.Input, env.Stderr).WithContext(env.Context)
-	if !p.Interactive() {
+	if !env.prompt.Interactive() {
 		return crypto.Link{}, usageErr("请在命令后面写上迁移链接，例如 dockhop in '链接'")
 	}
 	var link crypto.Link
-	_, err := p.Ask("请粘贴旧服务器上显示的迁移链接：", func(s string) error {
-		l, err := crypto.ParseLink(linkIn(s))
+	_, err := env.prompt.Ask("请粘贴旧服务器上显示的迁移链接：", func(s string) error {
+		l, err := crypto.ParseLink(s)
 		if err != nil {
 			return err
 		}
@@ -281,23 +267,22 @@ func readLink(env *Env, given string) (crypto.Link, error) {
 	return link, err
 }
 
-func runIn(env *Env, screen *ui.Screen, opts InOptions, checkOnly bool) error {
-	pasted := opts.Link == ""
+func runIn(env *Env, opts InOptions, checkOnly bool) error {
 	link, err := readLink(env, opts.Link)
 	if err != nil {
 		var le *crypto.LinkError
 		if errors.As(err, &le) || errors.Is(err, crypto.ErrOldLink) {
-			screen.Error(err.Error(), "")
+			env.screen.Problem(err.Error(), "")
 			return errReported
 		}
 		return err
 	}
-	if pasted {
-		fresh(env) // 菜单和粘贴的一长串链接不用留在屏幕上
+	if opts.Link == "" {
+		env.screen.Refresh() // 菜单和粘贴的一长串链接不用留在屏幕上
 	}
 	if opts.File != "" {
 		if _, err := os.Stat(opts.File); err != nil {
-			screen.Error("找不到迁移包 "+opts.File, "确认 --file 后面的路径写对了")
+			env.screen.Problem("找不到迁移包 "+opts.File, "确认 --file 后面的路径写对了")
 			return errReported
 		}
 	}
@@ -323,23 +308,6 @@ func runIn(env *Env, screen *ui.Screen, opts InOptions, checkOnly bool) error {
 		return errReported
 	}
 	return err
-}
-
-// linkIn 从粘贴的内容里找出迁移链接：用户可能连着引号、前后的空格，
-// 甚至整条 dockhop in '链接' 命令一起粘贴过来。
-func linkIn(s string) string {
-	i := strings.Index(s, "http://")
-	if i < 0 {
-		i = strings.Index(s, "https://")
-	}
-	if i < 0 {
-		return strings.TrimSpace(s)
-	}
-	s = s[i:]
-	if j := strings.IndexAny(s, "'\" \t"); j >= 0 {
-		s = s[:j]
-	}
-	return s
 }
 
 // errReported 表示错误已经显示过了，只需要返回失败的退出码。

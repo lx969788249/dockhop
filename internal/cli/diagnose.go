@@ -8,11 +8,11 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/logging"
-	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 // runDiagnose 生成诊断文件，写在当前目录；当前目录不可写时写到 DOCKHOP_HOME。
-func runDiagnose(env *Env, screen *ui.Screen) error {
+func runDiagnose(env *Env) error {
+	screen := env.screen
 	now := time.Now()
 	in := logging.DiagnoseInput{
 		Version:  env.Version,

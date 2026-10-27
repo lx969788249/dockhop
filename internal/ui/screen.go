@@ -29,7 +29,7 @@ type Failure struct {
 	Hint   string
 }
 
-// Timing 记录每个步骤的耗时，显示在结果摘要里。
+// Timing 记录每个步骤的耗时，任务结束时写进日志。
 type Timing struct {
 	Title   string
 	Elapsed time.Duration
@@ -58,11 +58,9 @@ type Screen struct {
 	lineBusy bool
 	lastNote time.Time
 	width    func() int
-	// reportFollows 表示最后会打印结果摘要：失败的建议只在摘要里写一次，不重复。
-	reportFollows bool
-	banner        string   // 清屏重画时最上面的程序名字
-	kept          []string // 清屏重画时要留下的行：步骤结果、警告、说明
-	asked         bool     // 当前步骤里问过问题
+	banner   string   // 最上面的程序名字，清屏后重新显示
+	kept     []string // 清屏重画时要留下的行：步骤结果、警告、说明
+	asked    bool     // 当前步骤里问过问题
 }
 
 // New 创建屏幕输出。tty 为 true 时使用颜色并原地刷新进度。
@@ -72,6 +70,9 @@ func New(out io.Writer, tty bool, log Logger) *Screen {
 	}
 	return &Screen{out: out, tty: tty, log: log, now: time.Now}
 }
+
+// SetLogger 设置日志：日志要等任务开始、知道写在哪里之后才有。
+func (s *Screen) SetLogger(log Logger) { s.log = log }
 
 // SetWidth 设置读取终端宽度的方法，原地刷新的那一行不会超过这个宽度。
 func (s *Screen) SetWidth(f func() int) { s.width = f }
@@ -88,8 +89,25 @@ func (s *Screen) room() int {
 	return 0
 }
 
-// SetBanner 设置清屏重画时最上面显示的程序名字。
+// SetBanner 设置最上面显示的程序名字（见 Banner）。
 func (s *Screen) SetBanner(b string) { s.banner = b }
+
+// Start 开始显示：终端里先清屏，屏幕上只留下这次运行的内容。
+func (s *Screen) Start() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tty {
+		fmt.Fprint(s.out, clearScreen)
+	}
+	fmt.Fprint(s.out, s.banner)
+}
+
+// Refresh 清屏重画，去掉菜单、问题这些已经回答过的内容（见 redraw）。
+func (s *Screen) Refresh() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.redraw()
+}
 
 // keep 输出一行要一直留在屏幕上的内容（清屏重画时也会重新显示）。调用方需持有锁。
 func (s *Screen) keep(line string) {
@@ -105,7 +123,7 @@ func (s *Screen) redraw() {
 	}
 	s.clearLine()
 	var b strings.Builder
-	b.WriteString(ClearScreen + s.banner)
+	b.WriteString(clearScreen + s.banner)
 	for _, l := range s.kept {
 		b.WriteString(l + "\n")
 	}
@@ -118,6 +136,13 @@ func (s *Screen) SetVerbose(v bool) { s.verbose = v }
 // IsTTY 表示输出是否是交互终端。
 func (s *Screen) IsTTY() bool { return s.tty }
 
+// 只上色、不加粗：有的终端里加粗的中文会显示成乱码。多数终端主题把黄色显示成橙色。
+const (
+	green  = "32"
+	red    = "31"
+	orange = "33"
+)
+
 func (s *Screen) color(code, text string) string {
 	if !s.tty {
 		return text
@@ -125,8 +150,11 @@ func (s *Screen) color(code, text string) string {
 	return "\033[" + code + "m" + text + "\033[0m"
 }
 
-// Paint 给要突出的文字上色（例如要复制的命令）；不是终端时原样返回。
-func (s *Screen) Paint(code, text string) string { return s.color(code, text) }
+// Green 把文字显示成绿色（例如要复制的链接）；不是终端时原样返回。
+func (s *Screen) Green(text string) string { return s.color(green, text) }
+
+// Orange 把文字显示成橙色（例如必须照做的提醒）；不是终端时原样返回。
+func (s *Screen) Orange(text string) string { return s.color(orange, text) }
 
 // clearLine 清掉被步骤标题或进度占用的当前行。调用方需持有锁。
 func (s *Screen) clearLine() {
@@ -215,7 +243,7 @@ func (s *Screen) End(summary string) {
 	if s.asked {
 		s.redraw()
 	}
-	s.keep(strings.TrimRight(s.prefix()+" "+s.color("1;32", "✓")+" "+tail, " "))
+	s.keep(strings.TrimRight(s.prefix()+" "+s.Green("✓")+" "+tail, " "))
 	s.cur = nil
 }
 
@@ -230,7 +258,7 @@ func (s *Screen) Fail() {
 	s.failed = s.prefix()
 	s.log.Printf("失败：%s", s.failed)
 	s.clearLine()
-	s.keep(s.failed + " " + s.color("1;31", "✗"))
+	s.keep(s.failed + " " + s.color(red, "✗"))
 	s.cur = nil
 }
 
@@ -261,7 +289,7 @@ func (s *Screen) Warn(format string, args ...any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.clearLine()
-	s.keep("    " + s.color("1;33", "!") + " " + msg)
+	s.keep("    " + s.Orange("!") + " " + msg)
 	s.warnings = append(s.warnings, msg)
 }
 
@@ -276,30 +304,37 @@ func (s *Screen) Info(format string, args ...any) {
 	s.keep("    · " + msg)
 }
 
-// ReportFollows 声明这次任务最后会打印结果摘要。之后 Error 在当场只写一行原因，
-// 建议留到摘要里，不重复两遍。
-func (s *Screen) ReportFollows() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.reportFollows = true
-}
-
-// Error 记录失败原因和建议，并在屏幕上显示。只有第一条会出现在结果摘要里。
+// Error 记录失败原因和建议，当场只显示一行原因：原因和建议都会写在最后的结果摘要里，
+// 不重复两遍。只有第一条会出现在结果摘要里，它通常就是根因。
 func (s *Screen) Error(reason, hint string) {
-	if hint != "" {
-		s.log.Printf("失败原因：%s（建议：%s）", reason, hint)
-	} else {
-		s.log.Printf("失败原因：%s", reason)
-	}
+	s.logFailure(reason, hint)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.failure == nil {
 		s.failure = &Failure{Reason: reason, Hint: hint}
 	}
 	s.clearLine()
-	s.keep(s.color("1;31", "✗") + " " + reason)
-	if hint != "" && !s.reportFollows {
+	s.keep(s.color(red, "✗") + " " + reason)
+}
+
+// Problem 显示一个没法继续的问题和建议，用在不会再有结果摘要的地方
+// （例如还没开始就连不上 Docker）。
+func (s *Screen) Problem(reason, hint string) {
+	s.logFailure(reason, hint)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clearLine()
+	s.keep(s.color(red, "✗") + " " + reason)
+	if hint != "" {
 		s.keep("  建议：" + hint)
+	}
+}
+
+func (s *Screen) logFailure(reason, hint string) {
+	if hint != "" {
+		s.log.Printf("失败原因：%s（建议：%s）", reason, hint)
+	} else {
+		s.log.Printf("失败原因：%s", reason)
 	}
 }
 

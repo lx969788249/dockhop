@@ -25,7 +25,20 @@ type Runner struct {
 	Prompt  *ui.Prompter
 	Auto    bool // --yes：自动采用推荐做法
 	Collect func() (*Target, error)
-	shown   map[string]bool
+	shown   map[string]bool // 已经显示过的说明和提醒，重新检查时不重复显示
+	raised  bool
+}
+
+// Raised 表示这次检查有没有提醒过用户留意、或者问过用户怎么处理（只是说一声的不算）。
+func (r *Runner) Raised() bool { return r.raised }
+
+// firstTime 表示这个问题是第一次出现：重新检查时同样的说明和提醒不再显示。
+func (r *Runner) firstTime(i Issue) bool {
+	if r.shown[i.Title] {
+		return false
+	}
+	r.shown[i.Title] = true
+	return true
 }
 
 // errRecheck 表示用户处理好了、要重新检查。
@@ -49,14 +62,14 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 		var asks, stops []Issue
 		for _, i := range res.Issues {
 			switch i.Level {
+			case Note:
+				if r.firstTime(i) {
+					r.Screen.Info("%s", i.Title)
+				}
 			case Info:
-				if !r.shown[i.Title] {
-					r.shown[i.Title] = true
-					if i.Kind == "docker_version" {
-						r.Screen.Info("%s", i.Title) // 一般不影响迁移，不算要留意的事
-					} else {
-						r.Screen.Warn("%s", i.Title)
-					}
+				if r.firstTime(i) {
+					r.raised = true
+					r.Screen.Warn("%s", i.Title)
 				}
 			case Ask:
 				asks = append(asks, i)
@@ -81,6 +94,7 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 		if len(asks) == 0 {
 			return res, nil
 		}
+		r.raised = true
 		if !r.Prompt.Interactive() && !auto {
 			r.Screen.Hold()
 			r.Screen.Println(fmt.Sprintf("发现 %d 个需要处理的问题，还没有下载或改动任何东西：", len(asks)))

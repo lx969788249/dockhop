@@ -6,7 +6,6 @@
 package logging
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -76,30 +75,6 @@ func (l *Logger) Block(text string) {
 	if !strings.HasSuffix(text, "\n") {
 		fmt.Fprintln(l.f)
 	}
-}
-
-// Tail 返回日志最后 n 行，用于失败时显示在屏幕上。
-func (l *Logger) Tail(n int) []string {
-	if l == nil || l.path == "" {
-		return nil
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	f, err := os.Open(l.path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-	var lines []string
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
-	for sc.Scan() {
-		lines = append(lines, sc.Text())
-		if len(lines) > n {
-			lines = lines[1:]
-		}
-	}
-	return lines
 }
 
 // Finish 结束日志：成功且没有要求保留时删除日志文件，返回日志是否还在。

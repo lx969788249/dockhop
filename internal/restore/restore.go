@@ -93,8 +93,7 @@ type run struct {
 	done []string // 同一个链接上次已经迁入、这次跳过的服务
 
 	committed      bool
-	partial        bool   // 只保留了一部分服务
-	prepared       string // 备份已有服务的结果，和恢复数据写在同一步里
+	partial        bool // 只保留了一部分服务
 	rollbackDone   bool
 	rollbackIssues []string
 	cleanupLeft    []string
@@ -113,11 +112,10 @@ func Run(ctx context.Context, d Deps, o Options) error {
 	}
 	lock, err := host.TryLock(filepath.Join(d.Home, "locks", "in.lock"))
 	if err != nil {
-		d.Screen.Error(err.Error(), "")
+		d.Screen.Problem(err.Error(), "")
 		return ErrReported
 	}
 	defer lock.Unlock()
-	d.Screen.ReportFollows()
 	if !o.CheckOnly {
 		removeHelpers(ctx, d.Docker)
 	}
@@ -293,7 +291,6 @@ func (r *run) check(ctx context.Context) (string, error) {
 		s.Warn("按 --skip-check 跳过迁入前检查")
 		return "跳过", nil
 	}
-	warned := len(s.Warnings())
 	runner := &preflight.Runner{Screen: s, Prompt: r.Prompt, Auto: r.opts.Yes,
 		Collect: func() (*preflight.Target, error) {
 			v := ""
@@ -304,8 +301,8 @@ func (r *run) check(ctx context.Context) (string, error) {
 		}}
 	res, err := runner.Run(r.plan, &r.d, preflight.Options{Existing: r.opts.Existing, BaseDir: r.workBase(),
 		BundleOnDisk: r.opts.File != "", Home: r.Home})
-	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
-		return "", err // 回答问题时取消了
+	if ui.Canceled(err) {
+		return "", err
 	}
 	if err != nil {
 		var p *preflight.Problem
@@ -317,7 +314,7 @@ func (r *run) check(ctx context.Context) (string, error) {
 	b, _ := json.Marshal(r.d)
 	r.Log.Printf("检查时的选择：%s", b)
 	summary := "没有发现问题"
-	if len(res.Issues) > 0 || len(s.Warnings()) > warned {
+	if runner.Raised() {
 		summary = "检查完成"
 	}
 	if res.NeedBytes > 0 {
@@ -855,7 +852,7 @@ func (r *run) prepare(ctx context.Context) error {
 		return fail(s, "（测试）模拟备份已有服务时失败", "", "")
 	}
 	if backedUp > 0 {
-		r.prepared = fmt.Sprintf("已备份 %d 个同名的容器", backedUp)
+		s.Info("已备份 %d 个同名的容器，迁入失败时会放回原来的", backedUp)
 	}
 	if stopped > 0 {
 		s.Info("临时停止了 %d 个和迁入的服务共用数据的容器，迁入完成后自动恢复", stopped)
@@ -1140,9 +1137,6 @@ func (r *run) restoreData(ctx context.Context) error {
 	}
 	if len(r.projects) > 0 {
 		parts = append(parts, fmt.Sprintf("%d 个 Compose 项目", len(r.projects)))
-	}
-	if r.prepared != "" {
-		parts = append(parts, r.prepared)
 	}
 	s.End(strings.Join(parts, " · "))
 	return nil
@@ -1618,10 +1612,7 @@ func (r *run) servicesText() string {
 			names = append(names, n)
 		}
 	}
-	if len(names) > 5 {
-		return strings.Join(names[:5], "、") + fmt.Sprintf(" 等 %d 项", len(names))
-	}
-	return strings.Join(names, "、")
+	return ui.Names(names)
 }
 
 // ---------- 提交 ----------
@@ -1661,13 +1652,13 @@ func (r *run) commit(ctx context.Context) error {
 		s.Fail()
 		return ErrReported
 	}
-	r.warnKept(r.items)
+	r.noteKept(r.items)
 	s.End(r.countText())
 	return nil
 }
 
-// warnKept 提醒迁入的容器里需要知道的情况。
-func (r *run) warnKept(items []*citem) {
+// noteKept 说明迁入的容器里需要知道的情况。
+func (r *run) noteKept(items []*citem) {
 	for _, it := range items {
 		switch {
 		case it.m.OldImage != "":
@@ -1727,7 +1718,7 @@ func (r *run) cleanFiles(success bool) {
 
 func (r *run) report(ctx context.Context, err error) error {
 	// 还没改动新服务器就取消了（例如回答问题时按 Ctrl+C）：不用摆出一整块失败结果。
-	if (errors.Is(err, io.EOF) || errors.Is(err, context.Canceled)) && r.j == nil {
+	if ui.Canceled(err) && r.j == nil {
 		msg := "\n已取消，这台服务器上什么都没有改动。"
 		if r.downloaded {
 			msg += "已经下载的部分留着，用同一个链接重新迁入会接着下载。"

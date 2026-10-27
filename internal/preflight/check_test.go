@@ -242,6 +242,30 @@ func TestRunnerAuto(t *testing.T) {
 	}
 }
 
+// 只是说一声的（新服务器的 Docker 旧一点）不算要留意的问题：显示成说明，不算警告。
+func TestRunnerRaised(t *testing.T) {
+	tg := testTarget()
+	tg.DockerVersion = "27.5.1"
+	var out bytes.Buffer
+	s := ui.New(&out, false, nil)
+	r := &Runner{Screen: s, Prompt: ui.NewPrompter(nil, &out), Collect: func() (*Target, error) { return tg, nil }}
+	if _, err := r.Run(testPlan(), &Decisions{}, Options{}); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	if r.Raised() || len(s.Warnings()) != 0 || !strings.Contains(out.String(), "· 新服务器的 Docker（27.5.1）比旧服务器（29.2.1）旧") {
+		t.Errorf("只是说一声：Raised=%v 警告=%v\n%s", r.Raised(), s.Warnings(), out.String())
+	}
+
+	tg.Containers["web"] = TargetContainer{}
+	r = &Runner{Screen: s, Prompt: ui.NewPrompter(nil, &out), Collect: func() (*Target, error) { return tg, nil }}
+	if _, err := r.Run(testPlan(), &Decisions{}, Options{Existing: "replace"}); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	if !r.Raised() || len(s.Warnings()) == 0 {
+		t.Errorf("要替换同名容器时应提醒：Raised=%v 警告=%v", r.Raised(), s.Warnings())
+	}
+}
+
 func TestRunnerInteractive(t *testing.T) {
 	tg := testTarget()
 	tg.Listeners = []host.Listener{{Proto: "tcp", Addr: "0.0.0.0", Port: 80}}

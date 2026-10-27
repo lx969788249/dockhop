@@ -116,46 +116,45 @@ fetch() {
   return "$rc"
 }
 
-printf '正在下载 DockHop %s（%s）……\n' "$VERSION" "$arch" >&2
-ok="" bad_sum=""
-for i in "${!sources[@]}"; do
-  base="${sources[$i]}"
-  last=0
-  ((i < ${#sources[@]} - 1)) || last=1
-  url="${base}/v${VERSION}/${name}"
-  rc=0
+# download 地址 是否最后一个地址：从一个地址下载程序到 $bin 并核对校验值。
+# 优先下载压缩过的（小一半多），地址上没有压缩包时（例如老版本）再下载没压缩的。
+# 返回 0 表示成功，3 表示下载到了但校验不通过，其他表示下载失败。
+download() {
+  local url="$1/v${VERSION}/${name}" last="$2" rc=2
   rm -f "$bin" "${bin}.gz"
-  # 优先下载压缩过的程序（小一半多），地址上没有时再下载没压缩的。
   if command -v gzip >/dev/null 2>&1; then
+    rc=0
     fetch "${url}.gz" "${bin}.gz" "$last" || rc=$?
-    if ((rc == 0)); then
-      gzip -dc "${bin}.gz" >"$bin" 2>/dev/null || rc=1
+    if ((rc == 0)) && ! gzip -dc "${bin}.gz" >"$bin" 2>/dev/null; then
+      return 1
     fi
-  else
-    rc=2
   fi
   if ((rc == 2)); then
     rc=0
     fetch "$url" "$bin" "$last" || rc=$?
   fi
+  ((rc == 0)) || return 1
+  [[ "$(sha256 "$bin")" == "$sha" ]] || return 3
+}
+
+printf '正在下载 DockHop %s（%s）……\n' "$VERSION" "$arch" >&2
+bad_sum=""
+for i in "${!sources[@]}"; do
+  last=$((i == ${#sources[@]} - 1))
+  rc=0
+  download "${sources[i]}" "$last" || rc=$?
+  ((rc != 0)) || break
   why="下载太慢或失败"
-  if ((rc == 0)); then
-    if [[ "$(sha256 "$bin")" == "$sha" ]]; then
-      ok=1
-      break
-    fi
+  if ((rc == 3)); then
     bad_sum=1
     why="下载的程序校验不通过"
   fi
-  if ((last == 0)); then
-    printf '从 %s %s，改从 %s 下载……\n' "${base#https://}" "$why" "${sources[$((i + 1))]#https://}" >&2
+  if ((last)); then
+    [[ -z "$bad_sum" ]] || fail "下载的程序校验不通过，已删除" "可能下载不完整，或镜像站提供的文件被改动过；请重试，或换一个下载地址"
+    fail "下载失败：${sources[i]}/v${VERSION}/${name}" "检查网络；都下载不了时，可以设置 DOCKHOP_MIRROR=镜像站地址 后重试"
   fi
+  printf '从 %s %s，改从 %s 下载……\n' "${sources[i]#https://}" "$why" "${sources[i + 1]#https://}" >&2
 done
-if [[ -z "$ok" && -n "$bad_sum" ]]; then
-  fail "下载的程序校验不通过，已删除" "可能下载不完整，或镜像站提供的文件被改动过；请重试，或换一个下载地址"
-fi
-[[ -n "$ok" ]] || fail "下载失败：${url}" \
-  "检查网络；都下载不了时，可以设置 DOCKHOP_MIRROR=镜像站地址 后重试"
 
 chmod +x "$bin"
 rc=0

@@ -34,15 +34,13 @@ func startTask(env *Env, kind string) (*task, error) {
 	t.log = log
 	t.log.Block(fmt.Sprintf("===== DockHop %s · %s =====\n参数：%s\n系统：%s · %s\n用户：uid=%d\n",
 		env.Version, kind, strings.Join(env.Args, " "), host.OSName(), host.Kernel(), os.Geteuid()))
-	t.screen = ui.New(env.Stderr, env.TTY, t.log)
-	t.screen.SetVerbose(env.verbose)
-	t.screen.SetWidth(env.Width)
-	t.screen.SetBanner(ui.Banner(env.Version, env.TTY))
-	t.prompt = ui.NewPrompter(env.Input, env.Stderr).WithContext(env.Context)
+	t.screen = env.screen
+	t.screen.SetLogger(t.log)
+	t.prompt = env.prompt
 	dc, err := docker.New(env.Context, docker.WithLogger(t.log.Printf))
 	if err != nil {
 		reason, hint := explainDockerError(err)
-		t.screen.Error(reason, hint)
+		t.screen.Problem(reason, hint)
 		t.finish(false)
 		return nil, errReported
 	}

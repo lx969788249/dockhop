@@ -50,8 +50,8 @@ type Deps struct {
 	Getenv   func(string) string
 }
 
-// steps 是迁出一共几步。
-const steps = 6
+// totalSteps 是迁出一共几步。
+const totalSteps = 6
 
 // ErrReported 表示失败原因已经显示在结果摘要里。
 var ErrReported = errors.New("迁出失败")
@@ -65,7 +65,6 @@ type run struct {
 	workdir        string
 	stopped        []StoppedContainer // 已经停下、还没恢复的源容器
 	chosen         string             // 迁移哪些服务，写在步骤结果和最终结果里
-	ended          bool               // 用户自己结束了传输
 	restored       int
 	toRestore      int
 	downtime       time.Duration
@@ -82,11 +81,10 @@ func Run(ctx context.Context, d Deps, o Options) error {
 	r := &run{Deps: d, opts: o, started: time.Now(), rid: randomID()}
 	lock, err := host.TryLock(lockPath(d.Home))
 	if err != nil {
-		d.Screen.Error(err.Error(), "")
+		d.Screen.Problem(err.Error(), "")
 		return ErrReported
 	}
 	defer lock.Unlock()
-	d.Screen.ReportFollows()
 	removeHelpers(ctx, d.Docker)
 
 	err = r.steps(ctx)
@@ -97,7 +95,7 @@ func Run(ctx context.Context, d Deps, o Options) error {
 func (r *run) steps(ctx context.Context) error {
 	s, dc := r.Screen, r.Docker
 
-	s.Begin(1, steps, "检查环境")
+	s.Begin(1, totalSteps, "检查环境")
 	info, err := dc.Info(ctx)
 	if err != nil {
 		return fail(s, "读取 Docker 信息失败", err.Error(), "")
@@ -113,14 +111,14 @@ func (r *run) steps(ctx context.Context) error {
 	}
 	s.End(envSummary)
 
-	s.Begin(2, steps, "选择要迁移的服务")
+	s.Begin(2, totalSteps, "选择要迁移的服务")
 	inv, err := buildInventory(ctx, dc, s)
 	if err != nil {
 		return fail(s, err.Error(), "", "")
 	}
 	chosen, err := chooseUnits(inv, r.opts.Include, s, r.Prompt)
-	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
-		return err // 回答问题时取消了
+	if ui.Canceled(err) {
+		return err
 	}
 	if err != nil {
 		return fail(s, err.Error(), "", "")
@@ -135,7 +133,7 @@ func (r *run) steps(ctx context.Context) error {
 	r.chosen = chosenText(sel)
 	s.End(r.chosen)
 
-	s.Begin(3, steps, "读取配置")
+	s.Begin(3, totalSteps, "读取配置")
 	col, err := collect(ctx, dc, tool, inv, sel, s, r.ignored(), r.opts.Snapshot != "never")
 	if err != nil {
 		return fail(s, err.Error(), "", "")
@@ -229,14 +227,14 @@ func (r *run) steps(ctx context.Context) error {
 	}
 	s.End(fmt.Sprintf("%d 个镜像 · 迁移包共 %s", images, ui.HumanBytes(size)))
 
-	s.Begin(6, steps, "启动下载服务")
+	s.Begin(6, totalSteps, "启动下载服务")
 	return r.serve(ctx, ln, link, bundlePath, planPath, size)
 }
 
 // pack 是第 4、5 步：停机打包数据，打包镜像并写完迁移包。
 func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path string) (*bundle.Manifest, int64, error) {
 	s, dc := r.Screen, r.Docker
-	s.Begin(4, steps, "停机打包数据")
+	s.Begin(4, totalSteps, "停机打包数据")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, 0, fail(s, "无法创建迁移包", err.Error(), "")
@@ -406,7 +404,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	}
 	s.End(summary)
 
-	s.Begin(5, steps, "打包镜像")
+	s.Begin(5, totalSteps, "打包镜像")
 	refSet := map[string]string{}
 	for _, it := range col.sel.items {
 		ref := it.c.Config.Image
@@ -483,13 +481,14 @@ func (r *run) addStream(w *bundle.Writer, prefix, label string, rc io.Reader, to
 // serve 是最后一步：提供下载，直到新服务器迁入成功、用户输入 q 结束或程序被结束。
 func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bundlePath, planPath string, size int64) error {
 	s := r.Screen
-	st := &status{s: s}
+	live := &liveLine{s: s}
+	defer live.stop()
 	statusCh := make(chan transfer.Status, 4)
 	completeCh := make(chan struct{}, 1)
 	notify := func(e transfer.Event) {
 		switch e.Kind {
 		case transfer.DownloadProgress:
-			st.downloading(e.Position, e.Size)
+			live.downloading(e.Position, e.Size)
 		case transfer.DownloadComplete:
 			select {
 			case completeCh <- struct{}{}:
@@ -510,8 +509,7 @@ func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bund
 	s.End(fmt.Sprintf("端口 %d", link.Port))
 
 	s.Println(r.instructions(ctx, link))
-	st.wait("等待新服务器连接")
-	defer st.stop()
+	live.wait("等待新服务器连接")
 	quit := make(chan struct{}, 1)
 	if r.Prompt.Interactive() {
 		go func() {
@@ -531,27 +529,21 @@ func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bund
 	for {
 		select {
 		case <-ctx.Done():
-			st.stop()
 			s.Detail("收到结束信号，结束传输")
-			r.ended = true
 			return nil
 		case <-quit:
-			st.stop()
 			s.Detail("用户输入 q 结束传输")
-			r.ended = true
 			return nil
 		case <-completeCh:
-			st.stop()
 			s.Println("新服务器已经下载完迁移包，正在迁入……")
-			st.wait("新服务器正在迁入")
+			live.wait("新服务器正在迁入")
 		case res := <-statusCh:
-			st.stop()
+			r.status = res.Result
 			if res.Result == "success" {
-				r.status = "success"
-				s.Println(s.Paint("1;32", "✓") + " 新服务器已迁入成功，传输自动结束。")
+				live.stop()
+				s.Println(s.Green("✓") + " 新服务器已迁入成功，传输自动结束。")
 				return nil
 			}
-			r.status = res.Result
 			msg := "新服务器迁入失败"
 			if res.Result == "partial" {
 				msg = "新服务器只迁入了一部分"
@@ -560,75 +552,79 @@ func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bund
 				msg += "：" + res.Message
 			}
 			s.Warn("%s。这里继续等着，在新服务器上处理好问题后，用同一个链接重新迁入即可", msg)
-			st.wait("等待新服务器重新迁入")
+			live.wait("等待新服务器重新迁入")
 		case err := <-serveErr:
-			st.stop()
 			if err != nil {
-				return fail(nil, "下载服务意外停止", err.Error(), "重新运行迁出")
+				return fail(s, "下载服务意外停止", err.Error(), "重新运行迁出")
 			}
 			return nil
 		}
 	}
 }
 
-// status 是等待新服务器时屏幕上原地刷新的那一行：等待连接、下载进度、等待迁入结果。
-// 让人一眼看出程序还在工作、窗口不能关。
-type status struct {
-	s    *ui.Screen
-	mu   sync.Mutex
-	prog *ui.Progress
-	busy bool // 正在显示下载进度
+// liveLine 是等待新服务器时屏幕最下面原地刷新的那一行：等待连接、下载进度、等待迁入结果，
+// 让人一眼看出程序还在工作、窗口不能关。下载进度由下载服务在另一个 goroutine 里报告。
+type liveLine struct {
+	s          *ui.Screen
+	mu         sync.Mutex
+	prog       *ui.Progress
+	inDownload bool // 正在显示下载进度
 }
 
-// wait 显示一行“正在等……”。只在终端里显示：日志里每 10 秒写一行“还在等”没有意义。
-func (st *status) wait(label string) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.stopLocked()
-	if st.s.IsTTY() {
-		st.prog = st.s.StartProgress(label, 0, "请保持这个窗口开着")
+// wait 换成一行“正在等……”。只在终端里显示：日志里每 10 秒写一行“还在等”没有意义。
+func (l *liveLine) wait(label string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.stopLocked()
+	if l.s.IsTTY() {
+		l.prog = l.s.StartProgress(label, 0, "请保持这个窗口开着")
 	}
 }
 
-func (st *status) downloading(pos, size int64) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if !st.busy {
-		st.stopLocked()
-		st.prog = st.s.StartProgress("新服务器正在下载", size, "下载停住了：新服务器可能断开了，它会自动从断点继续")
-		st.busy = true
+// downloading 显示新服务器的下载进度。
+func (l *liveLine) downloading(pos, size int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.inDownload {
+		l.stopLocked()
+		l.prog = l.s.StartProgress("新服务器正在下载", size, "下载停住了：新服务器可能断开了，它会自动从断点继续")
+		l.inDownload = true
 	}
-	st.prog.Set(pos)
+	l.prog.Set(pos)
 }
 
-func (st *status) stop() {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.stopLocked()
+func (l *liveLine) stop() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.stopLocked()
 }
 
-func (st *status) stopLocked() {
-	if st.prog != nil {
-		st.prog.Done(nil)
-		st.prog = nil
+func (l *liveLine) stopLocked() {
+	if l.prog != nil {
+		l.prog.Done(nil)
+		l.prog = nil
 	}
-	st.busy = false
+	l.inDownload = false
 }
 
 // instructions 是交给用户的下一步：要复制的只有迁移链接一样东西；新服务器上运行同一条命令、
-// 选「迁入」、粘贴链接，和 README 写的一样。并且讲清楚这个窗口不能关。
+// 选「迁入」、粘贴链接，和 README 写的一样。最要紧的两件事用橙色写：窗口不能关、端口要放行。
 func (r *run) instructions(ctx context.Context, link crypto.Link) string {
 	s := r.Screen
 	rule := strings.Repeat("━", 56)
 	var b strings.Builder
 	b.WriteString("\n" + rule + "\n")
-	b.WriteString(s.Paint("1", "迁移链接（请完整复制）：") + "\n\n")
-	b.WriteString(s.Paint("1;32", link.String()) + "\n\n")
+	b.WriteString("迁移链接（请完整复制）：\n\n")
+	b.WriteString(s.Green(link.String()) + "\n\n")
 	b.WriteString("下一步：\n")
 	b.WriteString("  1. 登录新服务器，运行 bash <(curl -fsSL dockhop.run)\n")
 	b.WriteString("  2. 选择「2) 迁入」，粘贴上面的链接\n\n")
-	b.WriteString(s.Paint("1;33", "⚠ 请不要关闭这个窗口") + "：新服务器要从这里下载数据，迁入成功后这里会自动结束。\n")
-	b.WriteString("· " + transfer.FirewallHint(ctx, link.Port) + "\n")
+	// 这两行在 80 列的终端里不折行。
+	b.WriteString(s.Orange("⚠ 请不要关闭这个窗口") + "：新服务器要从这里下载数据，迁入成功后这里会自动结束。\n")
+	b.WriteString(s.Orange(fmt.Sprintf("⚠ 请放行 TCP %d 端口", link.Port)) + "：在云服务商的安全组或防火墙里放行，否则新服务器连不上。\n")
+	if name, cmd := transfer.LocalFirewall(ctx, link.Port); name != "" {
+		b.WriteString("  这台服务器开着 " + name + "，还要执行：" + cmd + "\n")
+	}
 	b.WriteString("· 链接里含有解密密钥，不要发给别人\n")
 	if r.Prompt.Interactive() {
 		b.WriteString("· 不想迁了：输入 q 再按回车结束传输，链接随即失效\n")
@@ -682,27 +678,27 @@ func (r *run) removeTempTags() {
 // report 打印结果摘要。
 func (r *run) report(ctx context.Context, err error) error {
 	// 还在回答问题时取消（Ctrl+C、Ctrl+D）：什么都没做，不用摆出一整块失败结果。
-	if (errors.Is(err, io.EOF) || errors.Is(err, context.Canceled)) && r.toRestore == 0 && r.server == nil {
+	if ui.Canceled(err) && r.toRestore == 0 && r.server == nil {
 		r.Screen.Println("\n已取消，这台服务器上什么都没有改动。")
 		return ui.ErrCancelled
 	}
 	interrupted := ctx.Err() != nil && r.server == nil
 	success := err == nil && !interrupted
 	lines := append([]string(nil), r.summary...)
-	here := ""
+	hostLine := ""
 	switch {
 	case r.toRestore > 0 && r.restored < r.toRestore:
-		here = fmt.Sprintf("这台服务器：停下的 %d 个容器只恢复了 %d 个，请立即人工检查", r.toRestore, r.restored)
+		hostLine = fmt.Sprintf("这台服务器：停下的 %d 个容器只恢复了 %d 个，请立即人工检查", r.toRestore, r.restored)
 		success = false
 	case r.toRestore > 0 && r.downtime > 0:
-		here = "这台服务器：打包时停了" + downtimeText(r.downtime) + "，服务都已恢复运行"
+		hostLine = "这台服务器：打包时停了" + downtimeText(r.downtime) + "，服务都已恢复运行"
 	case r.toRestore > 0:
-		here = "这台服务器：停下的容器都已恢复原来的状态"
+		hostLine = "这台服务器：停下的容器都已恢复原来的状态"
 	case success:
-		here = "这台服务器：服务一直在运行，没有改动"
+		hostLine = "这台服务器：服务一直在运行，没有改动"
 	}
-	if here != "" {
-		lines = append(lines, here)
+	if hostLine != "" {
+		lines = append(lines, hostLine)
 	}
 	rep := ui.Report{Title: "迁出结果", Lines: lines, Elapsed: time.Since(r.started), Success: success}
 	switch {
@@ -722,7 +718,7 @@ func (r *run) report(ctx context.Context, err error) error {
 		default:
 			rep.Result = "⚠️ 已结束传输，没有收到新服务器迁入成功的消息"
 		}
-		rep.Next = []string{"要迁移时重新运行迁出，会生成一条新的命令"}
+		rep.Next = []string{"要迁移时重新运行迁出，会生成一个新的链接"}
 	case interrupted:
 		rep.Result = "⚠️ 迁出已中断"
 	default:
@@ -867,16 +863,13 @@ func downtimeText(d time.Duration) string {
 	return " " + ui.Elapsed(d)
 }
 
-// chosenText 是迁移哪些服务：独立容器写容器名、Compose 项目写项目名，太多时只写前几个。
+// chosenText 是迁移哪些服务：独立容器写容器名、Compose 项目写项目名。
 func chosenText(sel *selection) string {
 	names := make([]string, 0, len(sel.units))
 	for _, u := range sel.units {
 		names = append(names, u.label())
 	}
-	t := strings.Join(names, "、")
-	if len(names) > 5 {
-		t = strings.Join(names[:5], "、") + fmt.Sprintf(" 等 %d 项", len(names))
-	}
+	t := ui.Names(names)
 	if len(sel.items) != len(names) {
 		t += fmt.Sprintf("（共 %d 个容器）", len(sel.items))
 	}

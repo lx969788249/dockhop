@@ -82,10 +82,9 @@ func externalIPv4(ctx context.Context) net.IP {
 	return nil
 }
 
-// FirewallHint 返回放行端口的提示：检测到 ufw 或 firewalld 在运行时给出对应命令。
-// 只给提示，不擅自修改防火墙。
-func FirewallHint(ctx context.Context, port int) string {
-	hint := "新服务器连不上时：在云服务商控制台的安全组（防火墙）里放行 TCP " + strconv.Itoa(port) + " 端口"
+// LocalFirewall 检查这台服务器上有没有在运行的防火墙（ufw 或 firewalld），有的话返回
+// 它的名字和放行端口要执行的命令，没有时都为空。只给提示，不擅自修改防火墙。
+func LocalFirewall(ctx context.Context, port int) (name, cmd string) {
 	run := func(name string, args ...string) string {
 		if _, err := exec.LookPath(name); err != nil {
 			return ""
@@ -97,9 +96,9 @@ func FirewallHint(ctx context.Context, port int) string {
 	}
 	switch {
 	case strings.Contains(run("ufw", "status"), "Status: active"):
-		hint += "，并在这台服务器执行 ufw allow " + strconv.Itoa(port) + "/tcp"
+		return "ufw", "ufw allow " + strconv.Itoa(port) + "/tcp"
 	case strings.TrimSpace(run("firewall-cmd", "--state")) == "running":
-		hint += "，并在这台服务器执行 firewall-cmd --add-port=" + strconv.Itoa(port) + "/tcp"
+		return "firewalld", "firewall-cmd --add-port=" + strconv.Itoa(port) + "/tcp"
 	}
-	return hint
+	return "", ""
 }

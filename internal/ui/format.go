@@ -64,15 +64,19 @@ func isASCIIAlnum(c rune) bool {
 	return c < 128 && (c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z')
 }
 
-// displayWidth 估算文字在终端里占的列数：中文等全角字符占两列。
+// runeWidth 估算一个字在终端里占几列：中文等全角字符占两列。
+func runeWidth(r rune) int {
+	if r >= 0x2E80 {
+		return 2
+	}
+	return 1
+}
+
+// displayWidth 估算文字在终端里占的列数。
 func displayWidth(s string) int {
 	w := 0
 	for _, r := range s {
-		if r >= 0x2E80 {
-			w += 2
-		} else {
-			w++
-		}
+		w += runeWidth(r)
 	}
 	return w
 }
@@ -85,14 +89,21 @@ func Truncate(s string, width int) string {
 	var b strings.Builder
 	w := 0
 	for _, r := range s {
-		rw := displayWidth(string(r))
-		if w+rw > width-1 {
+		if w+runeWidth(r) > width-1 {
 			break
 		}
 		b.WriteRune(r)
-		w += rw
+		w += runeWidth(r)
 	}
 	return b.String() + "…"
+}
+
+// Names 把名字用“、”连起来；超过 5 个时只写前 5 个，后面写“等 N 项”。
+func Names(names []string) string {
+	if len(names) > 5 {
+		return strings.Join(names[:5], "、") + fmt.Sprintf(" 等 %d 项", len(names))
+	}
+	return strings.Join(names, "、")
 }
 
 // ShortPath 在进度里显示路径：太长时只留最后两级，例如 …/halo/data。完整路径写在日志里。

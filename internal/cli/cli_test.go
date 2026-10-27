@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/lx969788249/dockhop/internal/crypto"
-	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 type run struct {
@@ -137,15 +136,16 @@ func TestMenu(t *testing.T) {
 
 // 在终端里运行时，开始前清屏；选完菜单再清一次，屏幕上不留菜单。
 func TestMenuClearsScreen(t *testing.T) {
+	const clearScreen = "\033[H\033[2J"
 	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
 	var errb bytes.Buffer
 	Run(nil, Env{Stderr: &errb, Stdout: &bytes.Buffer{}, TTY: true, Input: strings.NewReader("1\n"), Version: "1.0.0-test",
 		Getenv: func(string) string { return "" }, HomeDir: func() (string, error) { return t.TempDir(), nil }})
 	out := errb.String()
-	if !strings.HasPrefix(out, ui.ClearScreen) || strings.Count(out, ui.ClearScreen) != 2 {
+	if !strings.HasPrefix(out, clearScreen) || strings.Count(out, clearScreen) != 2 {
 		t.Fatalf("开始时和选完菜单后应各清屏一次：%q", out)
 	}
-	if after := out[strings.LastIndex(out, ui.ClearScreen):]; strings.Contains(after, "1) 迁出") {
+	if after := out[strings.LastIndex(out, clearScreen):]; strings.Contains(after, "1) 迁出") {
 		t.Errorf("选完之后屏幕上不应再有菜单：%q", after)
 	}
 }
@@ -230,23 +230,5 @@ func TestDiagnose(t *testing.T) {
 	r = runCLI(t, "", map[string]string{"DOCKHOP_HOME": home}, "diagnose")
 	if r.code != ExitOK || !strings.Contains(r.stderr, "诊断文件：") {
 		t.Fatalf("连不上 Docker 时也应生成诊断文件：%d %q", r.code, r.stderr)
-	}
-}
-
-// 旧服务器显示的是一整条迁入命令，粘贴整条命令或者只粘贴链接都要认得。
-func TestLinkIn(t *testing.T) {
-	const link = "http://127.0.0.1:8080/k9Qm2xTa/#abc"
-	for _, in := range []string{
-		link,
-		"  " + link + "  ",
-		"bash <(curl -fsSL dockhop.run) in '" + link + "'",
-		`dockhop in "` + link + `" --yes`,
-	} {
-		if got := linkIn(in); got != link {
-			t.Errorf("linkIn(%q) = %q", in, got)
-		}
-	}
-	if got := linkIn(" abc "); got != "abc" {
-		t.Errorf("不是链接时原样交给 ParseLink 报错：%q", got)
 	}
 }
