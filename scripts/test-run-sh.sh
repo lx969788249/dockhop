@@ -11,20 +11,27 @@ version="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "${dist}/run.sh")"
 work="$(mktemp -d)"
 trap 'kill "${server:-}" 2>/dev/null || true; rm -rf "$work"' EXIT
 
-mkdir -p "${work}/mirror/v${version}"
-cp "${dist}"/dockhop-linux-* "${work}/mirror/v${version}/"
+# full 有压缩包和没压缩的程序（和 GitHub Release 一样），plain 只有没压缩的（老版本）。
+mkdir -p "${work}/srv/full/v${version}" "${work}/srv/plain/v${version}"
+cp "${dist}"/dockhop-linux-* "${work}/srv/full/v${version}/"
+cp "${dist}"/dockhop-linux-amd64 "${dist}"/dockhop-linux-arm64 "${dist}"/dockhop-linux-armv7 "${work}/srv/plain/v${version}/"
 port=$((20000 + RANDOM % 20000))
-(cd "${work}/mirror" && exec python3 -m http.server "$port" --bind 127.0.0.1) >/dev/null 2>&1 &
+(cd "${work}/srv" && exec python3 -m http.server "$port" --bind 127.0.0.1) >"${work}/server.log" 2>&1 &
 server=$!
 for _ in $(seq 1 50); do
   curl -s -o /dev/null "http://127.0.0.1:${port}/" && break
   sleep 0.1
 done
-export DOCKHOP_MIRROR="http://127.0.0.1:${port}"
+export DOCKHOP_MIRROR="http://127.0.0.1:${port}/full"
 
 out="$(bash "${dist}/run.sh" version 2>&1)"
 grep -Fq "DockHop ${version}（linux/" <<<"$out"
-echo "✓ 下载、核对、运行：${out##*$'\n'}"
+grep -q "GET /full/v${version}/dockhop-linux-[a-z0-9]*\.gz HTTP/[0-9.]*\" 200" "${work}/server.log"
+echo "✓ 下载压缩包、核对、运行：${out##*$'\n'}"
+
+out="$(DOCKHOP_MIRROR="http://127.0.0.1:${port}/plain" bash "${dist}/run.sh" version 2>&1)"
+grep -Fq "DockHop ${version}（linux/" <<<"$out"
+echo "✓ 没有压缩包（老版本）时下载没压缩的程序"
 
 out="$(bash "${dist}/run.sh" in --existing merge x 2>&1)" && exit 1
 grep -Fq "replace、skip 或 fail" <<<"$out"

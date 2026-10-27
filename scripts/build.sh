@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 编译三个架构的程序，并生成带校验值的 run.sh。
 #   scripts/build.sh 版本号 输出目录
-# 输出：dockhop-linux-amd64、dockhop-linux-arm64、dockhop-linux-armv7、SHA256SUMS、run.sh
+# 输出：dockhop-linux-amd64、dockhop-linux-arm64、dockhop-linux-armv7，各自压缩过的 .gz
+#（小一半多，run.sh 优先下载它），SHA256SUMS、run.sh
 set -euo pipefail
 
 version="${1:?用法：scripts/build.sh 版本号 输出目录}"
@@ -18,6 +19,9 @@ build() {
 build amd64 amd64
 build arm64 arm64
 build armv7 arm 7
+for arch in amd64 arm64 armv7; do
+  gzip -9 -n -c "${out}/dockhop-linux-${arch}" >"${out}/dockhop-linux-${arch}.gz"
+done
 
 (cd "$out" && sha256sum dockhop-linux-* >SHA256SUMS)
 sum() { awk -v f="dockhop-linux-$1" '$2 == f {print $1}' "${out}/SHA256SUMS"; }

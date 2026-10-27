@@ -55,6 +55,8 @@ bash <(curl -fsSL dockhop.run)
 
 `dockhop.run` 只是 GitHub 上 [run.sh](run.sh) 的短地址，内容完全一样；万一它打不开，可以把命令里的 `dockhop.run` 换成 `https://raw.githubusercontent.com/lx969788249/dockhop/main/run.sh`。
 
+程序（压缩后约 4MB）也先从 `dockhop.run` 下载：它是 GitHub Release 在 Cloudflare 上的缓存，国内服务器一般比直接连 GitHub 快得多；太慢或下载失败时会自动改从 GitHub 下载。不管从哪里下载，`run.sh` 都会核对程序的 SHA-256，对不上就不运行。
+
 > [!WARNING]
 > 迁入命令（迁移链接）里包含解开这次迁移包的密钥。请完整复制，只通过可信的渠道发送，不要公开。
 
@@ -234,7 +236,7 @@ dockhop diagnose
 |---|---|---|
 | `DOCKHOP_HOME` | `~/.dockhop` | 日志（`logs/`）、中断记录（`state/`）、回滚资料（`rollback/`）和工作文件（`work/`）都放在这里 |
 | `DOCKHOP_KEEP_LOG` | — | 设为 `1` 时，成功后也保留日志 |
-| `DOCKHOP_MIRROR` | GitHub Releases | 一行命令下载程序用的镜像站；程序的校验值写在 `run.sh` 里，从镜像站下载也能确认没被改动 |
+| `DOCKHOP_MIRROR` | dockhop.run，不行时 GitHub Releases | 一行命令下载程序用的镜像站（设置后只用它）；程序的校验值写在 `run.sh` 里，从镜像站下载也能确认没被改动 |
 
 完整说明见 `dockhop --help`。
 
@@ -388,7 +390,7 @@ test/apps/run.sh wordpress                  # 在两台模拟服务器之间迁�
 | `internal/host` | 系统、磁盘、监听端口、文件锁 |
 | `test/integration` | 在真实 Docker 上的验收测试：迁移包内容、配置全量比较、事务回滚、中断补救 |
 | `test/apps` | 两台模拟服务器之间迁移真实应用 |
-| `worker` | `dockhop.run` 短地址（Cloudflare Worker），命令行访问时返回 `run.sh`，浏览器访问时跳到这个仓库 |
+| `worker` | `dockhop.run` 短地址（Cloudflare Worker），命令行访问时返回 `run.sh`，浏览器访问时跳到这个仓库；也转发并缓存 Release 里的程序 |
 | `docs` | [设计方案](docs/design.md) |
 
 每次提交都会在 CI 中运行格式检查、静态检查、单元测试，编译三个架构并测试 `run.sh`，在 Debian、Ubuntu、Rocky Linux、Alpine 上检查程序能直接运行，并在真实 Docker 上跑全部验收测试：12 个容器迁移前后的完整配置逐字段比较，以及失败、被中断、被强制结束、Docker 自己出错时的撤销，只迁入一部分、重试时跳过已迁入的服务，Compose 多副本、多个软链接指向同一个目录、`--rm` 容器等 20 多个事务和安全场景。

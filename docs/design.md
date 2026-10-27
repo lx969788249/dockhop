@@ -422,7 +422,7 @@ http://203.0.113.7:8080/k3Jx9QmP2vLa/#a7j8zg6qtzkg8ddwxnzl94th3c4ns7ckdzjxu0w0fy
 #### 3.4.14 安装和发布
 
 - `run.sh`（约 30 行）：判断 CPU 架构（x86_64 / arm64 / armv7）→ 从 GitHub Releases 下载对应程序 → 核对 SHA-256 → 运行 → 删除。
-- 国内访问 GitHub 慢：支持 `DOCKHOP_MIRROR=镜像地址`；下载失败时提示怎么设置。程序的校验值写在 `run.sh` 里，从镜像站下载也能确认没被篡改。
+- 国内访问 GitHub 慢：程序先从 `dockhop.run`（Cloudflare 上的 Release 缓存）下载压缩包，15 秒内平均不到 20KB/s 或失败时自动改从 GitHub 下载；也支持 `DOCKHOP_MIRROR=镜像地址`（设置后只用它）。程序的校验值写在 `run.sh` 里，从哪里下载都能确认没被篡改。
 - 发布：打标签后 GitHub Actions 自动编译三个架构、生成校验值、发布。
 - 版本号从 1.0.0 开始（第 7 节）。
 

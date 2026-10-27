@@ -3,8 +3,9 @@
 #   bash <(curl -fsSL dockhop.run) [命令和选项]
 #
 # 判断 CPU 架构 → 下载对应的程序 → 核对 SHA-256 → 运行 → 删除。
-# 程序的校验值写在这个脚本里（发布时自动生成），从镜像站下载也能确认没被篡改。
-# 国内访问 GitHub 慢时可以设置 DOCKHOP_MIRROR=镜像站地址。
+# 程序的校验值写在这个脚本里（发布时自动生成），从哪里下载都能确认没被篡改。
+# 先从 dockhop.run 下载（Cloudflare 缓存，国内一般比 GitHub 快），太慢或失败时自动换 GitHub；
+# 设置了 DOCKHOP_MIRROR=镜像站地址 时只用这个镜像站。
 set -euo pipefail
 
 VERSION="__VERSION__"
@@ -32,32 +33,129 @@ case "$(uname -m)" in
   *) fail "不支持这种 CPU：$(uname -m)" "DockHop 支持 x86_64、arm64 和 armv7" ;;
 esac
 
-base="${DOCKHOP_MIRROR:-$RELEASES}"
-url="${base%/}/v${VERSION}/dockhop-linux-${arch}"
+name="dockhop-linux-${arch}"
+if [[ -n "${DOCKHOP_MIRROR:-}" ]]; then
+  sources=("${DOCKHOP_MIRROR%/}")
+else
+  sources=("https://dockhop.run" "$RELEASES")
+fi
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/dockhop.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 bin="${tmp}/dockhop"
 
-printf '正在下载 DockHop %s（%s）……\n' "$VERSION" "$arch" >&2
 if command -v curl >/dev/null 2>&1; then
-  curl -fL --retry 3 --connect-timeout 15 -sS -o "$bin" "$url" || fail "下载失败：$url" \
-    "检查网络；国内服务器访问 GitHub 慢时，可以设置 DOCKHOP_MIRROR=镜像站地址 后重试"
+  getter=curl
 elif command -v wget >/dev/null 2>&1; then
-  wget -q -T 15 -t 3 -O "$bin" "$url" || fail "下载失败：$url" \
-    "检查网络；国内服务器访问 GitHub 慢时，可以设置 DOCKHOP_MIRROR=镜像站地址 后重试"
+  getter=wget
 else
   fail "需要 curl 或 wget 才能下载 DockHop"
 fi
-
 if command -v sha256sum >/dev/null 2>&1; then
-  actual="$(sha256sum "$bin" | awk '{print $1}')"
+  sumcmd=(sha256sum)
 elif command -v shasum >/dev/null 2>&1; then
-  actual="$(shasum -a 256 "$bin" | awk '{print $1}')"
+  sumcmd=(shasum -a 256)
 else
   fail "需要 sha256sum 才能核对下载的程序"
 fi
-[[ "$actual" == "$sha" ]] || fail "下载的程序校验不通过，已删除" \
-  "可能下载不完整，或镜像站提供的文件被改动过；请重试，或换一个下载地址"
+sha256() { "${sumcmd[@]}" "$1" | awk '{print $1}'; }
+
+human() { awk -v n="$1" 'BEGIN { if (n >= 1048576) printf "%.1fMB", n / 1048576; else printf "%dKB", n / 1024 }'; }
+
+# show_progress 下载进程 文件：下载时每隔一会儿在同一行显示下载了多少、速度，下载完擦掉这一行。
+# 不用 curl 自己的进度条：它出错时会在屏幕上打出“curl: (28) …”这样的英文。
+show_progress() {
+  local pid="$1" out="$2" start=$SECONDS size total line
+  while kill -0 "$pid" 2>/dev/null; do
+    size="$(wc -c <"$out" 2>/dev/null || echo 0)"
+    total="$(awk 'tolower($1) == "content-length:" { n = $2 + 0 } END { print n + 0 }' "${tmp}/headers" 2>/dev/null || echo 0)"
+    line="已下载 $(human "$size")"
+    if ((total > 0 && size <= total)); then
+      line="${line} / $(human "$total")（$((size * 100 / total))%）"
+    fi
+    if ((SECONDS > start)); then
+      line="${line} · $(human $((size / (SECONDS - start))))/s"
+    fi
+    printf '\r  %s\033[K' "$line" >&2
+    sleep 0.3 2>/dev/null || sleep 1
+  done
+  printf '\r\033[K' >&2
+}
+
+# fetch 地址 文件 是否最后一个地址：下载一个文件，屏幕是终端时显示进度。
+# 不是最后一个地址时，连不上或者 15 秒内平均不到 20KB/s 就放弃，换下一个地址。
+# 返回 2 表示地址上没有这个文件（例如老版本没有压缩包），其他非 0 表示下载失败。
+fetch() {
+  local url="$1" out="$2" last="$3" rc=0 pid
+  : >"$out"
+  : >"${tmp}/headers"
+  if [[ "$getter" == curl ]]; then
+    local -a opts=(-sL --connect-timeout 10 -o "$out" -D "${tmp}/headers" -w '%{http_code}')
+    if [[ "$last" == 1 ]]; then
+      opts+=(--retry 3)
+    else
+      opts+=(--speed-limit 20480 --speed-time 15)
+    fi
+    curl "${opts[@]}" "$url" >"${tmp}/code" &
+  else
+    local -a opts=(-q -T 15 -O "$out")
+    if [[ "$last" == 1 ]]; then opts+=(-t 3); else opts+=(-t 1); fi
+    wget "${opts[@]}" "$url" &
+  fi
+  pid=$!
+  [[ ! -t 2 ]] || show_progress "$pid" "$out"
+  wait "$pid" || rc=$?
+  if [[ "$getter" == curl ]]; then
+    ((rc == 0)) || return "$rc"
+    case "$(cat "${tmp}/code")" in
+      404) return 2 ;;
+      2??) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  ((rc != 8)) || return 2 # wget：服务器返回了错误（例如 404）
+  return "$rc"
+}
+
+printf '正在下载 DockHop %s（%s）……\n' "$VERSION" "$arch" >&2
+ok="" bad_sum=""
+for i in "${!sources[@]}"; do
+  base="${sources[$i]}"
+  last=0
+  ((i < ${#sources[@]} - 1)) || last=1
+  url="${base}/v${VERSION}/${name}"
+  rc=0
+  rm -f "$bin" "${bin}.gz"
+  # 优先下载压缩过的程序（小一半多），地址上没有时再下载没压缩的。
+  if command -v gzip >/dev/null 2>&1; then
+    fetch "${url}.gz" "${bin}.gz" "$last" || rc=$?
+    if ((rc == 0)); then
+      gzip -dc "${bin}.gz" >"$bin" 2>/dev/null || rc=1
+    fi
+  else
+    rc=2
+  fi
+  if ((rc == 2)); then
+    rc=0
+    fetch "$url" "$bin" "$last" || rc=$?
+  fi
+  why="下载太慢或失败"
+  if ((rc == 0)); then
+    if [[ "$(sha256 "$bin")" == "$sha" ]]; then
+      ok=1
+      break
+    fi
+    bad_sum=1
+    why="下载的程序校验不通过"
+  fi
+  if ((last == 0)); then
+    printf '从 %s %s，改从 %s 下载……\n' "${base#https://}" "$why" "${sources[$((i + 1))]#https://}" >&2
+  fi
+done
+if [[ -z "$ok" && -n "$bad_sum" ]]; then
+  fail "下载的程序校验不通过，已删除" "可能下载不完整，或镜像站提供的文件被改动过；请重试，或换一个下载地址"
+fi
+[[ -n "$ok" ]] || fail "下载失败：${url}" \
+  "检查网络；都下载不了时，可以设置 DOCKHOP_MIRROR=镜像站地址 后重试"
 
 chmod +x "$bin"
 rc=0
