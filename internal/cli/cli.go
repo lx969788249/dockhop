@@ -194,8 +194,20 @@ func dispatch(cmd string, args []string, env *Env, screen *ui.Screen) error {
 	}
 }
 
-// banner 在开始一项任务前显示程序的名字和版本。
-func banner(env *Env) { fmt.Fprint(env.Stderr, ui.Banner(env.Version, env.TTY)) }
+// banner 在开始一项任务前清屏，显示程序的名字和版本：屏幕上只留下这次任务的内容。
+func banner(env *Env) {
+	if env.TTY {
+		fmt.Fprint(env.Stderr, ui.ClearScreen)
+	}
+	fmt.Fprint(env.Stderr, ui.Banner(env.Version, env.TTY))
+}
+
+// fresh 回答完菜单之后清屏重新开始；不是终端时什么都不做（不能清屏，也不用再写一遍名字）。
+func fresh(env *Env) {
+	if env.TTY {
+		banner(env)
+	}
+}
 
 func menu(env *Env, screen *ui.Screen) error {
 	p := ui.NewPrompter(env.Input, env.Stderr).WithContext(env.Context)
@@ -204,20 +216,18 @@ func menu(env *Env, screen *ui.Screen) error {
 		return usageErr("没有可以输入的终端，请直接写明命令，例如 dockhop out 或 dockhop in '链接'")
 	}
 	banner(env)
-	choice, err := p.Choose([]string{
-		"迁出：在旧服务器上选这个，把服务打包好，等新服务器来取",
-		"迁入：在新服务器上选这个，把服务迁到这台服务器",
-		"收集诊断信息：遇到问题、要反馈时用",
-	}, 1)
+	choice, err := p.Choose([]string{"迁出", "迁入", "收集诊断信息"}, 1)
 	if err != nil {
 		return err
 	}
 	switch choice {
 	case 1:
+		fresh(env)
 		return runOut(env, screen, OutOptions{Snapshot: "auto", Port: 8080})
 	case 2:
-		return runIn(env, screen, InOptions{HealthTimeout: defaultHealthTimeout}, false)
+		return runIn(env, screen, InOptions{HealthTimeout: defaultHealthTimeout}, false) // 粘贴完链接再清屏
 	default:
+		fresh(env)
 		return runDiagnose(env, screen)
 	}
 }
@@ -260,7 +270,7 @@ func readLink(env *Env, given string) (crypto.Link, error) {
 		return crypto.Link{}, usageErr("请在命令后面写上迁移链接，例如 dockhop in '链接'")
 	}
 	var link crypto.Link
-	_, err := p.Ask("请粘贴旧服务器上显示的命令（或者其中的链接）：", func(s string) error {
+	_, err := p.Ask("请粘贴旧服务器上显示的迁移链接：", func(s string) error {
 		l, err := crypto.ParseLink(linkIn(s))
 		if err != nil {
 			return err
@@ -272,6 +282,7 @@ func readLink(env *Env, given string) (crypto.Link, error) {
 }
 
 func runIn(env *Env, screen *ui.Screen, opts InOptions, checkOnly bool) error {
+	pasted := opts.Link == ""
 	link, err := readLink(env, opts.Link)
 	if err != nil {
 		var le *crypto.LinkError
@@ -280,6 +291,9 @@ func runIn(env *Env, screen *ui.Screen, opts InOptions, checkOnly bool) error {
 			return errReported
 		}
 		return err
+	}
+	if pasted {
+		fresh(env) // 菜单和粘贴的一长串链接不用留在屏幕上
 	}
 	if opts.File != "" {
 		if _, err := os.Stat(opts.File); err != nil {
@@ -311,8 +325,8 @@ func runIn(env *Env, screen *ui.Screen, opts InOptions, checkOnly bool) error {
 	return err
 }
 
-// linkIn 从粘贴的内容里找出迁移链接：旧服务器显示的是一整条迁入命令，
-// 用户可能整行粘贴过来，也可能只粘贴引号里的链接。
+// linkIn 从粘贴的内容里找出迁移链接：用户可能连着引号、前后的空格，
+// 甚至整条 dockhop in '链接' 命令一起粘贴过来。
 func linkIn(s string) string {
 	i := strings.Index(s, "http://")
 	if i < 0 {

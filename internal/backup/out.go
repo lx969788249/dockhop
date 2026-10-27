@@ -559,7 +559,7 @@ func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bund
 			if res.Message != "" {
 				msg += "：" + res.Message
 			}
-			s.Warn("%s。这里继续等着，在新服务器上处理好问题后，重新运行同一条命令即可", msg)
+			s.Warn("%s。这里继续等着，在新服务器上处理好问题后，用同一个链接重新迁入即可", msg)
 			st.wait("等待新服务器重新迁入")
 		case err := <-serveErr:
 			st.stop()
@@ -615,22 +615,25 @@ func (st *status) stopLocked() {
 	st.busy = false
 }
 
-// instructions 是交给用户的下一步：只给一条要在新服务器上运行的命令（链接已经在命令里），
-// 并且讲清楚这个窗口不能关。
+// instructions 是交给用户的下一步：要复制的只有迁移链接一样东西；新服务器上运行同一条命令、
+// 选「迁入」、粘贴链接，和 README 写的一样。并且讲清楚这个窗口不能关。
 func (r *run) instructions(ctx context.Context, link crypto.Link) string {
 	s := r.Screen
 	rule := strings.Repeat("━", 56)
 	var b strings.Builder
 	b.WriteString("\n" + rule + "\n")
-	b.WriteString(s.Paint("1", "下一步：登录新服务器，复制下面这一整行命令运行") + "\n\n")
-	b.WriteString(s.Paint("1;32", "bash <(curl -fsSL dockhop.run) in '"+link.String()+"'") + "\n\n")
+	b.WriteString(s.Paint("1", "迁移链接（请完整复制）：") + "\n\n")
+	b.WriteString(s.Paint("1;32", link.String()) + "\n\n")
+	b.WriteString("下一步：\n")
+	b.WriteString("  1. 登录新服务器，运行 bash <(curl -fsSL dockhop.run)\n")
+	b.WriteString("  2. 选择「2) 迁入」，粘贴上面的链接\n\n")
 	b.WriteString(s.Paint("1;33", "⚠ 请不要关闭这个窗口") + "：新服务器要从这里下载数据，迁入成功后这里会自动结束。\n")
 	b.WriteString("· " + transfer.FirewallHint(ctx, link.Port) + "\n")
-	b.WriteString("· 命令里含有解密密钥，不要发给别人\n")
+	b.WriteString("· 链接里含有解密密钥，不要发给别人\n")
 	if r.Prompt.Interactive() {
-		b.WriteString("· 不想迁了：输入 q 再按回车结束传输，命令随即失效\n")
+		b.WriteString("· 不想迁了：输入 q 再按回车结束传输，链接随即失效\n")
 	} else {
-		b.WriteString(fmt.Sprintf("· 不想迁了：执行 kill -TERM %d 结束传输，命令随即失效\n", os.Getpid()))
+		b.WriteString(fmt.Sprintf("· 不想迁了：执行 kill -TERM %d 结束传输，链接随即失效\n", os.Getpid()))
 	}
 	b.WriteString(rule)
 	return b.String()

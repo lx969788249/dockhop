@@ -464,7 +464,7 @@ func TestInPartial(t *testing.T) {
 	if code == 0 {
 		t.Fatal("只迁入了一部分时不能报告成功")
 	}
-	mustContain(t, out, "⚠️ 只迁入了一部分", "已经迁入、正常运行："+good, "没有迁入（已删除）："+bad, "重新运行同一条迁入命令",
+	mustContain(t, out, "⚠️ 只迁入了一部分", "已经迁入、正常运行："+good, "没有迁入（已删除）："+bad, "用同一个链接重新迁入",
 		"有些回滚资料没能删除", "下次运行迁入时会接着删除")
 	if b, err := os.ReadFile(filepath.Join(home, "rollback", "current", "journal.jsonl")); err != nil || !strings.Contains(string(b), `"op":"commit"`) {
 		t.Errorf("清理没完成时应保留标为已提交的日志：%v\n%s", err, b)

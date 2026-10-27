@@ -37,6 +37,7 @@ func startTask(env *Env, kind string) (*task, error) {
 	t.screen = ui.New(env.Stderr, env.TTY, t.log)
 	t.screen.SetVerbose(env.verbose)
 	t.screen.SetWidth(env.Width)
+	t.screen.SetBanner(ui.Banner(env.Version, env.TTY))
 	t.prompt = ui.NewPrompter(env.Input, env.Stderr).WithContext(env.Context)
 	dc, err := docker.New(env.Context, docker.WithLogger(t.log.Printf))
 	if err != nil {

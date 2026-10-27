@@ -2,7 +2,8 @@
 //
 // 每个步骤在屏幕上只占一行：进行中时由进度原地刷新这一行，完成后换成
 // “✓ 结果 · 耗时”。警告单独占一行并汇总到最终结果；细节只写日志
-// （--verbose 时也显示在屏幕上）。
+// （--verbose 时也显示在屏幕上）。步骤里问过问题（菜单、选择）的，这一步结束时
+// 清屏重画，屏幕上只留下程序名字和各步骤的结果。
 package ui
 
 import (
@@ -59,6 +60,9 @@ type Screen struct {
 	width    func() int
 	// reportFollows 表示最后会打印结果摘要：失败的建议只在摘要里写一次，不重复。
 	reportFollows bool
+	banner        string   // 清屏重画时最上面的程序名字
+	kept          []string // 清屏重画时要留下的行：步骤结果、警告、说明
+	asked         bool     // 当前步骤里问过问题
 }
 
 // New 创建屏幕输出。tty 为 true 时使用颜色并原地刷新进度。
@@ -82,6 +86,30 @@ func (s *Screen) room() int {
 		return w - 1
 	}
 	return 0
+}
+
+// SetBanner 设置清屏重画时最上面显示的程序名字。
+func (s *Screen) SetBanner(b string) { s.banner = b }
+
+// keep 输出一行要一直留在屏幕上的内容（清屏重画时也会重新显示）。调用方需持有锁。
+func (s *Screen) keep(line string) {
+	fmt.Fprintln(s.out, line)
+	s.kept = append(s.kept, line)
+}
+
+// redraw 清屏，重新显示程序名字和留下来的行，去掉菜单、问题这些已经回答过的内容。
+// --verbose 时不清屏：要看的就是全部细节。调用方需持有锁。
+func (s *Screen) redraw() {
+	if !s.tty || s.verbose {
+		return
+	}
+	s.clearLine()
+	var b strings.Builder
+	b.WriteString(ClearScreen + s.banner)
+	for _, l := range s.kept {
+		b.WriteString(l + "\n")
+	}
+	fmt.Fprint(s.out, b.String())
 }
 
 // SetVerbose 打开后，细节也会显示在屏幕上。
@@ -143,6 +171,7 @@ func (s *Screen) Begin(num, total int, title string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cur = &stage{num: num, total: total, title: title, started: s.now()}
+	s.asked = false
 	s.log.Printf("===== %s =====", s.prefix())
 	if s.tty {
 		s.draw(s.prefix() + " …")
@@ -158,6 +187,7 @@ func (s *Screen) Hold() {
 	if !s.tty || s.cur == nil {
 		return
 	}
+	s.asked = true
 	s.draw(s.prefix())
 	fmt.Fprintln(s.out)
 	s.lineBusy = false
@@ -182,7 +212,10 @@ func (s *Screen) End(summary string) {
 	}
 	s.log.Printf("完成：%s · %s", s.prefix(), tail)
 	s.clearLine()
-	fmt.Fprintln(s.out, strings.TrimRight(s.prefix()+" "+s.color("1;32", "✓")+" "+tail, " "))
+	if s.asked {
+		s.redraw()
+	}
+	s.keep(strings.TrimRight(s.prefix()+" "+s.color("1;32", "✓")+" "+tail, " "))
 	s.cur = nil
 }
 
@@ -197,7 +230,7 @@ func (s *Screen) Fail() {
 	s.failed = s.prefix()
 	s.log.Printf("失败：%s", s.failed)
 	s.clearLine()
-	fmt.Fprintf(s.out, "%s %s\n", s.failed, s.color("1;31", "✗"))
+	s.keep(s.failed + " " + s.color("1;31", "✗"))
 	s.cur = nil
 }
 
@@ -228,7 +261,7 @@ func (s *Screen) Warn(format string, args ...any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.clearLine()
-	fmt.Fprintf(s.out, "    %s %s\n", s.color("1;33", "!"), msg)
+	s.keep("    " + s.color("1;33", "!") + " " + msg)
 	s.warnings = append(s.warnings, msg)
 }
 
@@ -240,7 +273,7 @@ func (s *Screen) Info(format string, args ...any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.clearLine()
-	fmt.Fprintf(s.out, "    · %s\n", msg)
+	s.keep("    · " + msg)
 }
 
 // ReportFollows 声明这次任务最后会打印结果摘要。之后 Error 在当场只写一行原因，
@@ -264,9 +297,9 @@ func (s *Screen) Error(reason, hint string) {
 		s.failure = &Failure{Reason: reason, Hint: hint}
 	}
 	s.clearLine()
-	fmt.Fprintf(s.out, "%s %s\n", s.color("1;31", "✗"), reason)
+	s.keep(s.color("1;31", "✗") + " " + reason)
 	if hint != "" && !s.reportFollows {
-		fmt.Fprintf(s.out, "  建议：%s\n", hint)
+		s.keep("  建议：" + hint)
 	}
 }
 

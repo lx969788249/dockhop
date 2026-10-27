@@ -8,6 +8,9 @@ const logo = `  ____             _    _   _
  |____/ \___/ \___|_|\_\_| |_|\___/| .__/
                                    |_|`
 
+// ClearScreen 清掉屏幕上已有的内容，光标回到左上角（往上翻还能看到之前的内容）。
+const ClearScreen = "\033[H\033[2J"
+
 // Tagline 是一句话介绍。
 const Tagline = "一条链接，把 Docker 服务连同数据迁到新服务器"
 

@@ -103,7 +103,7 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 				break
 			}
 			if err != nil {
-				hint := "处理后重新运行同一条命令即可继续"
+				hint := "处理后用同一个链接重新迁入即可继续"
 				if auto {
 					hint = "这个问题没法自动处理，请处理后重新运行"
 				}

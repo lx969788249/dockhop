@@ -1730,7 +1730,7 @@ func (r *run) report(ctx context.Context, err error) error {
 	if (errors.Is(err, io.EOF) || errors.Is(err, context.Canceled)) && r.j == nil {
 		msg := "\n已取消，这台服务器上什么都没有改动。"
 		if r.downloaded {
-			msg += "已经下载的部分留着，重新运行同一条命令会接着下载。"
+			msg += "已经下载的部分留着，用同一个链接重新迁入会接着下载。"
 		}
 		r.Screen.Println(msg)
 		return ui.ErrCancelled
@@ -1801,7 +1801,7 @@ func (r *run) report(ctx context.Context, err error) error {
 			}
 			lines = append(lines, left)
 		}
-		lines = append(lines, "处理好问题后，重新运行同一条迁入命令：已经迁入的会跳过，只迁入剩下的")
+		lines = append(lines, "处理好问题后，用同一个链接重新迁入：已经迁入的会跳过，只迁入剩下的")
 		status.Result = "partial"
 		status.Message = "没能启动：" + labels(failed)
 	case r.committed:
@@ -1934,7 +1934,7 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 		}
 		return fail(s, "上次迁入的内容没能全部删除", "", "回滚资料在 "+r.rbDir+"，请人工处理后删除这个目录")
 	}
-	s.Println("已删除上次迁入的内容，回到了上次迁入之前的样子。")
+	s.Info("已删除上次迁入的内容，回到了上次迁入之前的样子")
 	removeHelpers(ctx, r.Docker)
 	return os.RemoveAll(r.rbDir)
 }

@@ -126,7 +126,7 @@ func RecoverInterrupted(ctx context.Context, dc *docker.Client, home string, scr
 	if failed := restoreStates(ctx, dc, still, screen); len(failed) > 0 {
 		return fmt.Errorf("有 %d 个容器没能恢复：%s。请执行 docker ps -a 检查，用 docker start 手动启动", len(failed), strings.Join(failed, "、"))
 	}
-	screen.Println(fmt.Sprintf("已恢复 %d 个容器。", len(still)))
+	screen.Info("已恢复上次迁出时停下的 %d 个容器", len(still))
 	return removeStopped(home)
 }
 

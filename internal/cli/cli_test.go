@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 type run struct {
@@ -126,11 +127,26 @@ func TestInLinkMessages(t *testing.T) {
 func TestMenu(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
 	r := runCLI(t, "1\n", nil)
-	if !strings.Contains(r.stderr, "1) 迁出：") || !strings.Contains(r.stderr, "2) 迁入：") || !strings.Contains(r.stderr, "3) 收集诊断信息：") {
+	if !strings.Contains(r.stderr, "1) 迁出\n") || !strings.Contains(r.stderr, "2) 迁入\n") || !strings.Contains(r.stderr, "3) 收集诊断信息\n") {
 		t.Fatalf("菜单文字不对：%q", r.stderr)
 	}
 	if r.code != ExitFailed || !strings.Contains(r.stderr, "连不上 Docker") || !strings.Contains(r.stderr, "systemctl start docker") {
 		t.Fatalf("选迁出、连不上 Docker 时应说明原因：%d %q", r.code, r.stderr)
+	}
+}
+
+// 在终端里运行时，开始前清屏；选完菜单再清一次，屏幕上不留菜单。
+func TestMenuClearsScreen(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
+	var errb bytes.Buffer
+	Run(nil, Env{Stderr: &errb, Stdout: &bytes.Buffer{}, TTY: true, Input: strings.NewReader("1\n"), Version: "1.0.0-test",
+		Getenv: func(string) string { return "" }, HomeDir: func() (string, error) { return t.TempDir(), nil }})
+	out := errb.String()
+	if !strings.HasPrefix(out, ui.ClearScreen) || strings.Count(out, ui.ClearScreen) != 2 {
+		t.Fatalf("开始时和选完菜单后应各清屏一次：%q", out)
+	}
+	if after := out[strings.LastIndex(out, ui.ClearScreen):]; strings.Contains(after, "1) 迁出") {
+		t.Errorf("选完之后屏幕上不应再有菜单：%q", after)
 	}
 }
 

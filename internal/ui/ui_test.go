@@ -198,6 +198,43 @@ func TestDrawFitsWidth(t *testing.T) {
 	}
 }
 
+// 步骤里问过问题的，这一步结束时清屏重画：只留下程序名字、之前的步骤结果和警告，不留菜单。
+func TestRedrawAfterQuestions(t *testing.T) {
+	s, out, _ := newScreen(true)
+	s.SetBanner("DockHop\n\n")
+	s.Begin(1, 6, "检查环境")
+	s.End("Docker 29")
+	s.Begin(2, 6, "选择要迁移的服务")
+	s.Hold()
+	s.Println("    1) web")
+	s.Warn("自动加入 db")
+	s.End("web")
+	screen := out.String()[strings.LastIndex(out.String(), ClearScreen)+len(ClearScreen):]
+	want := "DockHop\n\n[1/6] 检查环境 \033[1;32m✓\033[0m Docker 29\n    \033[1;33m!\033[0m 自动加入 db\n" +
+		"[2/6] 选择要迁移的服务 \033[1;32m✓\033[0m web\n"
+	if screen != want {
+		t.Errorf("清屏重画后：\n实际 %q\n期望 %q", screen, want)
+	}
+	// 没问过问题的步骤不清屏。
+	s.Begin(3, 6, "读取配置")
+	s.End("")
+	if strings.Count(out.String(), ClearScreen) != 1 {
+		t.Errorf("没问过问题的步骤不应清屏：%q", out.String())
+	}
+	// 不是终端时、--verbose 时从不清屏。
+	p, pout, _ := newScreen(false)
+	v, vout, _ := newScreen(true)
+	v.SetVerbose(true)
+	for _, x := range []*Screen{p, v} {
+		x.Begin(2, 6, "选择要迁移的服务")
+		x.Hold()
+		x.End("web")
+	}
+	if strings.Contains(pout.String(), ClearScreen) || strings.Contains(vout.String(), ClearScreen) {
+		t.Errorf("不是终端时、--verbose 时不应清屏：%q %q", pout.String(), vout.String())
+	}
+}
+
 func TestInfoIsNotWarning(t *testing.T) {
 	s, out, _ := newScreen(false)
 	s.Info("自动加入 db：web 依赖它，必须一起迁移")

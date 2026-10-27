@@ -340,7 +340,7 @@ func TestOutKilledWhileStopped(t *testing.T) {
 	cmd.Env = append(os.Environ(), "DOCKHOP_HOME="+home)
 	b, _ := cmd.CombinedOutput()
 	out := string(b)
-	if !strings.Contains(out, "上次迁出") || !strings.Contains(out, "已恢复 3 个容器") {
+	if !strings.Contains(out, "上次迁出") || !strings.Contains(out, "已恢复上次迁出时停下的 3 个容器") {
 		t.Fatalf("应提示并恢复上次停下的容器：\n%s", out)
 	}
 	for _, n := range []string{f.web, f.side, f.reader} {
