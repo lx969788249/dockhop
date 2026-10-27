@@ -36,7 +36,7 @@ DockHop 直接读取容器的完整配置，原样交给新服务器的 Docker �
 在**旧服务器**和**新服务器**上运行同一条命令：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/dockhop/main/run.sh)
+bash <(curl -fsSL dockhop.run)
 ```
 
 | 步骤 | 在哪里 | 做什么 |
@@ -46,7 +46,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/dockhop/main/run
 | 3 | 新服务器 | 选择 `2) 迁入`，粘贴链接 |
 | 4 | 旧服务器 | 新服务器迁入成功后，旧服务器这边自动结束、清理临时文件 |
 
-也可以直接带上命令，跳过菜单：在旧服务器 `… run.sh) out`，在新服务器 `… run.sh) in '迁移链接'`。
+也可以直接带上命令，跳过菜单：在旧服务器 `bash <(curl -fsSL dockhop.run) out`，在新服务器 `bash <(curl -fsSL dockhop.run) in '迁移链接'`。
+
+`dockhop.run` 只是 GitHub 上 [run.sh](run.sh) 的短地址，内容完全一样；万一它打不开，可以把命令里的 `dockhop.run` 换成 `https://raw.githubusercontent.com/lx969788249/dockhop/main/run.sh`。
 
 > [!WARNING]
 > 迁移链接里包含解开这次迁移包的密钥。请完整复制，只通过可信的渠道发送，不要公开。
@@ -172,7 +174,7 @@ sequenceDiagram
 
 ### 命令
 
-下面用 `dockhop` 代表程序。通过一行命令运行时，把参数接在后面即可，例如 `bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/dockhop/main/run.sh) out --include web,db`。
+下面用 `dockhop` 代表程序。通过一行命令运行时，把参数接在后面即可，例如 `bash <(curl -fsSL dockhop.run) out --include web,db`。
 
 ```bash
 # 只迁移指定的容器（或它们所在的 Compose 项目），不显示菜单
@@ -381,6 +383,7 @@ test/apps/run.sh wordpress                  # 在两台模拟服务器之间迁�
 | `internal/host` | 系统、磁盘、监听端口、文件锁 |
 | `test/integration` | 在真实 Docker 上的验收测试：迁移包内容、配置全量比较、事务回滚、中断补救 |
 | `test/apps` | 两台模拟服务器之间迁移真实应用 |
+| `worker` | `dockhop.run` 短地址（Cloudflare Worker），命令行访问时返回 `run.sh`，浏览器访问时跳到这个仓库 |
 | `docs` | [设计方案](docs/design.md) |
 
 每次提交都会在 CI 中运行格式检查、静态检查、单元测试，编译三个架构并测试 `run.sh`，在 Debian、Ubuntu、Rocky Linux、Alpine 上检查程序能直接运行，并在真实 Docker 上跑全部验收测试：12 个容器迁移前后的完整配置逐字段比较，以及失败、被中断、被强制结束、Docker 自己出错时的撤销，只迁入一部分、重试时跳过已迁入的服务，Compose 多副本、多个软链接指向同一个目录、`--rm` 容器等 20 多个事务和安全场景。

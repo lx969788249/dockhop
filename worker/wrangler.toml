@@ -1,0 +1,8 @@
+# dockhop.run 的 Cloudflare Worker：部署用 npx wrangler deploy（在这个目录里运行）。
+name = "dockhop-run"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+# 直接挂在 dockhop.run 上，Cloudflare 会自动加好 DNS 和证书。
+routes = [{ pattern = "dockhop.run", custom_domain = true }]

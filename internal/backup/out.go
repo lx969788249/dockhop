@@ -569,7 +569,7 @@ func (r *run) instructions(ctx context.Context, link crypto.Link) string {
 	b.WriteString("\n━━━━━━━━━━ 迁移链接（请完整复制）━━━━━━━━━━\n")
 	b.WriteString(link.String() + "\n\n")
 	b.WriteString("在新服务器上运行：\n")
-	b.WriteString("bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/dockhop/main/run.sh) in '" + link.String() + "'\n\n")
+	b.WriteString("bash <(curl -fsSL dockhop.run) in '" + link.String() + "'\n\n")
 	b.WriteString(transfer.FirewallHint(ctx, link.Port) + "。\n")
 	if r.Prompt.Interactive() {
 		b.WriteString("新服务器迁入成功后这里会自动结束；也可以随时按回车结束传输。\n")
