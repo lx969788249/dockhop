@@ -2,8 +2,10 @@ package ui
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,8 +71,9 @@ func scriptSuccess(s *Screen, clock *fakeClock) {
 	})
 }
 
-// 一次失败的迁入：失败原因只保留第一条，附日志位置和最近日志。
+// 一次失败的迁入：失败原因只保留第一条，附日志位置；建议只在结果摘要里写一次。
 func scriptFailure(s *Screen, clock *fakeClock) {
+	s.ReportFollows()
 	s.Begin(8, 9, "恢复数据")
 	clock.advance(4 * time.Second)
 	s.Error("数据卷 mysql_data 写入失败：磁盘空间不足", "执行 df -h 查看剩余空间，清理后重试")
@@ -82,7 +85,6 @@ func scriptFailure(s *Screen, clock *fakeClock) {
 		Lines:   []string{"失败步骤：" + s.FailedStage(), "新服务器：回到了迁入前的样子"},
 		Elapsed: 4 * time.Second,
 		LogPath: "/root/.dockhop/logs/in-20261021-120000-123.log",
-		LogTail: []string{"[12:00:04] $ docker volume create mysql_data", "[12:00:04]   → 退出码 1"},
 	})
 }
 
@@ -156,8 +158,88 @@ func TestProgressLifecycle(t *testing.T) {
 	p.Write(make([]byte, 1024))
 	p.Done(nil)
 	s.End("1 个卷")
-	if !strings.HasSuffix(out.String(), "[4/7] 停机并打包 \033[1;32m✓\033[0m 1 个卷 · 0 秒\n") {
+	if !strings.HasSuffix(out.String(), "[4/7] 停机并打包 \033[1;32m✓\033[0m 1 个卷\n") {
 		t.Fatalf("进度结束后应回到步骤行：%q", out.String())
+	}
+}
+
+// 终端窄时，进度行要缩到一行以内：折行后 \r 回不到上一行，旧内容会留在屏幕上。
+func TestFitProgress(t *testing.T) {
+	p := ProgressState{Label: "[4/6] 停机打包数据 · 目录 /opt/1panel/apps/halo/halo/data", Current: 178 << 20, Total: 292 << 20,
+		Elapsed: 3 * time.Second, Rate: 64 << 20}
+	for _, w := range []int{120, 79, 60, 40, 20} {
+		got := FitProgress(p, w)
+		if displayWidth(got) > w {
+			t.Errorf("宽度 %d：超出了（%d 列）%q", w, displayWidth(got), got)
+		}
+		if w >= 60 && !strings.Contains(got, "60%") {
+			t.Errorf("宽度 %d：应保留百分比 %q", w, got)
+		}
+	}
+	if got := FitProgress(p, 200); got != RenderProgress(p) {
+		t.Errorf("够宽时应和 RenderProgress 一样：%q", got)
+	}
+	if got := FitProgress(p, 79); !strings.HasPrefix(got, "[4/6] 停机打包数据") {
+		t.Errorf("截短的应是后面的对象，不是步骤名：%q", got)
+	}
+}
+
+// 原地刷新的那一行（步骤标题、计数、说明）也不能超过终端宽度。
+func TestDrawFitsWidth(t *testing.T) {
+	s, out, _ := newScreen(true)
+	s.SetWidth(func() int { return 30 })
+	s.Begin(3, 6, "读取配置")
+	s.Note("统计目录大小 · /opt/1panel/apps/halo/halo/data/very/long")
+	for _, part := range strings.Split(out.String(), "\r") {
+		line := strings.TrimSuffix(strings.TrimPrefix(part, "\033[K"), "\033[K")
+		if displayWidth(line) > 29 {
+			t.Errorf("超出终端宽度：%q", line)
+		}
+	}
+}
+
+func TestInfoIsNotWarning(t *testing.T) {
+	s, out, _ := newScreen(false)
+	s.Info("自动加入 db：web 依赖它，必须一起迁移")
+	if len(s.Warnings()) != 0 || !strings.Contains(out.String(), "    · 自动加入 db") {
+		t.Fatalf("说明不算警告：%q %v", out.String(), s.Warnings())
+	}
+}
+
+func TestShortPathAndTruncate(t *testing.T) {
+	if got := ShortPath("/opt/1panel/apps/halo/halo/data"); got != "…/halo/data" {
+		t.Errorf("ShortPath 长路径：%q", got)
+	}
+	if got := ShortPath("/root/site"); got != "/root/site" {
+		t.Errorf("ShortPath 短路径不变：%q", got)
+	}
+	if got := Truncate("停机打包数据", 7); got != "停机打…" {
+		t.Errorf("Truncate 中文：%q", got)
+	}
+	if got := Truncate("abc", 3); got != "abc" {
+		t.Errorf("Truncate 不用截：%q", got)
+	}
+}
+
+// 按 Ctrl+C 时，正在等输入的提问要马上返回，不用再按一次回车。
+func TestPromptCancel(t *testing.T) {
+	r, w := io.Pipe()
+	defer w.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	p := NewPrompter(r, io.Discard).WithContext(ctx)
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Choose([]string{"a", "b"}, 1)
+		done <- err
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("应返回 context.Canceled：%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("取消后提问没有返回")
 	}
 }
 

@@ -93,7 +93,8 @@ type run struct {
 	done []string // 同一个链接上次已经迁入、这次跳过的服务
 
 	committed      bool
-	partial        bool // 只保留了一部分服务
+	partial        bool   // 只保留了一部分服务
+	prepared       string // 备份已有服务的结果，和恢复数据写在同一步里
 	rollbackDone   bool
 	rollbackIssues []string
 	cleanupLeft    []string
@@ -103,7 +104,7 @@ type run struct {
 func Run(ctx context.Context, d Deps, o Options) error {
 	r := &run{Deps: d, opts: o, started: time.Now(), imageAs: map[string]string{}, anonVolumes: map[string]bundle.Volume{},
 		rbDir: filepath.Join(d.Home, "rollback", "current")}
-	r.steps = 8
+	r.steps = 6
 	if o.CheckOnly {
 		r.steps = 2
 		if o.File != "" {
@@ -116,6 +117,7 @@ func Run(ctx context.Context, d Deps, o Options) error {
 		return ErrReported
 	}
 	defer lock.Unlock()
+	d.Screen.ReportFollows()
 	if !o.CheckOnly {
 		removeHelpers(ctx, d.Docker)
 	}
@@ -230,19 +232,18 @@ func (r *run) run(ctx context.Context) error {
 	if err := r.loadImages(ctx); err != nil {
 		return err
 	}
-	s.Begin(5, r.steps, "备份已有服务")
+	// 备份同名服务通常一闪而过（新服务器上多半没有），不单独占一步。
+	s.Begin(5, r.steps, "恢复数据")
 	if err := r.prepare(ctx); err != nil {
 		return err
 	}
-	s.Begin(6, r.steps, "恢复数据")
 	if err := r.restoreData(ctx); err != nil {
 		return err
 	}
-	s.Begin(7, r.steps, "启动服务")
+	s.Begin(6, r.steps, "启动服务")
 	if err := r.startServices(ctx); err != nil {
 		return err
 	}
-	s.Begin(8, r.steps, "完成迁入")
 	return r.commit(ctx)
 }
 
@@ -292,6 +293,7 @@ func (r *run) check(ctx context.Context) (string, error) {
 		s.Warn("按 --skip-check 跳过迁入前检查")
 		return "跳过", nil
 	}
+	warned := len(s.Warnings())
 	runner := &preflight.Runner{Screen: s, Prompt: r.Prompt, Auto: r.opts.Yes,
 		Collect: func() (*preflight.Target, error) {
 			v := ""
@@ -302,6 +304,9 @@ func (r *run) check(ctx context.Context) (string, error) {
 		}}
 	res, err := runner.Run(r.plan, &r.d, preflight.Options{Existing: r.opts.Existing, BaseDir: r.workBase(),
 		BundleOnDisk: r.opts.File != "", Home: r.Home})
+	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+		return "", err // 回答问题时取消了
+	}
 	if err != nil {
 		var p *preflight.Problem
 		if errors.As(err, &p) {
@@ -311,11 +316,14 @@ func (r *run) check(ctx context.Context) (string, error) {
 	}
 	b, _ := json.Marshal(r.d)
 	r.Log.Printf("检查时的选择：%s", b)
-	summary := fmt.Sprintf("%d 个容器", res.Containers)
-	if res.NeedBytes > 0 {
-		summary += " · 需要约 " + ui.HumanBytes(res.NeedBytes)
+	summary := "没有发现问题"
+	if len(res.Issues) > 0 || len(s.Warnings()) > warned {
+		summary = "检查完成"
 	}
-	return summary + " · 检查通过", nil
+	if res.NeedBytes > 0 {
+		summary += " · 需要约 " + ui.HumanBytes(res.NeedBytes) + " 磁盘空间"
+	}
+	return summary, nil
 }
 
 func (r *run) workBase() string {
@@ -418,7 +426,7 @@ func (r *run) unpack(ctx context.Context) (string, error) {
 	if err := r.scan(); err != nil {
 		return "", fail(s, err.Error(), "", "在旧服务器重新运行迁出")
 	}
-	return fmt.Sprintf("%d 个容器 · %s · 校验通过", len(m.Containers), ui.HumanBytes(st.Size())), nil
+	return fmt.Sprintf("%s · 校验通过", ui.HumanBytes(st.Size())), nil
 }
 
 // scan 检查迁移包里所有的卷、目录和 Compose 文件（路径是否越界、有没有通过软链接
@@ -846,11 +854,11 @@ func (r *run) prepare(ctx context.Context) error {
 	if r.testFail("prepare") {
 		return fail(s, "（测试）模拟备份已有服务时失败", "", "")
 	}
-	switch {
-	case stopped == 0 && backedUp == 0:
-		s.End("新服务器上没有同名的服务")
-	default:
-		s.End(fmt.Sprintf("备份 %d 个同名容器 · 临时停止 %d 个共用数据的容器", backedUp, stopped))
+	if backedUp > 0 {
+		r.prepared = fmt.Sprintf("已备份 %d 个同名的容器", backedUp)
+	}
+	if stopped > 0 {
+		s.Info("临时停止了 %d 个和迁入的服务共用数据的容器，迁入完成后自动恢复", stopped)
 	}
 	return nil
 }
@@ -1123,11 +1131,20 @@ func (r *run) restoreData(ctx context.Context) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	summary := fmt.Sprintf("%d 个卷 · %d 个目录", nv, nb)
-	if len(r.projects) > 0 {
-		summary += fmt.Sprintf(" · %d 个 Compose 项目", len(r.projects))
+	var parts []string
+	if nv > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个数据卷", nv))
 	}
-	s.End(summary)
+	if nb > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个目录", nb))
+	}
+	if len(r.projects) > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个 Compose 项目", len(r.projects)))
+	}
+	if r.prepared != "" {
+		parts = append(parts, r.prepared)
+	}
+	s.End(strings.Join(parts, " · "))
 	return nil
 }
 
@@ -1167,7 +1184,7 @@ func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
 	}
 	defer os.RemoveAll(stage)
 	rc := bundle.OpenStream(r.dataDir, "binds/"+b.ID, b.Parts)
-	p := r.Screen.StartProgress("目录 "+b.Path, b.Bytes, "")
+	p := r.Screen.StartProgress("目录 "+ui.ShortPath(b.Path), b.Bytes, "")
 	err := bundle.ExtractTree(io.TeeReader(rc, p), stage)
 	rc.Close()
 	p.Done(err)
@@ -1259,7 +1276,6 @@ func (r *run) extractAndInstall(prefix string, parts int, dest string, skip func
 // ---------- 启动服务 ----------
 
 func (r *run) startServices(ctx context.Context) error {
-	s := r.Screen
 	// 先建好所有独立网络，再启动 Compose 项目：Compose 自动分配网段时会占用第一个空闲网段，
 	// 可能正是独立网络在旧服务器上用的网段。
 	for _, n := range r.m.Networks {
@@ -1310,7 +1326,6 @@ func (r *run) startServices(ctx context.Context) error {
 	ok, failed := r.splitGroups()
 	switch {
 	case len(failed) == 0:
-		s.End(r.countText())
 		return nil
 	case len(ok) == 0:
 		return ErrReported
@@ -1319,7 +1334,6 @@ func (r *run) startServices(ctx context.Context) error {
 	if err != nil || !keep {
 		return ErrReported
 	}
-	s.End(fmt.Sprintf("%s 正常运行 · %s 没能启动", labels(ok), labels(failed)))
 	return nil
 }
 
@@ -1559,6 +1573,8 @@ func uniq(list []string) []string {
 	return out
 }
 
+// countText 是迁入的容器和它们的状态。停止、暂停的容器是照旧服务器上的样子保留的，
+// 单独说明，免得以为没启动成功。
 func (r *run) countText() string {
 	running, paused, stopped := 0, 0, 0
 	for _, it := range r.items {
@@ -1571,11 +1587,41 @@ func (r *run) countText() string {
 			stopped++
 		}
 	}
-	t := fmt.Sprintf("%d 个容器（运行 %d / 暂停 %d / 停止 %d）", len(r.items), running, paused, stopped)
-	if len(r.projects) > 0 {
-		t += fmt.Sprintf(" · %d 个 Compose 项目", len(r.projects))
+	if paused+stopped == 0 {
+		if len(r.items) == 1 {
+			return "容器正常运行"
+		}
+		return fmt.Sprintf("%d 个容器都在正常运行", len(r.items))
 	}
-	return t
+	t := fmt.Sprintf("%d 个容器，%d 个正常运行", len(r.items), running)
+	var kept []string
+	if stopped > 0 {
+		kept = append(kept, fmt.Sprintf("%d 个停止", stopped))
+	}
+	if paused > 0 {
+		kept = append(kept, fmt.Sprintf("%d 个暂停", paused))
+	}
+	return t + "，" + strings.Join(kept, "、") + "（和旧服务器上一样）"
+}
+
+// servicesText 是迁入了哪些服务：独立容器写容器名、Compose 项目写项目名。
+func (r *run) servicesText() string {
+	var names []string
+	seen := map[string]bool{}
+	for _, it := range r.items {
+		n := it.m.Name
+		if it.m.Project != "" {
+			n = it.m.Project
+		}
+		if !seen[n] {
+			seen[n] = true
+			names = append(names, n)
+		}
+	}
+	if len(names) > 5 {
+		return strings.Join(names[:5], "、") + fmt.Sprintf(" 等 %d 项", len(names))
+	}
+	return strings.Join(names, "、")
 }
 
 // ---------- 提交 ----------
@@ -1616,7 +1662,7 @@ func (r *run) commit(ctx context.Context) error {
 		return ErrReported
 	}
 	r.warnKept(r.items)
-	s.End("全部服务验证通过")
+	s.End(r.countText())
 	return nil
 }
 
@@ -1625,9 +1671,10 @@ func (r *run) warnKept(items []*citem) {
 	for _, it := range items {
 		switch {
 		case it.m.OldImage != "":
-			r.Screen.Warn("%s 用的是旧版本镜像（旧服务器上的镜像名 %s 已经指向别的版本），迁入后保持原样，镜像名为 %s", it.m.Name, it.c.Config.Image, it.img)
+			r.Screen.Info("%s 用的是旧版本的镜像（旧服务器上的 %s 已经更新过），迁入后保持原样，镜像名为 %s", it.m.Name, it.c.Config.Image, it.img)
 		case it.m.Changes != nil:
-			r.Screen.Warn("%s 里没挂载出来的改动已一起迁入；以后用新镜像重建这个容器时，这些改动会丢失", it.m.Name)
+			// 和在旧服务器上一样：用新镜像重建容器时，容器里的改动本来就会丢。不是迁移带来的问题，只写日志。
+			r.Screen.Detail("%s 里没挂载出来的改动已一起迁入；以后用新镜像重建这个容器时，这些改动会丢失", it.m.Name)
 		}
 	}
 }
@@ -1679,6 +1726,15 @@ func (r *run) cleanFiles(success bool) {
 }
 
 func (r *run) report(ctx context.Context, err error) error {
+	// 还没改动新服务器就取消了（例如回答问题时按 Ctrl+C）：不用摆出一整块失败结果。
+	if (errors.Is(err, io.EOF) || errors.Is(err, context.Canceled)) && r.j == nil {
+		msg := "\n已取消，这台服务器上什么都没有改动。"
+		if r.downloaded {
+			msg += "已经下载的部分留着，重新运行同一条命令会接着下载。"
+		}
+		r.Screen.Println(msg)
+		return ui.ErrCancelled
+	}
 	interrupted := ctx.Err() != nil
 	success := err == nil && !interrupted
 	if !success {
@@ -1704,12 +1760,21 @@ func (r *run) report(ctx context.Context, err error) error {
 	}
 	status := transfer.Status{Result: "failed"}
 	rep := ui.Report{Title: "迁入结果", Elapsed: time.Since(r.started)}
+	untouched := "（还没有改动新服务器）"
+	if !r.downloaded && r.opts.File == "" {
+		untouched = "（还没有下载或改动任何东西）"
+	}
 	switch {
 	case success:
 		rep.Result = "✅ 迁入完成"
-		lines = append(lines, "容器："+r.countText())
+		lines = append(lines, "迁入的服务："+r.servicesText()+" · "+r.countText())
 		if len(r.done) > 0 {
 			lines = append(lines, "上次已经迁入："+strings.Join(r.done, "、"))
+		}
+		rep.Next = []string{
+			"确认服务都正常（docker ps 可以查看容器）",
+			"用域名访问的，把域名解析改到这台服务器",
+			"确认没问题后，再停掉旧服务器上的服务（DockHop 不会删除旧服务器上的任何东西）",
 		}
 		status.Result = "success"
 	case r.partial:
@@ -1762,9 +1827,9 @@ func (r *run) report(ctx context.Context, err error) error {
 		}
 		lines = append(lines, "回滚资料："+r.rbDir+"（下次运行迁入时会提示继续删除）")
 	case interrupted:
-		rep.Result = "⚠️ 迁入已中断（还没有改动新服务器）"
+		rep.Result = "⚠️ 迁入已中断" + untouched
 	default:
-		rep.Result = "❌ 迁入失败（还没有改动新服务器）"
+		rep.Result = "❌ 迁入失败" + untouched
 	}
 	if f := r.Screen.Failure(); f != nil && status.Message == "" {
 		status.Message = f.Reason
@@ -1779,7 +1844,6 @@ func (r *run) report(ctx context.Context, err error) error {
 	rep.Success = success
 	if !success {
 		rep.LogPath = r.Log.Path()
-		rep.LogTail = r.Log.Tail(15)
 	}
 	// 通知旧服务器：成功时它会自动结束；失败时它继续提供下载，方便重试。
 	if r.m != nil || r.plan != nil {

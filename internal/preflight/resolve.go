@@ -52,7 +52,11 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 			case Info:
 				if !r.shown[i.Title] {
 					r.shown[i.Title] = true
-					r.Screen.Warn("%s", i.Title)
+					if i.Kind == "docker_version" {
+						r.Screen.Info("%s", i.Title) // 一般不影响迁移，不算要留意的事
+					} else {
+						r.Screen.Warn("%s", i.Title)
+					}
 				}
 			case Ask:
 				asks = append(asks, i)
@@ -62,9 +66,8 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 		}
 		if len(stops) > 0 {
 			r.Screen.Hold()
-			if len(stops) == 1 {
-				r.Screen.Println("发现无法继续的问题，还没有下载或改动任何东西。")
-			} else {
+			// 只有一个问题时，原因和建议都写在最后的结果里，这里不重复。
+			if len(stops) > 1 {
 				r.Screen.Println(fmt.Sprintf("发现 %d 个无法继续的问题，还没有下载或改动任何东西：", len(stops)))
 				for _, s := range stops {
 					r.Screen.Println("  ✗ " + s.Title)

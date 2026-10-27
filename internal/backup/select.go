@@ -107,7 +107,7 @@ func buildInventory(ctx context.Context, dc *docker.Client, screen *ui.Screen) (
 				continue
 			}
 			screen.Detail("容器 %s 属于 Compose 项目 %s，但%s，按独立容器迁移", it.name(), proj, problem)
-			u := &unit{items: []*item{it}, note: "Compose 配置文件不在这台服务器上，按独立容器迁移"}
+			u := &unit{items: []*item{it}, note: "找不到 Compose 配置文件，按单独的容器迁移"}
 			order = append(order, u)
 			inv.unitOf[it] = u
 			continue
@@ -230,7 +230,7 @@ func chooseUnits(inv *inventory, include []string, screen *ui.Screen, prompt *ui
 				return nil, fmt.Errorf("容器 %s 不能迁移", name)
 			}
 			if u.project != "" && len(u.items) > 1 && !seen[u] {
-				screen.Warn("%s 属于 Compose 项目 %s，整个项目一起迁移（%d 个服务）", name, u.project, len(u.items))
+				screen.Info("%s 属于 Compose 项目 %s，项目里的 %d 个容器一起迁移", name, u.project, len(u.items))
 			}
 			if !seen[u] {
 				seen[u] = true
@@ -243,42 +243,56 @@ func chooseUnits(inv *inventory, include []string, screen *ui.Screen, prompt *ui
 		return nil, fmt.Errorf("没有可以输入的终端，无法显示菜单。请用 --include 容器1,容器2 指定要迁移的容器")
 	}
 	screen.Hold()
+	// 菜单只写名字，状态、容器数这些补充说明放在名字后面的 [ ] 里；项目目录不显示，
+	// 一长串路径只会让名字更难找。
 	var standalone, projects []string
+	panels := false
 	for i, u := range inv.units {
-		line := fmt.Sprintf("  %2d) ", i+1)
+		line := fmt.Sprintf("    %*d) %s", len(strconv.Itoa(len(inv.units))), i+1, u.label())
+		var tags []string
 		if u.project == "" {
-			line += u.items[0].name() + " · " + stateText(u.items[0].c)
+			if st := stateText(u.items[0].c); st != "运行中" {
+				tags = append(tags, st)
+			}
 			if u.panel {
-				line += " [面板管理容器，默认不选]"
+				tags = append(tags, "面板自身，回车时不包含")
+				panels = true
 			}
 			if u.note != "" {
-				line += " [" + u.note + "]"
+				tags = append(tags, u.note)
 			}
+		} else if len(u.items) > 1 {
+			tags = append(tags, fmt.Sprintf("%d 个容器", len(u.items)))
+		}
+		for _, t := range tags {
+			line += "  [" + t + "]"
+		}
+		if u.project == "" {
 			standalone = append(standalone, line)
 		} else {
-			for _, it := range u.items {
-				line += "〖" + it.name() + "〗"
-			}
-			line += " · " + u.workingDir
 			projects = append(projects, line)
 		}
 	}
 	if len(standalone) > 0 {
-		screen.Println("独立容器：")
+		screen.Println("  单独的容器：")
 		screen.Println(strings.Join(standalone, "\n"))
 	}
 	if len(projects) > 0 {
-		screen.Println("Compose 项目（整组迁移）：")
+		screen.Println("  Compose 项目（项目里的容器一起迁移）：")
 		screen.Println(strings.Join(projects, "\n"))
 	}
 	if len(inv.notMoving) > 0 {
-		screen.Println("不能迁移：")
+		screen.Println("  不能迁移：")
 		for _, s := range inv.notMoving {
-			screen.Println("   · " + s)
+			screen.Println("    · " + s)
 		}
 	}
+	question := "\n请输入要迁移的序号，多个用逗号隔开（例如 1,3），直接回车迁移全部："
+	if panels {
+		question = "\n请输入要迁移的序号，多个用逗号隔开（例如 1,3），直接回车迁移全部（不含面板自身）："
+	}
 	var chosen []*unit
-	_, err := prompt.Ask("请输入要迁移的序号 [回车=全部（不含面板容器）/ 多个用逗号分开，如 1,3]：", func(s string) error {
+	_, err := prompt.Ask(question, func(s string) error {
 		chosen = nil
 		if strings.TrimSpace(s) == "" {
 			for _, u := range inv.units {
@@ -287,12 +301,12 @@ func chooseUnits(inv *inventory, include []string, screen *ui.Screen, prompt *ui
 				}
 			}
 			if len(chosen) == 0 {
-				return fmt.Errorf("除了面板管理容器没有别的容器了，请输入序号选择")
+				return fmt.Errorf("除了面板自身没有别的容器了，请输入序号选择")
 			}
 			return nil
 		}
 		seen := map[int]bool{}
-		for _, part := range strings.Split(s, ",") {
+		for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == '，' || r == ' ' || r == '、' }) {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
@@ -349,7 +363,7 @@ func withDependencies(inv *inventory, chosen []*unit, screen *ui.Screen) (*selec
 				if !in[du] {
 					in[du] = true
 					queue = append(queue, du)
-					screen.Warn("自动加入 %s：%s 依赖它，必须一起迁移", du.label(), it.name())
+					screen.Info("自动加入 %s：%s 依赖它，必须一起迁移", du.label(), it.name())
 				}
 			}
 		}

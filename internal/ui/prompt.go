@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,10 +13,20 @@ import (
 // ErrNotInteractive 表示没有终端可以提问（定时任务、管道、nohup 等）。
 var ErrNotInteractive = errors.New("没有可以输入的终端")
 
+// ErrCancelled 表示用户在回答问题时取消了（Ctrl+C），取消的说明已经显示过了。
+var ErrCancelled = errors.New("已取消")
+
 // Prompter 向用户提问。in 为 nil 表示不能交互。
 type Prompter struct {
-	in  *bufio.Reader
-	out io.Writer
+	in    *bufio.Reader
+	out   io.Writer
+	ctx   context.Context
+	lines chan readResult // 正在读的那一行；被 Ctrl+C 打断时留给下一次提问
+}
+
+type readResult struct {
+	line string
+	err  error
 }
 
 // NewPrompter 创建提问器。in 通常是 /dev/tty；不能交互时传 nil。
@@ -27,6 +38,13 @@ func NewPrompter(in io.Reader, out io.Writer) *Prompter {
 	return p
 }
 
+// WithContext 让提问能被 Ctrl+C 打断：程序接管了 Ctrl+C 信号，读终端又会一直等到回车，
+// 不这样做的话，按 Ctrl+C 要再按一次回车才有反应。
+func (p *Prompter) WithContext(ctx context.Context) *Prompter {
+	p.ctx = ctx
+	return p
+}
+
 // Interactive 表示能否向用户提问。
 func (p *Prompter) Interactive() bool { return p != nil && p.in != nil }
 
@@ -34,6 +52,26 @@ func (p *Prompter) readLine() (string, error) {
 	if !p.Interactive() {
 		return "", ErrNotInteractive
 	}
+	if p.ctx == nil {
+		return p.read()
+	}
+	if p.lines == nil {
+		p.lines = make(chan readResult, 1)
+		go func() {
+			line, err := p.read()
+			p.lines <- readResult{line, err}
+		}()
+	}
+	select {
+	case res := <-p.lines:
+		p.lines = nil
+		return res.line, res.err
+	case <-p.ctx.Done():
+		return "", p.ctx.Err()
+	}
+}
+
+func (p *Prompter) read() (string, error) {
 	line, err := p.in.ReadString('\n')
 	if err != nil && line == "" {
 		return "", err

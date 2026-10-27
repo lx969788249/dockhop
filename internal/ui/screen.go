@@ -56,6 +56,9 @@ type Screen struct {
 	// lineBusy 表示当前行正被步骤标题或进度占用，输出别的内容前要先清掉。
 	lineBusy bool
 	lastNote time.Time
+	width    func() int
+	// reportFollows 表示最后会打印结果摘要：失败的建议只在摘要里写一次，不重复。
+	reportFollows bool
 }
 
 // New 创建屏幕输出。tty 为 true 时使用颜色并原地刷新进度。
@@ -64,6 +67,21 @@ func New(out io.Writer, tty bool, log Logger) *Screen {
 		log = nopLogger{}
 	}
 	return &Screen{out: out, tty: tty, log: log, now: time.Now}
+}
+
+// SetWidth 设置读取终端宽度的方法，原地刷新的那一行不会超过这个宽度。
+func (s *Screen) SetWidth(f func() int) { s.width = f }
+
+// room 是原地刷新的那一行最多能写多少列；0 表示不知道终端宽度、不限制。
+// 留出最后一列：有的终端写满一整行就会自动换行。
+func (s *Screen) room() int {
+	if s.width == nil {
+		return 0
+	}
+	if w := s.width(); w > 1 {
+		return w - 1
+	}
+	return 0
 }
 
 // SetVerbose 打开后，细节也会显示在屏幕上。
@@ -79,6 +97,9 @@ func (s *Screen) color(code, text string) string {
 	return "\033[" + code + "m" + text + "\033[0m"
 }
 
+// Paint 给要突出的文字上色（例如要复制的命令）；不是终端时原样返回。
+func (s *Screen) Paint(code, text string) string { return s.color(code, text) }
+
 // clearLine 清掉被步骤标题或进度占用的当前行。调用方需持有锁。
 func (s *Screen) clearLine() {
 	if s.tty && s.lineBusy {
@@ -90,7 +111,8 @@ func (s *Screen) clearLine() {
 // draw 在当前行原地画出一行内容（只用于终端）。调用方需持有锁。
 func (s *Screen) draw(line string) {
 	// 一次写入覆盖旧内容，再清除右侧残留；先写一整行空格会在慢终端上闪烁。
-	fmt.Fprint(s.out, "\r"+line+"\033[K")
+	// 超过终端宽度会折行，\r 只能回到最后一行，所以先截短。
+	fmt.Fprint(s.out, "\r"+Truncate(line, s.room())+"\033[K")
 	s.lineBusy = true
 }
 
@@ -150,13 +172,17 @@ func (s *Screen) End(summary string) {
 	}
 	elapsed := s.now().Sub(s.cur.started)
 	s.timings = append(s.timings, Timing{Title: s.cur.title, Elapsed: elapsed})
-	tail := Elapsed(elapsed)
-	if summary != "" {
-		tail = summary + " · " + tail
+	// 不到 1 秒的步骤不写“0 秒”。
+	tail := summary
+	if elapsed >= time.Second {
+		if tail != "" {
+			tail += " · "
+		}
+		tail += Elapsed(elapsed)
 	}
 	s.log.Printf("完成：%s · %s", s.prefix(), tail)
 	s.clearLine()
-	fmt.Fprintf(s.out, "%s %s %s\n", s.prefix(), s.color("1;32", "✓"), tail)
+	fmt.Fprintln(s.out, strings.TrimRight(s.prefix()+" "+s.color("1;32", "✓")+" "+tail, " "))
 	s.cur = nil
 }
 
@@ -206,6 +232,25 @@ func (s *Screen) Warn(format string, args ...any) {
 	s.warnings = append(s.warnings, msg)
 }
 
+// Info 显示一条需要知道、但不用处理的说明（例如自动加入了依赖的容器），
+// 不算警告，不汇总到最终结果。
+func (s *Screen) Info(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	s.log.Printf("说明：%s", msg)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clearLine()
+	fmt.Fprintf(s.out, "    · %s\n", msg)
+}
+
+// ReportFollows 声明这次任务最后会打印结果摘要。之后 Error 在当场只写一行原因，
+// 建议留到摘要里，不重复两遍。
+func (s *Screen) ReportFollows() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reportFollows = true
+}
+
 // Error 记录失败原因和建议，并在屏幕上显示。只有第一条会出现在结果摘要里。
 func (s *Screen) Error(reason, hint string) {
 	if hint != "" {
@@ -220,7 +265,7 @@ func (s *Screen) Error(reason, hint string) {
 	}
 	s.clearLine()
 	fmt.Fprintf(s.out, "%s %s\n", s.color("1;31", "✗"), reason)
-	if hint != "" {
+	if hint != "" && !s.reportFollows {
 		fmt.Fprintf(s.out, "  建议：%s\n", hint)
 	}
 }
@@ -281,13 +326,13 @@ type Report struct {
 	Title   string   // 例如“迁入结果”
 	Result  string   // 例如“✅ 迁入成功”
 	Lines   []string // 结果下面的其他行
+	Next    []string // “接下来”要做的事
 	Elapsed time.Duration
 	Success bool
-	LogPath string   // 失败时显示的日志位置
-	LogTail []string // 失败时显示的最近日志
+	LogPath string // 失败时显示的日志位置
 }
 
-// PrintReport 打印结果摘要。成功时附上各步骤耗时；失败时附上原因、建议和日志位置。
+// PrintReport 打印结果摘要。失败时附上原因、建议和日志位置。各步骤的耗时只写日志。
 func (s *Screen) PrintReport(r Report) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -299,15 +344,15 @@ func (s *Screen) PrintReport(r Report) {
 	for _, l := range r.Lines {
 		b.WriteString(l + "\n")
 	}
-	if r.Elapsed > 0 {
+	if r.Elapsed >= time.Second {
 		b.WriteString("耗时：" + Elapsed(r.Elapsed) + "\n")
 	}
-	if r.Success && len(s.timings) > 0 {
+	if len(s.timings) > 0 {
 		parts := make([]string, 0, len(s.timings))
 		for _, t := range s.timings {
 			parts = append(parts, t.Title+" "+Elapsed(t.Elapsed))
 		}
-		b.WriteString("各步骤耗时：" + strings.Join(parts, " · ") + "\n")
+		s.log.Printf("各步骤耗时：%s", strings.Join(parts, " · "))
 	}
 	if len(s.warnings) > 0 {
 		seen := map[string]bool{}
@@ -318,13 +363,19 @@ func (s *Screen) PrintReport(r Report) {
 				uniq = append(uniq, w)
 			}
 		}
-		fmt.Fprintf(&b, "警告：%d 条\n", len(s.warnings))
+		b.WriteString("需要留意：\n")
 		for i, w := range uniq {
 			if i == 10 {
 				fmt.Fprintf(&b, "  · ……还有 %d 条，见日志\n", len(uniq)-10)
 				break
 			}
 			b.WriteString("  · " + w + "\n")
+		}
+	}
+	if len(r.Next) > 0 {
+		b.WriteString("接下来：\n")
+		for _, l := range r.Next {
+			b.WriteString("  · " + l + "\n")
 		}
 	}
 	if !r.Success {
@@ -337,12 +388,6 @@ func (s *Screen) PrintReport(r Report) {
 		if r.LogPath != "" {
 			b.WriteString("日志：" + r.LogPath + "\n")
 			b.WriteString("      反馈问题时请附上这个文件（密钥和密码已自动隐藏），或运行 dockhop diagnose 生成诊断文件。\n")
-		}
-		if len(r.LogTail) > 0 {
-			b.WriteString("最近日志：\n")
-			for _, l := range r.LogTail {
-				b.WriteString("  " + l + "\n")
-			}
 		}
 	}
 	b.WriteString(strings.Repeat("━", 20+displayWidth(middle)) + "\n")

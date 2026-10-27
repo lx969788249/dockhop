@@ -30,8 +30,18 @@ func main() {
 		Version: version,
 		Workdir: wd,
 		Context: ctx,
+		Width:   terminalWidth,
 	})
 	os.Exit(code)
+}
+
+// terminalWidth 是屏幕（标准错误）有多少列，每次刷新进度时读取，窗口拉宽拉窄都跟得上。
+func terminalWidth() int {
+	w, _, err := term.GetSize(int(os.Stderr.Fd()))
+	if err != nil {
+		return 0
+	}
+	return w
 }
 
 // terminalInput 返回可以提问的终端输入。通过 bash <(curl …) 运行时标准输入

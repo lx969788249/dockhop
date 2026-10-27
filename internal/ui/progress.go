@@ -31,6 +31,35 @@ type ProgressState struct {
 // RenderProgress 生成一行进度文字（不含换行）。只在确实知道总量时显示百分比，
 // 不用“假进度条”误导用户。
 func RenderProgress(p ProgressState) string {
+	label, tail := progressParts(p, 20, true)
+	return label + tail
+}
+
+// FitProgress 和 RenderProgress 一样，但保证不超过 width 列：终端窄时依次去掉速度、
+// 缩短进度条、截短正在处理的对象。一行进度一旦折行，\r 只能回到最后一行的开头，
+// 前面那一截就会留在屏幕上。width 为 0 表示不限。
+func FitProgress(p ProgressState, width int) string {
+	if width <= 0 {
+		return RenderProgress(p)
+	}
+	for _, v := range []struct {
+		bar  int
+		rate bool
+	}{{20, true}, {20, false}, {10, false}} {
+		label, tail := progressParts(p, v.bar, v.rate)
+		if displayWidth(label)+displayWidth(tail) <= width {
+			return label + tail
+		}
+	}
+	label, tail := progressParts(p, 10, false)
+	if room := width - displayWidth(tail); room >= 12 {
+		return Truncate(label, room) + tail
+	}
+	return Truncate(label+tail, width)
+}
+
+// progressParts 把进度行拆成开头（步骤和对象）和后面的进度部分。
+func progressParts(p ProgressState, barWidth int, showRate bool) (string, string) {
 	var b strings.Builder
 	cur, total := p.Current, p.Total
 	if cur < 0 {
@@ -46,11 +75,11 @@ func RenderProgress(p ProgressState) string {
 		if percent > 99 {
 			percent = 99
 		}
-		filled := percent * 20 / 100
-		fmt.Fprintf(&b, "%s %s%s %d%% · %s/%s", p.Label,
-			strings.Repeat("█", filled), strings.Repeat("░", 20-filled),
+		filled := percent * barWidth / 100
+		fmt.Fprintf(&b, " %s%s %d%% · %s/%s",
+			strings.Repeat("█", filled), strings.Repeat("░", barWidth-filled),
 			percent, HumanBytes(cur), HumanBytes(total))
-		if p.Rate > 0 {
+		if p.Rate > 0 && showRate {
 			b.WriteString(" · " + HumanBytes(p.Rate) + "/s")
 		}
 		if p.Rate > 0 && total > cur {
@@ -63,17 +92,15 @@ func RenderProgress(p ProgressState) string {
 			b.WriteString(" · " + Elapsed(p.Elapsed))
 		}
 	case cur > 0:
-		b.WriteString(p.Label)
 		if p.Spinner != "" {
 			b.WriteString(" " + p.Spinner)
 		}
 		b.WriteString(" 已处理 " + HumanBytes(cur))
-		if p.Rate > 0 {
+		if p.Rate > 0 && showRate {
 			b.WriteString(" · " + HumanBytes(p.Rate) + "/s")
 		}
 		b.WriteString(" · " + Elapsed(p.Elapsed))
 	default:
-		b.WriteString(p.Label)
 		if p.Spinner != "" {
 			b.WriteString(" " + p.Spinner)
 		}
@@ -82,7 +109,7 @@ func RenderProgress(p ProgressState) string {
 	if p.Hint != "" {
 		b.WriteString(" · " + p.Hint)
 	}
-	return b.String()
+	return p.Label, b.String()
 }
 
 // Progress 显示一个耗时操作的进度：终端里每秒原地刷新，非终端每 10 秒输出一行。
@@ -173,7 +200,7 @@ func (p *Progress) loop(interval time.Duration) {
 		st.Label = p.s.label(p.label)
 		if p.s.tty {
 			st.Spinner = spinnerFrames[tick%len(spinnerFrames)]
-			p.s.draw(RenderProgress(st))
+			p.s.draw(FitProgress(st, p.s.room()))
 		} else {
 			fmt.Fprintf(p.s.out, "[进度] %s\n", RenderProgress(st))
 		}

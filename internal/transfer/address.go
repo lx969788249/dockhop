@@ -85,7 +85,7 @@ func externalIPv4(ctx context.Context) net.IP {
 // FirewallHint 返回放行端口的提示：检测到 ufw 或 firewalld 在运行时给出对应命令。
 // 只给提示，不擅自修改防火墙。
 func FirewallHint(ctx context.Context, port int) string {
-	hint := "新服务器连不上时，请在云厂商控制台的安全组里放行 TCP " + strconv.Itoa(port)
+	hint := "新服务器连不上时：在云服务商控制台的安全组（防火墙）里放行 TCP " + strconv.Itoa(port) + " 端口"
 	run := func(name string, args ...string) string {
 		if _, err := exec.LookPath(name); err != nil {
 			return ""

@@ -76,3 +76,33 @@ func displayWidth(s string) int {
 	}
 	return w
 }
+
+// Truncate 把文字截到不超过 width 列，截掉的部分用“…”表示。
+func Truncate(s string, width int) string {
+	if width <= 0 || displayWidth(s) <= width {
+		return s
+	}
+	var b strings.Builder
+	w := 0
+	for _, r := range s {
+		rw := displayWidth(string(r))
+		if w+rw > width-1 {
+			break
+		}
+		b.WriteRune(r)
+		w += rw
+	}
+	return b.String() + "…"
+}
+
+// ShortPath 在进度里显示路径：太长时只留最后两级，例如 …/halo/data。完整路径写在日志里。
+func ShortPath(p string) string {
+	if displayWidth(p) <= 30 {
+		return p
+	}
+	parts := strings.Split(strings.TrimRight(p, "/"), "/")
+	if len(parts) <= 3 {
+		return p
+	}
+	return "…/" + strings.Join(parts[len(parts)-2:], "/")
+}

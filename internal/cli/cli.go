@@ -37,7 +37,8 @@ type Env struct {
 	Workdir  string // 当前目录，诊断文件写在这里
 	Context  context.Context
 	HomeDir  func() (string, error)
-	Platform string // 例如 linux/amd64
+	Platform string     // 例如 linux/amd64
+	Width    func() int // 终端有多少列；0 表示不知道
 	Args     []string
 	verbose  bool
 }
@@ -146,6 +147,7 @@ func Run(args []string, env Env) int {
 	env.Args = args
 	screen := ui.New(env.Stderr, env.TTY, nil)
 	screen.SetVerbose(verbose)
+	screen.SetWidth(env.Width)
 	err := dispatch(cmd, rest, &env, screen)
 	return exitCode(err, env.Stderr)
 }
@@ -196,16 +198,16 @@ func dispatch(cmd string, args []string, env *Env, screen *ui.Screen) error {
 func banner(env *Env) { fmt.Fprint(env.Stderr, ui.Banner(env.Version, env.TTY)) }
 
 func menu(env *Env, screen *ui.Screen) error {
-	p := ui.NewPrompter(env.Input, env.Stderr)
+	p := ui.NewPrompter(env.Input, env.Stderr).WithContext(env.Context)
 	if !p.Interactive() {
 		fmt.Fprint(env.Stdout, helpText)
 		return usageErr("没有可以输入的终端，请直接写明命令，例如 dockhop out 或 dockhop in '链接'")
 	}
 	banner(env)
 	choice, err := p.Choose([]string{
-		"迁出",
-		"迁入",
-		"收集诊断信息",
+		"迁出：在旧服务器上选这个，把服务打包好，等新服务器来取",
+		"迁入：在新服务器上选这个，把服务迁到这台服务器",
+		"收集诊断信息：遇到问题、要反馈时用",
 	}, 1)
 	if err != nil {
 		return err
@@ -226,6 +228,10 @@ func runOut(env *Env, _ *ui.Screen, opts OutOptions) error {
 		return err
 	}
 	if err := backup.RecoverInterrupted(env.Context, t.docker, t.home, t.screen, t.prompt); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+			t.finish(false)
+			return err
+		}
 		t.screen.Error(err.Error(), "")
 		t.finish(false)
 		return errReported
@@ -247,15 +253,15 @@ func runOut(env *Env, _ *ui.Screen, opts OutOptions) error {
 // readLink 取得迁移链接：命令里写了就用，否则在终端里请用户粘贴。
 func readLink(env *Env, given string) (crypto.Link, error) {
 	if given != "" {
-		return crypto.ParseLink(given)
+		return crypto.ParseLink(linkIn(given))
 	}
-	p := ui.NewPrompter(env.Input, env.Stderr)
+	p := ui.NewPrompter(env.Input, env.Stderr).WithContext(env.Context)
 	if !p.Interactive() {
 		return crypto.Link{}, usageErr("请在命令后面写上迁移链接，例如 dockhop in '链接'")
 	}
 	var link crypto.Link
-	_, err := p.Ask("请粘贴旧服务器上显示的迁移链接：", func(s string) error {
-		l, err := crypto.ParseLink(s)
+	_, err := p.Ask("请粘贴旧服务器上显示的命令（或者其中的链接）：", func(s string) error {
+		l, err := crypto.ParseLink(linkIn(s))
 		if err != nil {
 			return err
 		}
@@ -305,6 +311,23 @@ func runIn(env *Env, screen *ui.Screen, opts InOptions, checkOnly bool) error {
 	return err
 }
 
+// linkIn 从粘贴的内容里找出迁移链接：旧服务器显示的是一整条迁入命令，
+// 用户可能整行粘贴过来，也可能只粘贴引号里的链接。
+func linkIn(s string) string {
+	i := strings.Index(s, "http://")
+	if i < 0 {
+		i = strings.Index(s, "https://")
+	}
+	if i < 0 {
+		return strings.TrimSpace(s)
+	}
+	s = s[i:]
+	if j := strings.IndexAny(s, "'\" \t"); j >= 0 {
+		s = s[:j]
+	}
+	return s
+}
+
 // errReported 表示错误已经显示过了，只需要返回失败的退出码。
 var errReported = errors.New("已显示")
 
@@ -317,8 +340,10 @@ func exitCode(err error, stderr io.Writer) int {
 	case errors.As(err, &ue):
 		fmt.Fprintln(stderr, "✗ "+ue.Msg)
 		return ExitUsage
+	case errors.Is(err, ui.ErrCancelled):
+		return ExitInterrupted
 	case errors.Is(err, context.Canceled):
-		fmt.Fprintln(stderr, "已中断。")
+		fmt.Fprintln(stderr, "\n已取消。")
 		return ExitInterrupted
 	case errors.Is(err, ui.ErrNotInteractive):
 		fmt.Fprintln(stderr, "✗ 需要回答问题，但没有可以输入的终端")

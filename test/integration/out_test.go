@@ -124,7 +124,7 @@ func TestOutBundleContents(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := p.out()
-	for _, want := range []string{"[1/7] 检查环境 ✓", "整个项目一起迁移", "共用数据或网络", "[4/7] 停机并打包数据 ✓", "[7/7] 启动下载服务 ✓"} {
+	for _, want := range []string{"[1/6] 检查环境 ✓", "项目里的", "共用数据或网络", "[4/6] 停机打包数据 ✓", "[6/6] 启动下载服务 ✓", "请不要关闭这个窗口"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("输出里缺少「%s」", want)
 		}
@@ -296,7 +296,7 @@ func TestOutBundleContents(t *testing.T) {
 		t.Fatalf("迁出应成功结束，退出码 %d：\n%s", code, p.out())
 	}
 	out = p.out()
-	for _, want := range []string{"新服务器已迁入成功", "✅ 迁出完成", "源容器：已恢复 5/5"} {
+	for _, want := range []string{"新服务器已迁入成功", "✅ 迁移完成", "服务都已恢复运行"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("结束时输出里缺少「%s」：\n%s", want, out)
 		}
@@ -368,7 +368,7 @@ func TestOutDiskCheckBeforeStop(t *testing.T) {
 	if err == nil || !strings.Contains(string(b), "磁盘空间可能不够") || !strings.Contains(string(b), "--workdir") {
 		t.Fatalf("磁盘不够时应停下并提示：%v\n%s", err, b)
 	}
-	if strings.Contains(string(b), "[4/7]") {
+	if strings.Contains(string(b), "[4/6]") {
 		t.Fatal("磁盘不够时不应进入停机步骤")
 	}
 	if s := state(t, f.web); s != "running" {
@@ -477,7 +477,7 @@ func TestOutLargeLayerWarns(t *testing.T) {
 	p.waitFor(t, linkPattern, 5*time.Minute)
 	out := p.out()
 	warn := strings.Index(out, "里没挂载出来的改动有 114MB")
-	stop := strings.Index(out, "[4/7]")
+	stop := strings.Index(out, "[4/6]")
 	if warn < 0 || warn > stop {
 		t.Errorf("应在停机之前提醒容器里的改动很大：\n%s", out)
 	}
@@ -499,7 +499,7 @@ func TestOutRefusesAutoRemove(t *testing.T) {
 		cmd := exec.Command(bin, "out", "--include", include, "--stop-shared", "--port", fmt.Sprint(nextPort()))
 		cmd.Env = append(os.Environ(), "DOCKHOP_HOME="+t.TempDir())
 		b, err := cmd.CombinedOutput()
-		if err == nil || !strings.Contains(string(b), p+"_tmp 是用 --rm 启动的") || strings.Contains(string(b), "[4/7]") {
+		if err == nil || !strings.Contains(string(b), p+"_tmp 是用 --rm 启动的") || strings.Contains(string(b), "[4/6]") {
 			t.Fatalf("应在停机之前停下（--include %s）：%v\n%s", include, err, b)
 		}
 		if s := state(t, p+"_tmp"); s != "running" {

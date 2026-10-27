@@ -126,7 +126,7 @@ func TestInLinkMessages(t *testing.T) {
 func TestMenu(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
 	r := runCLI(t, "1\n", nil)
-	if !strings.Contains(r.stderr, "1) 迁出\n") || !strings.Contains(r.stderr, "2) 迁入\n") || !strings.Contains(r.stderr, "3) 收集诊断信息\n") {
+	if !strings.Contains(r.stderr, "1) 迁出：") || !strings.Contains(r.stderr, "2) 迁入：") || !strings.Contains(r.stderr, "3) 收集诊断信息：") {
 		t.Fatalf("菜单文字不对：%q", r.stderr)
 	}
 	if r.code != ExitFailed || !strings.Contains(r.stderr, "连不上 Docker") || !strings.Contains(r.stderr, "systemctl start docker") {
@@ -214,5 +214,23 @@ func TestDiagnose(t *testing.T) {
 	r = runCLI(t, "", map[string]string{"DOCKHOP_HOME": home}, "diagnose")
 	if r.code != ExitOK || !strings.Contains(r.stderr, "诊断文件：") {
 		t.Fatalf("连不上 Docker 时也应生成诊断文件：%d %q", r.code, r.stderr)
+	}
+}
+
+// 旧服务器显示的是一整条迁入命令，粘贴整条命令或者只粘贴链接都要认得。
+func TestLinkIn(t *testing.T) {
+	const link = "http://127.0.0.1:8080/k9Qm2xTa/#abc"
+	for _, in := range []string{
+		link,
+		"  " + link + "  ",
+		"bash <(curl -fsSL dockhop.run) in '" + link + "'",
+		`dockhop in "` + link + `" --yes`,
+	} {
+		if got := linkIn(in); got != link {
+			t.Errorf("linkIn(%q) = %q", in, got)
+		}
+	}
+	if got := linkIn(" abc "); got != "abc" {
+		t.Errorf("不是链接时原样交给 ParseLink 报错：%q", got)
 	}
 }

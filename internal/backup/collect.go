@@ -127,7 +127,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 	var bindPaths []*bindInfo
 	images := map[string]int64{}
 	for i, it := range sel.items {
-		screen.Count("读取配置", i+1, len(sel.items), it.name())
+		screen.Count("读取容器配置", i+1, len(sel.items), it.name())
 		out.secrets = append(out.secrets, spec.SecretEnvValues(it.c.Config.Env)...)
 		if _, ok := images[it.c.Image]; !ok {
 			size := int64(0)
@@ -255,7 +255,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		}
 		b.dir = st.IsDir()
 		b.id = fmt.Sprintf("b%03d", len(out.binds)+1)
-		screen.Note("统计目录大小 · " + b.path)
+		screen.Note("统计目录大小 · " + ui.ShortPath(b.path))
 		b.bytes, _ = treeSize(b.path, nil, 0)
 		out.binds = append(out.binds, b)
 	}
@@ -273,7 +273,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 			}
 		}
 		if !p.inBind {
-			screen.Note("统计项目目录 · " + u.workingDir)
+			screen.Note("统计项目目录 · " + ui.ShortPath(u.workingDir))
 			p.dirBytes, p.skipped = treeSize(u.workingDir, p.excludes, bigFileLimit)
 		}
 		cp := compose.Project{Name: u.project, WorkingDir: u.workingDir, Files: u.files}
