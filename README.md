@@ -1,6 +1,9 @@
 <div align="center">
 
-# 🐳 DockHop
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.png">
+  <img alt="DockHop" src="docs/images/logo-light.png" width="420">
+</picture>
 
 **一条链接，把 Docker 服务连同数据从旧服务器迁到新服务器。**
 
