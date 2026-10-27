@@ -1,4 +1,4 @@
-// dockhop.run：一行命令 bash <(curl -fsSL dockhop.run) 用的短地址。
+// dockhop.run：一行命令 bash <(curl -fsSL https://dockhop.run) 用的短地址。
 //
 // curl、wget 来访问时，直接返回仓库 main 分支上的 run.sh（在 Cloudflare 上缓存 5 分钟）；
 // 浏览器来访问时，跳到 GitHub 上的项目页。
@@ -23,6 +23,12 @@ const text = (body, status) =>
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    // 明文 HTTP 不返回脚本：路上的人可以改掉它，而它是以 root 运行的，程序的校验值也写在它里面。
+    // 不写 https:// 的老命令会先走 HTTP，跳到 https 之后 curl -L 会跟过去。
+    if (url.protocol === "http:") {
+      url.protocol = "https:";
+      return Response.redirect(url.toString(), 301);
+    }
     const asset = url.pathname.match(ASSET);
     if (asset) {
       return release(request, ctx, asset[1], asset[2]);

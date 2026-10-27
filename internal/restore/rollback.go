@@ -27,8 +27,9 @@ type undo struct {
 // rollback 返回没能撤销的地方；为空表示已经全部撤销。
 //
 // 顺序和改动的顺序相反，分三遍：
-//  1. 先停止并删除这次新建的容器。没能全部删掉时停下：它们可能还在写数据，这时放回
-//     的数据会被覆盖，回滚资料全部保留，交给人工处理。
+//  1. 先停下所有可能在写数据的容器：删除这次新建的容器，再把临时停过、提交时已经重新
+//     启动的已有容器重新停下（之后才出错或被中断时会这样）。没能做到时停下：它们可能还在
+//     写数据，这时放回的数据会被覆盖，回滚资料全部保留，交给人工处理。
 //  2. 再处理数据：删除这次写入的网络、Compose 文件、目录、数据卷，放回原有的。
 //  3. 最后放回旧服务：重建旧 Compose 容器、旧容器改回原名、启动临时停下的容器。
 //     原有的数据没能全部放回时，旧服务保持停止，以免在不完整的数据上运行。
@@ -49,7 +50,7 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		}
 	}
 
-	// 第 1 遍：删除新建的容器。
+	// 第 1 遍：删除新建的容器，停下临时停过、又被启动了的容器。
 	u.screen.Note("删除这次新建的容器")
 	for i := len(entries) - 1; i >= 0; i-- {
 		e := entries[i]
@@ -68,6 +69,8 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 			}
 		case opHelper:
 			u.removeHelper(ctx, e, note)
+		case opStop:
+			u.restop(ctx, e, note)
 		case opComposeUp:
 			list, err := u.dc.ContainersByLabel(ctx, "com.docker.compose.project="+e.Name)
 			if err != nil {
@@ -88,7 +91,7 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		if u.fail("rollback-remove") {
 			note("（测试）模拟新容器没能删除")
 		}
-		note("新建的容器没能全部删除，为了安全没有动数据，回滚资料全部保留")
+		note("有容器没能删除或停下，为了安全没有动数据，回滚资料全部保留")
 		return problems
 	}
 
@@ -168,6 +171,27 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		}
 	}
 	return problems
+}
+
+// restop 把临时停过、现在又在运行的已有容器重新停下（暂停的先恢复再停）。
+func (u *undo) restop(ctx context.Context, e Entry, note func(string, ...any)) {
+	c, _, err := u.dc.InspectContainer(ctx, e.ID)
+	switch {
+	case docker.IsNotFound(err), err == nil && !c.State.Running:
+		return
+	case err != nil:
+		note("没法确认临时停过的容器 %s 已经停下：%v", e.Name, err)
+		return
+	}
+	if c.State.Paused {
+		if err := u.dc.UnpauseContainer(ctx, e.ID); err != nil {
+			note("临时停过的容器 %s 又在运行，没能停下：%v", e.Name, err)
+			return
+		}
+	}
+	if err := u.dc.StopContainer(ctx, e.ID, nil); err != nil {
+		note("临时停过的容器 %s 又在运行，没能停下：%v", e.Name, err)
+	}
 }
 
 // removeHelper 删除 DockHop 自己的临时容器（按日志里记下的名字，名字里带着进程号）。

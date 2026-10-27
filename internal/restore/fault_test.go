@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 
+	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -147,5 +150,138 @@ func TestMoveOrCopyPartialFailure(t *testing.T) {
 	}
 	if _, err := os.Lstat(src); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("原来的应删除")
+	}
+}
+
+// 每种镜像都要给出能用来建容器的名字，恢复数据卷的临时容器靠它：以前按摘要固定的镜像
+// 在线补齐成功后没给名字，只有这种镜像又有数据卷时，迁入在恢复数据卷时失败。
+func TestLoadImagesChoosesHelper(t *testing.T) {
+	digest := "alpine@sha256:" + strings.Repeat("a", 64)
+	cases := []struct {
+		name   string
+		refs   []string
+		pullOK bool
+		want   string
+	}{
+		{"只有按摘要固定的、在线补齐", []string{digest}, true, digest},
+		{"只有按摘要固定的、用迁移包里的", []string{digest}, false, "alpine:pinned-aaaaaaaaaaaa"},
+		{"混合", []string{"nginx:1.27", digest}, true, digest},
+		{"只有普通的", []string{"nginx:1.27"}, true, "nginx:1.27"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dc, _ := faultyDocker(t, func(w http.ResponseWriter, q *http.Request) bool {
+				switch {
+				case q.Method == "POST" && strings.HasSuffix(q.URL.Path, "/images/load"):
+					io.Copy(io.Discard, q.Body)
+					w.Write([]byte(`{"stream":"Loaded image"}`))
+				case q.Method == "POST" && strings.HasSuffix(q.URL.Path, "/images/create"):
+					return c.pullOK
+				case q.Method == "GET" && strings.HasSuffix(q.URL.Path, "/json"):
+					w.Write([]byte(`{"Id":"sha256:` + strings.Repeat("b", 64) + `"}`))
+				case q.Method == "POST" && strings.HasSuffix(q.URL.Path, "/tag"):
+					w.WriteHeader(http.StatusCreated)
+				default:
+					return false
+				}
+				return true
+			})
+			refs := map[string]string{}
+			for _, ref := range c.refs {
+				refs[ref] = "sha256:" + strings.Repeat("b", 64)
+			}
+			var out bytes.Buffer
+			r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, dataDir: t.TempDir(), imageAs: map[string]string{},
+				m: &bundle.Manifest{Images: bundle.Images{Refs: refs}}}
+			if err := r.loadImages(context.Background()); err != nil {
+				t.Fatalf("%v\n%s", err, out.String())
+			}
+			if r.helperImage != c.want {
+				t.Errorf("临时容器用的镜像：%q，期望 %q", r.helperImage, c.want)
+			}
+		})
+	}
+}
+
+// sharedWriters 模拟提交时恢复临时停下的、共用数据的容器：b 恢复成功（又在运行了），
+// a 恢复失败，于是整体回滚。stopOK 决定回滚时能不能把 b 停下。
+func sharedWriters(t *testing.T, stopOK bool) (r *run, dataReplacedWhileRunning func() bool, dst string) {
+	root := t.TempDir()
+	dst, backup := filepath.Join(root, "data"), filepath.Join(root, "backup")
+	os.Mkdir(dst, 0o700)
+	os.Mkdir(backup, 0o700)
+	os.WriteFile(filepath.Join(dst, "state"), []byte("new"), 0o600)
+	os.WriteFile(filepath.Join(backup, "state"), []byte("old"), 0o600)
+	var mu sync.Mutex
+	runningB, replaced, replacedWhileRunning := false, false, false
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, q *http.Request) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		// 数据是在两次请求之间被换掉的：第一次看到旧数据时，b 的状态就是换数据那一刻的状态。
+		if b, _ := os.ReadFile(filepath.Join(dst, "state")); string(b) == "old" && !replaced {
+			replaced, replacedWhileRunning = true, runningB
+		}
+		switch {
+		case strings.HasSuffix(q.URL.Path, "/containers/b/json"):
+			w.Write([]byte(`{"Id":"b","Name":"/b","State":{"Status":"running","Running":` + strconv.FormatBool(runningB) + `}}`))
+		case strings.HasSuffix(q.URL.Path, "/containers/a/json"):
+			w.Write([]byte(`{"Id":"a","Name":"/a","State":{"Status":"exited","Running":false}}`))
+		case strings.HasSuffix(q.URL.Path, "/containers/b/start"):
+			runningB = true
+			w.WriteHeader(http.StatusNoContent)
+		case strings.HasSuffix(q.URL.Path, "/containers/b/stop") && stopOK:
+			runningB = false
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			return false // a 启动失败；stopOK 为 false 时 b 停不下
+		}
+		return true
+	})
+	var out bytes.Buffer
+	screen := ui.New(&out, false, nil)
+	rb := filepath.Join(root, "rb")
+	j, err := openJournal(rb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(j.close)
+	shared := []Entry{{Op: opStop, Name: "a", ID: "a", State: "running"}, {Op: opStop, Name: "b", ID: "b", State: "running"}}
+	for _, e := range append(shared, Entry{Op: opBind, Path: dst, Existed: true, Backup: backup}) {
+		if err := j.add(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r = &run{Deps: Deps{Docker: dc, Screen: screen}, j: j, rbDir: rb, shared: shared,
+		undo: &undo{dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
+	if err := r.commit(context.Background()); err == nil {
+		t.Fatal("a 恢复失败时提交应失败")
+	}
+	return r, func() bool { mu.Lock(); defer mu.Unlock(); return replacedWhileRunning }, dst
+}
+
+// 提交时已经重新启动的、共用数据的容器，回滚放回旧数据之前要再停下：不然它会在数据被换掉时继续读写。
+func TestRollbackRestopsRestartedSharedWriter(t *testing.T) {
+	r, replacedWhileRunning, dst := sharedWriters(t, true)
+	r.rollback(context.Background())
+	if replacedWhileRunning() {
+		t.Error("放回旧数据时共用数据的容器 b 还在运行")
+	}
+	if b, _ := os.ReadFile(filepath.Join(dst, "state")); string(b) != "old" {
+		t.Errorf("应放回旧数据，实际：%q", b)
+	}
+}
+
+// 停不下那个容器时，不能动数据，回滚资料全部保留。
+func TestRollbackKeepsDataWhenWriterWontStop(t *testing.T) {
+	r, replacedWhileRunning, dst := sharedWriters(t, false)
+	r.rollback(context.Background())
+	if replacedWhileRunning() {
+		t.Error("容器停不下时不应动数据")
+	}
+	if b, _ := os.ReadFile(filepath.Join(dst, "state")); string(b) != "new" {
+		t.Errorf("数据不应被动过，实际：%q", b)
+	}
+	if issues := strings.Join(r.rollbackIssues, "；"); !strings.Contains(issues, "没能停下") || !strings.Contains(issues, "没有动数据") {
+		t.Errorf("应说明为什么没动数据：%s", issues)
 	}
 }

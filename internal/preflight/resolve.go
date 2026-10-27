@@ -41,6 +41,9 @@ func (r *Runner) firstTime(i Issue) bool {
 	return true
 }
 
+// autoRounds 是 --yes 自动处理最多做几轮。
+const autoRounds = 3
+
 // errRecheck 表示用户处理好了、要重新检查。
 var errRecheck = errors.New("重新检查")
 
@@ -95,6 +98,14 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 			return res, nil
 		}
 		r.raised = true
+		// 自动处理了几轮还有问题（处理一个又冒出另一个、或者处理不了）：交给用户。
+		// 每轮处理完都会再检查一次，最后一轮处理好了也算数。
+		if auto && round > autoRounds {
+			if !r.Prompt.Interactive() {
+				return res, &Problem{Reason: "自动处理之后仍有问题没有解决：" + asks[0].Title, Hint: "查看上面的问题，处理后重新运行"}
+			}
+			auto = false
+		}
 		if !r.Prompt.Interactive() && !auto {
 			r.Screen.Hold()
 			r.Screen.Println(fmt.Sprintf("发现 %d 个需要处理的问题，还没有下载或改动任何东西：", len(asks)))
@@ -131,13 +142,6 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 				return res, err
 			}
 		}
-		// 自动处理只做一轮：再查一次还有问题就交给用户。
-		if auto && round >= 2 {
-			if !r.Prompt.Interactive() {
-				return res, &Problem{Reason: "自动处理之后仍有问题没有解决：" + asks[0].Title, Hint: "查看上面的问题，处理后重新运行"}
-			}
-			auto = false
-		}
 		if !auto {
 			r.Screen.Println("\n重新检查……")
 		}
@@ -163,6 +167,12 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 	}
 	switch i.Kind {
 	case "port", "host_ip":
+		// 只改这次选的那一项：同一个端口之前做过的其他调整（例如改绑地址）要保留。
+		changePort := func(edit func(*PortChange)) {
+			ch := d.currentPort(*i.Port)
+			edit(&ch)
+			d.setPort(ch)
+		}
 		if i.Project != "" {
 			// Compose 项目的端口写在用户自己的文件里，不替用户改，只能处理后重查或跳过。
 			if auto {
@@ -190,10 +200,10 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 			}
 			switch c {
 			case 1:
-				d.setPort(PortChange{PortRef: *i.Port, NewIP: "", NewPort: i.Port.HostPort})
+				changePort(func(ch *PortChange) { ch.NewIP = "" })
 				return nil
 			case 2:
-				d.setPort(PortChange{PortRef: *i.Port, Drop: true})
+				changePort(func(ch *PortChange) { ch.Drop = true })
 				return nil
 			}
 			return errCancel
@@ -203,7 +213,7 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 				return errCancel
 			}
 			r.Screen.Warn("%s → 按 --yes 自动改用空闲端口 %s", i.Title, i.Suggest)
-			d.setPort(PortChange{PortRef: *i.Port, NewIP: i.Port.HostIP, NewPort: i.Suggest})
+			changePort(func(ch *PortChange) { ch.NewPort = i.Suggest })
 			return nil
 		}
 		first := "改用空闲端口 " + i.Suggest + "（推荐）"
@@ -228,11 +238,11 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 					return err
 				}
 			}
-			d.setPort(PortChange{PortRef: *i.Port, NewIP: i.Port.HostIP, NewPort: port})
+			changePort(func(ch *PortChange) { ch.NewPort = port })
 		case 3:
 			return errRecheck
 		case 4:
-			d.setPort(PortChange{PortRef: *i.Port, Drop: true})
+			changePort(func(ch *PortChange) { ch.Drop = true })
 		default:
 			return errCancel
 		}
@@ -386,12 +396,14 @@ func (d *Decisions) setPort(p PortChange) {
 func (d *Decisions) Summary() []string {
 	var out []string
 	for _, p := range d.Ports {
-		switch {
-		case p.Drop:
+		if p.Drop {
 			out = append(out, fmt.Sprintf("不再对外开放：%s 的端口 %s", p.Container, p.HostPort))
-		case p.NewPort != p.HostPort:
+			continue
+		}
+		if p.NewPort != p.HostPort {
 			out = append(out, fmt.Sprintf("端口变更：%s %s → %s", p.Container, p.HostPort, p.NewPort))
-		case p.NewIP != p.HostIP:
+		}
+		if p.NewIP != p.HostIP {
 			out = append(out, fmt.Sprintf("改绑到所有地址：%s 的端口 %s（原来绑定 %s）", p.Container, p.HostPort, p.HostIP))
 		}
 	}

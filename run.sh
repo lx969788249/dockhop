@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DockHop 一行命令入口：
-#   bash <(curl -fsSL dockhop.run) [命令和选项]
+#   bash <(curl -fsSL https://dockhop.run) [命令和选项]
 #
 # 判断 CPU 架构 → 下载对应的程序 → 核对 SHA-256 → 运行 → 删除。
 # 程序的校验值写在这个脚本里（发布时自动生成），从哪里下载都能确认没被篡改。

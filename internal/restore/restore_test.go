@@ -308,3 +308,77 @@ func TestReplicasOrder(t *testing.T) {
 		t.Errorf("副本顺序：%v", got)
 	}
 }
+
+// 写到同一处的项目必须分在同一组：只删除没启动的那组时，不能删掉或换回保留下来的项目还在用的文件。
+func TestBuildGroupsSharedPaths(t *testing.T) {
+	cases := []struct {
+		name     string
+		projects []bundle.Project
+		together bool
+	}{
+		{"同一个目录", []bundle.Project{{Name: "a", WorkingDir: "/srv/app"}, {Name: "b", WorkingDir: "/srv/app"}}, true},
+		{"一个在另一个里面", []bundle.Project{{Name: "a", WorkingDir: "/srv/app"}, {Name: "b", WorkingDir: "/srv/app/admin"}}, true},
+		{"目录外的文件在另一个项目里", []bundle.Project{{Name: "a", WorkingDir: "/srv/a", Outside: []string{"/srv/b/.env"}}, {Name: "b", WorkingDir: "/srv/b"}}, true},
+		{"共用目录外的同一个文件", []bundle.Project{{Name: "a", WorkingDir: "/srv/a", Outside: []string{"/etc/app.env"}}, {Name: "b", WorkingDir: "/srv/b", Outside: []string{"/etc/app.env"}}}, true},
+		{"互不相干", []bundle.Project{{Name: "a", WorkingDir: "/srv/a"}, {Name: "b", WorkingDir: "/srv/ab"}}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := &run{m: &bundle.Manifest{Projects: c.projects}, projects: c.projects}
+			for _, p := range c.projects {
+				r.items = append(r.items, &citem{m: bundle.Container{Name: p.Name + "-web-1", Project: p.Name}, c: &docker.Container{}})
+			}
+			r.buildGroups(nil)
+			if together := r.groupOf["p:a"] == r.groupOf["p:b"]; together != c.together {
+				t.Errorf("同组：%v，应该：%v（%d 组）", together, c.together, len(r.groups))
+			}
+		})
+	}
+}
+
+// 分在不同组的项目互不影响：只删除一组时，另一组的文件原样保留。
+func TestPartialRollbackKeepsOtherGroup(t *testing.T) {
+	root := t.TempDir()
+	stage := filepath.Join(root, "stage")
+	os.Mkdir(stage, 0o700)
+	os.WriteFile(filepath.Join(stage, "compose.yml"), []byte("services: {}"), 0o600)
+	projects := []bundle.Project{{Name: "a", WorkingDir: filepath.Join(root, "a")}, {Name: "b", WorkingDir: filepath.Join(root, "b")}}
+	var out bytes.Buffer
+	r := &run{Deps: Deps{Screen: ui.New(&out, false, nil)}, m: &bundle.Manifest{Projects: projects}, projects: projects}
+	for _, p := range projects {
+		r.items = append(r.items, &citem{m: bundle.Container{Name: p.Name + "-web-1", Project: p.Name}, c: &docker.Container{}})
+	}
+	r.buildGroups(nil)
+	j, err := openJournal(filepath.Join(root, "rb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.close()
+	r.j = j
+	for _, p := range projects {
+		r.in("p:" + p.Name)
+		if err := r.installTree(stage, p.WorkingDir, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := readJournal(j.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var drop []Entry
+	for _, e := range entries {
+		if e.Group == r.groupOf["p:a"] {
+			drop = append(drop, e)
+		}
+	}
+	u := &undo{screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+	if problems := u.rollback(context.Background(), drop); len(problems) > 0 {
+		t.Fatal(problems)
+	}
+	if _, err := os.Stat(filepath.Join(root, "a", "compose.yml")); !os.IsNotExist(err) {
+		t.Errorf("删除的那组应删掉：%v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(root, "b", "compose.yml")); err != nil || string(b) != "services: {}" {
+		t.Errorf("保留的那组应原样保留：%q %v", b, err)
+	}
+}

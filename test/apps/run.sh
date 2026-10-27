@@ -385,7 +385,10 @@ run_digest() {
   digest="$(docker image inspect -f '{{index .RepoDigests 0}}' alpine:3.20)"
   ref="alpine:3.20@${digest#*@}"
   docker exec "$old" docker pull -q "$ref" >/dev/null
-  docker exec "$old" docker run -d --name dm_pinned --restart unless-stopped "$ref" sleep infinity >/dev/null
+  docker exec "$old" docker run -d --name dm_pinned --restart unless-stopped -v dm_pinned_data:/data -v /cache \
+    "$ref" sleep infinity >/dev/null
+  # 具名卷和匿名卷里各写一点数据：恢复数据卷要用镜像建临时容器，迁移包里只有按摘要固定的镜像时也要建得出来。
+  docker exec "$old" docker exec dm_pinned sh -c 'echo named >/data/check && echo anon >/cache/check'
 
   log "[digest] 新服务器连不上镜像仓库：检查时询问，--yes 改用迁移包里的镜像"
   start_out
@@ -400,11 +403,13 @@ run_digest() {
   grep -Fq '镜像按摘要固定了版本' "${tmp}/in-offline.log"
   grep -Fq '改用迁移包里的镜像' "${tmp}/in-offline.log"
   [[ "$(docker exec "$new" docker inspect -f '{{.Config.Image}} {{.State.Status}}' dm_pinned)" == "alpine:3.20 running" ]]
-  echo "  ✓ 改用迁移包里的镜像（alpine:3.20），容器正常运行"
+  [[ "$(docker exec "$new" docker exec dm_pinned cat /data/check /cache/check | paste -sd' ' -)" == "named anon" ]]
+  echo "  ✓ 改用迁移包里的镜像（alpine:3.20），容器正常运行，具名卷和匿名卷的数据都在"
   wait_out_finished
 
   log "[digest] 新服务器连得上镜像仓库：按摘要补齐清单，配置和旧服务器完全一样"
-  docker exec "$new" sh -c 'docker rm -f dm_pinned >/dev/null && docker image rm -f alpine:3.20 >/dev/null; iptables -F OUTPUT'
+  docker exec "$new" sh -c 'docker rm -f -v dm_pinned >/dev/null && docker volume rm dm_pinned_data >/dev/null &&
+    docker image rm -f alpine:3.20 >/dev/null; iptables -F OUTPUT'
   start_out
   link="$(wait_for_link)"
   run_in "$link" "${tmp}/in-online.log" || {
@@ -413,7 +418,8 @@ run_digest() {
   }
   [[ "$(docker exec "$new" docker inspect -f '{{.Config.Image}} {{.State.Status}}' dm_pinned)" == "${ref} running" ]]
   docker exec "$new" docker image inspect "$ref" >/dev/null
-  echo "  ✓ 镜像名保留 @sha256，按摘要能找到镜像"
+  [[ "$(docker exec "$new" docker exec dm_pinned cat /data/check /cache/check | paste -sd' ' -)" == "named anon" ]]
+  echo "  ✓ 镜像名保留 @sha256，按摘要能找到镜像，具名卷和匿名卷的数据都在"
   wait_out_finished
   remove_hosts
   current=""

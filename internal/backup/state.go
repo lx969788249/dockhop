@@ -98,7 +98,7 @@ func RecoverInterrupted(ctx context.Context, dc *docker.Client, home string, scr
 			// 不能当作容器已经没了：删掉记录，之后就没法自动恢复了。
 			return fmt.Errorf("读不到上次迁出停下的容器 %s 的状态（%v），停机记录保留，处理好 Docker 的问题后重新运行迁出会接着恢复", c.Name, err)
 		}
-		if !ct.State.Running {
+		if !restored(c, ct) {
 			still = append(still, c)
 		}
 	}
@@ -128,6 +128,12 @@ func RecoverInterrupted(ctx context.Context, dc *docker.Client, home string, scr
 	}
 	screen.Info("已恢复上次迁出时停下的 %d 个容器", len(still))
 	return removeStopped(home)
+}
+
+// restored 表示容器已经是记录里原来的状态。原来暂停的要还在暂停：停机打包时先恢复运行再停止，
+// 恢复时先启动再暂停，在这两步之间被强制结束的话，容器在运行但没有暂停，还要再暂停。
+func restored(c StoppedContainer, ct *docker.Container) bool {
+	return ct.State.Running && (c.State != "paused" || ct.State.Paused)
 }
 
 // restoreStates 按记录把容器恢复成原来的状态（运行或暂停），返回没能恢复的容器名。

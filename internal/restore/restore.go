@@ -612,50 +612,59 @@ func (r *run) loadImages(ctx context.Context) error {
 	}
 	sort.Strings(refs)
 	for _, ref := range refs {
-		if !strings.Contains(ref, "@sha256:") {
-			if _, err := r.Docker.InspectImage(ctx, ref); err != nil {
-				return fail(s, "镜像 "+ref+" 没有加载成功", err.Error(), "")
-			}
-			if r.helperImage == "" {
-				r.helperImage = ref // 用名字：containerd 存储里按多平台镜像的 ID 创建容器会选错平台
-			}
-			continue
+		name, err := r.resolveImage(ctx, ref)
+		if err != nil {
+			return err
 		}
-		// digest 固定的镜像：导出文件里没有仓库清单，加载后按摘要找不到（实验 3、6）。
-		if !r.d.UseBundleImage(ref) {
-			s.Note("按摘要补齐镜像清单 · " + ref)
-			pctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-			err := r.Docker.PullImage(pctx, ref)
-			cancel()
-			if err == nil {
-				continue
-			}
-			s.Warn("镜像 %s 没能按摘要补齐（%v），改用迁移包里的镜像", ref, err)
-		}
-		// 加载后的镜像只能按 ID 找到：旧版 Docker 的 ID 是配置的摘要，新版（containerd 存储）
-		// 的 ID 就是引用里的摘要。
-		id := ""
-		for _, cand := range []string{r.m.Images.Refs[ref], "sha256:" + ref[strings.LastIndex(ref, "@sha256:")+8:]} {
-			if img, err := r.Docker.InspectImage(ctx, cand); err == nil {
-				id = img.ID
-				break
-			}
-		}
-		if id == "" {
-			return fail(s, "镜像 "+ref+" 没有加载成功", "", "")
-		}
-		as := preflight.StripDigest(ref)
-		repo, tag := splitTag(as)
-		if err := r.Docker.TagImage(ctx, id, repo, tag); err != nil {
-			return fail(s, "给镜像 "+ref+" 加名字失败", err.Error(), "")
-		}
-		r.imageAs[ref] = as
+		// 恢复数据卷的临时容器用第一个镜像来建。用名字而不是 ID：containerd 存储里
+		// 按多平台镜像的 ID 创建容器会选错平台。
 		if r.helperImage == "" {
-			r.helperImage = as
+			r.helperImage = name
 		}
 	}
 	s.End(fmt.Sprintf("%d 个镜像 · %s", len(refs), ui.HumanBytes(r.m.Images.Bytes)))
 	return nil
+}
+
+// resolveImage 确认迁移包里的一个镜像在这台服务器上能用，返回用来创建容器的名字。
+func (r *run) resolveImage(ctx context.Context, ref string) (string, error) {
+	s := r.Screen
+	if !strings.Contains(ref, "@sha256:") {
+		if _, err := r.Docker.InspectImage(ctx, ref); err != nil {
+			return "", fail(s, "镜像 "+ref+" 没有加载成功", err.Error(), "")
+		}
+		return ref, nil
+	}
+	// digest 固定的镜像：导出文件里没有仓库清单，加载后按摘要找不到（实验 3、6）。
+	if !r.d.UseBundleImage(ref) {
+		s.Note("按摘要补齐镜像清单 · " + ref)
+		pctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		err := r.Docker.PullImage(pctx, ref)
+		cancel()
+		if err == nil {
+			return ref, nil
+		}
+		s.Warn("镜像 %s 没能按摘要补齐（%v），改用迁移包里的镜像", ref, err)
+	}
+	// 加载后的镜像只能按 ID 找到：旧版 Docker 的 ID 是配置的摘要，新版（containerd 存储）
+	// 的 ID 就是引用里的摘要。
+	id := ""
+	for _, cand := range []string{r.m.Images.Refs[ref], "sha256:" + ref[strings.LastIndex(ref, "@sha256:")+8:]} {
+		if img, err := r.Docker.InspectImage(ctx, cand); err == nil {
+			id = img.ID
+			break
+		}
+	}
+	if id == "" {
+		return "", fail(s, "镜像 "+ref+" 没有加载成功", "", "")
+	}
+	as := preflight.StripDigest(ref)
+	repo, tag := splitTag(as)
+	if err := r.Docker.TagImage(ctx, id, repo, tag); err != nil {
+		return "", fail(s, "给镜像 "+ref+" 加名字失败", err.Error(), "")
+	}
+	r.imageAs[ref] = as
+	return as, nil
 }
 
 func splitTag(ref string) (string, string) {

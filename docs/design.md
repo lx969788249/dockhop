@@ -191,7 +191,7 @@ http://203.0.113.7:8080/k3Jx9QmP2vLa/#a7j8zg6qtzkg8ddwxnzl94th3c4ns7ckdzjxu0w0fy
 **运行**：仍然是一行命令，不带参数时显示菜单：
 
 ```bash
-bash <(curl -fsSL dockhop.run)
+bash <(curl -fsSL https://dockhop.run)
 ```
 
 ```

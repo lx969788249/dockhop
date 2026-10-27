@@ -34,7 +34,9 @@ func TestInstructions(t *testing.T) {
 	if strings.Count(text, link.String()) != 1 || strings.Contains(text, "dockhop.run) in") {
 		t.Errorf("要复制的只能有链接一样：\n%s", text)
 	}
-	for _, want := range []string{"\033[33m⚠ 请不要关闭这个窗口\033[0m", "\033[33m⚠ 请放行 TCP 8080 端口\033[0m", "选择「2) 迁入」"} {
+	// 一行命令要写 https://：不写的话 curl 先走明文 HTTP，以 root 运行的脚本可能被路上的人改掉。
+	for _, want := range []string{"\033[33m⚠ 请不要关闭这个窗口\033[0m", "\033[33m⚠ 请放行 TCP 8080 端口\033[0m", "选择「2) 迁入」",
+		"bash <(curl -fsSL https://dockhop.run)"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("缺少 %q：\n%s", want, text)
 		}

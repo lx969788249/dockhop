@@ -27,13 +27,18 @@ type Target struct {
 	Projects      map[string]bool
 	Volumes       map[string]*docker.Volume
 	Networks      map[string]TargetNetwork
-	DockerPorts   map[string]string // tcp/8080 → 占用它的容器
+	DockerPorts   []DockerPort // 已有容器对外开放的端口
 	Listeners     []host.Listener
 	ListenersOK   bool
 	HostIPs       map[string]bool // 本机的地址；为 nil 时不检查
 	Exists        func(path string) bool
 	Disk          func(path string) (host.Disk, error)
 	Pullable      func(ref string) bool
+}
+
+// DockerPort 是新服务器上已有容器对外开放的一个端口，连同绑定的地址。
+type DockerPort struct {
+	Proto, IP, Port, Container string
 }
 
 // TargetContainer 是新服务器上已有的一个容器。
@@ -60,7 +65,7 @@ func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, e
 		MemTotal: info.MemTotal, HasCompose: compose != "", Compose: compose, Local: dc.Local(),
 		Runtimes: map[string]bool{}, VolumePlugins: map[string]bool{},
 		Containers: map[string]TargetContainer{}, Projects: map[string]bool{},
-		Volumes: map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{}, DockerPorts: map[string]string{},
+		Volumes: map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{},
 		Exists: func(p string) bool { _, err := os.Stat(p); return err == nil },
 		Disk:   host.DiskOf,
 	}
@@ -85,7 +90,7 @@ func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, e
 		}
 		for _, p := range c.Ports {
 			if p.PublicPort > 0 {
-				t.DockerPorts[p.Type+"/"+strconv.Itoa(p.PublicPort)] = c.Name()
+				t.DockerPorts = append(t.DockerPorts, DockerPort{Proto: p.Type, IP: p.IP, Port: strconv.Itoa(p.PublicPort), Container: c.Name()})
 			}
 		}
 	}

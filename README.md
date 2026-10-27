@@ -39,7 +39,7 @@ DockHop 直接读取容器的完整配置，原样交给新服务器的 Docker �
 在**旧服务器**和**新服务器**上运行同一条命令：
 
 ```bash
-bash <(curl -fsSL dockhop.run)
+bash <(curl -fsSL https://dockhop.run)
 ```
 
 | 步骤 | 在哪里 | 做什么 |
@@ -49,7 +49,7 @@ bash <(curl -fsSL dockhop.run)
 | 3 | 新服务器 | 选择 `2) 迁入`，粘贴链接，自动完成检查、下载和迁入 |
 | 4 | 旧服务器 | 新服务器迁入成功后，旧服务器这边自动结束、清理临时文件 |
 
-也可以直接带上命令，跳过菜单：在旧服务器 `bash <(curl -fsSL dockhop.run) out`，在新服务器 `bash <(curl -fsSL dockhop.run) in '迁移链接'`。
+也可以直接带上命令，跳过菜单：在旧服务器 `bash <(curl -fsSL https://dockhop.run) out`，在新服务器 `bash <(curl -fsSL https://dockhop.run) in '迁移链接'`。
 
 > [!WARNING]
 > 迁移链接里包含解开这次迁移包的密钥。请完整复制，只通过可信的渠道发送，不要公开。
@@ -175,7 +175,7 @@ sequenceDiagram
 
 ### 命令
 
-下面用 `dockhop` 代表程序。通过一行命令运行时，把参数接在后面即可，例如 `bash <(curl -fsSL dockhop.run) out --include web,db`。
+下面用 `dockhop` 代表程序。通过一行命令运行时，把参数接在后面即可，例如 `bash <(curl -fsSL https://dockhop.run) out --include web,db`。
 
 ```bash
 # 只迁移指定的容器（或它们所在的 Compose 项目），不显示菜单

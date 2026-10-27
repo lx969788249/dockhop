@@ -126,6 +126,15 @@ func (d *Decisions) AutoIPFor(container, network string) bool {
 	return has(d.AutoSubnet, network) || has(d.ReuseNetwork, network)
 }
 
+// currentPort 是端口映射现在的样子：调整过就是调整后的，否则就是原来的。处理一个问题时
+// 只改这次选的那一项，不能把之前对它做过的其他调整（例如改绑地址）冲掉。
+func (d *Decisions) currentPort(r PortRef) PortChange {
+	if ch, ok := d.PortFor(r); ok {
+		return ch
+	}
+	return PortChange{PortRef: r, NewIP: r.HostIP, NewPort: r.HostPort}
+}
+
 // PortFor 返回端口映射的调整；没有调整时 ok 为 false。
 func (d *Decisions) PortFor(r PortRef) (PortChange, bool) {
 	for _, p := range d.Ports {
@@ -492,15 +501,22 @@ func networkIssues(plan *bundle.Plan, t *Target, d *Decisions, containers []bund
 
 var wildcard = map[string]bool{"": true, "0.0.0.0": true, "::": true, "*": true, "[::]": true}
 
+// sameAddress 表示绑定在这两个地址上的同一个端口会互相冲突：其中一个是“所有地址”，
+// 或者是同一个地址。绑定在不同的具体地址上可以用同一个端口。
+func sameAddress(a, b string) bool { return wildcard[a] || wildcard[b] || a == b }
+
+// binding 是迁移包里的一个容器要把端口绑定在哪个地址上。
+type binding struct{ ip, container string }
+
 func portIssues(t *Target, d *Decisions, containers []bundle.PlanContainer, planNames map[string]bool, o Options, addIssue func(Issue)) {
 	busy := map[string]bool{}
 	for _, l := range t.Listeners {
 		busy[l.Proto+"/"+strconv.Itoa(l.Port)] = true
 	}
-	for k := range t.DockerPorts {
-		busy[k] = true
+	for _, p := range t.DockerPorts {
+		busy[p.Proto+"/"+p.Port] = true
 	}
-	requested := map[string]string{} // 协议/端口 → 要用它的容器
+	requested := map[string][]binding{} // 协议/端口 → 迁移包里要用它的容器
 	for _, c := range containers {
 		if c.NetworkMode == "host" || strings.HasPrefix(c.NetworkMode, "container:") {
 			continue
@@ -525,13 +541,13 @@ func portIssues(t *Target, d *Decisions, containers []bundle.PlanContainer, plan
 			if stopped {
 				continue // 源端本来就停着，迁入后也不启动，不会占用端口
 			}
-			if other, ok := requested[key]; ok {
+			if other := conflicting(requested[key], ip); other != "" {
 				addIssue(Issue{Level: Ask, Kind: "port", Container: c.Name, Project: c.Project, Port: &ref,
 					Title:   fmt.Sprintf("端口 %s 同时被迁移包里的 %s 和%s使用", port, other, who(c)),
 					Suggest: suggest(p.Proto, port, busy, requested)})
 				continue
 			}
-			requested[key] = c.Name
+			requested[key] = append(requested[key], binding{ip: ip, container: c.Name})
 			holder, owner := portHolder(t, p.Proto, ip, port)
 			if holder == "" || (owner != "" && planNames[owner] && replaceable(owner, d, t, o)) {
 				continue
@@ -560,27 +576,40 @@ func replaceable(name string, d *Decisions, t *Target, o Options) bool {
 	return o.Existing != "skip" && !has(d.SkipContainers, name)
 }
 
+// conflicting 返回迁移包里和这个地址抢同一个端口的容器；没有时为空。
+func conflicting(list []binding, ip string) string {
+	for _, b := range list {
+		if sameAddress(b.ip, ip) {
+			return b.container
+		}
+	}
+	return ""
+}
+
 func portHolder(t *Target, proto, ip, port string) (holder, owner string) {
-	if c := t.DockerPorts[proto+"/"+port]; c != "" {
-		return "容器 " + c, c
+	for _, p := range t.DockerPorts {
+		if p.Proto == proto && p.Port == port && sameAddress(p.IP, ip) {
+			return "容器 " + p.Container, p.Container
+		}
 	}
 	n, _ := strconv.Atoi(port)
 	for _, l := range t.Listeners {
-		if l.Proto == proto && l.Port == n && (wildcard[ip] || wildcard[l.Addr] || l.Addr == ip) {
+		if l.Proto == proto && l.Port == n && sameAddress(l.Addr, ip) {
 			return "其他程序", ""
 		}
 	}
 	return "", ""
 }
 
-func suggest(proto, port string, busy map[string]bool, requested map[string]string) string {
+// suggest 找一个空闲端口：在任何地址上都没人用的才算，免得换过去又冲突。
+func suggest(proto, port string, busy map[string]bool, requested map[string][]binding) string {
 	n, err := strconv.Atoi(port)
 	if err != nil {
 		return ""
 	}
 	for p := n + 1; p < n+200 && p <= 65535; p++ {
 		k := proto + "/" + strconv.Itoa(p)
-		if !busy[k] && requested[k] == "" {
+		if !busy[k] && len(requested[k]) == 0 {
 			return strconv.Itoa(p)
 		}
 	}

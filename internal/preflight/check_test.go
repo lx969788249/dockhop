@@ -2,6 +2,7 @@ package preflight
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 
@@ -31,7 +32,7 @@ func testTarget() *Target {
 	return &Target{
 		Arch: "x86_64", DockerVersion: "29.2.1", DockerRoot: "/var/lib/docker", HasCompose: true, Local: true,
 		Runtimes: map[string]bool{"runc": true}, Containers: map[string]TargetContainer{}, Projects: map[string]bool{},
-		Volumes: map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{}, DockerPorts: map[string]string{},
+		Volumes: map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{},
 		ListenersOK: true, Exists: func(string) bool { return true },
 		Disk: func(string) (host.Disk, error) { return host.Disk{Path: "/", Free: 100 << 30, Dev: 1}, nil },
 	}
@@ -69,7 +70,7 @@ func TestEvaluateClean(t *testing.T) {
 func TestEvaluatePorts(t *testing.T) {
 	tg := testTarget()
 	tg.Listeners = []host.Listener{{Proto: "tcp", Addr: "0.0.0.0", Port: 80}, {Proto: "tcp", Addr: "0.0.0.0", Port: 81}, {Proto: "tcp", Addr: "::", Port: 22}}
-	tg.DockerPorts["tcp/3000"] = "other"
+	tg.DockerPorts = append(tg.DockerPorts, DockerPort{Proto: "tcp", Port: "3000", Container: "other"})
 	r := Evaluate(testPlan(), tg, &Decisions{}, Options{})
 	var ports []*Issue
 	for i := range r.Issues {
@@ -88,7 +89,7 @@ func TestEvaluatePorts(t *testing.T) {
 	}
 	// 选择换端口之后不再报告；占用端口的是将被替换的同名容器时也不算冲突。
 	d := &Decisions{Ports: []PortChange{{PortRef: *ports[0].Port, NewPort: "8080"}}}
-	tg.DockerPorts["tcp/3000"] = "site-app-1"
+	tg.DockerPorts = []DockerPort{{Proto: "tcp", Port: "3000", Container: "site-app-1"}}
 	tg.Containers["site-app-1"] = TargetContainer{Project: "site"}
 	tg.Projects["site"] = true
 	r = Evaluate(testPlan(), tg, d, Options{Existing: "replace"})
@@ -309,5 +310,74 @@ func TestEvaluateOldCompose(t *testing.T) {
 	tg.Compose = "2.30.0"
 	if find(Evaluate(p, tg, &Decisions{}, Options{}), "old_compose") != nil {
 		t.Error("新版 Compose 不用提醒")
+	}
+}
+
+// 端口绑定在新服务器没有的地址上、端口又被占用：先改绑所有地址、再换端口，两次选择都要保留，
+// 不能后一次把前一次冲掉（以前会来回问个没完）。交互和 --yes 都要能处理完。
+func TestRunnerIPThenPort(t *testing.T) {
+	plan := func() *bundle.Plan {
+		p := testPlan()
+		p.Containers = p.Containers[:1]
+		p.Containers[0].Ports[0].HostIP = "10.9.9.9"
+		return p
+	}
+	tg := testTarget()
+	tg.HostIPs = map[string]bool{"192.168.1.5": true}
+	tg.Listeners = []host.Listener{{Proto: "tcp", Addr: "0.0.0.0", Port: 80}}
+	for _, auto := range []bool{false, true} {
+		var out bytes.Buffer
+		in := io.Reader(strings.NewReader("1\n1\n"))
+		if auto {
+			in = nil
+		}
+		r := &Runner{Screen: ui.New(&out, false, nil), Prompt: ui.NewPrompter(in, &out), Auto: auto,
+			Collect: func() (*Target, error) { return tg, nil }}
+		d := &Decisions{}
+		if _, err := r.Run(plan(), d, Options{}); err != nil {
+			t.Fatalf("--yes=%v：应能处理完：%v\n%s", auto, err, out.String())
+		}
+		if len(d.Ports) != 1 || d.Ports[0].NewIP != "" || d.Ports[0].NewPort != "81" {
+			t.Fatalf("--yes=%v：应改绑所有地址并换到 81：%+v", auto, d.Ports)
+		}
+		sum := strings.Join(d.Summary(), "\n")
+		if !strings.Contains(sum, "端口变更：web 80 → 81") || !strings.Contains(sum, "改绑到所有地址") {
+			t.Errorf("--yes=%v：结果里两项调整都要写：%s", auto, sum)
+		}
+	}
+}
+
+// 端口冲突按地址判断：绑定在不同的具体地址上可以用同一个端口；同一个地址、或者其中一个是
+// 所有地址，才冲突。迁移包里的容器、新服务器上已有的容器、其他程序都一样。
+func TestPortConflictsByAddress(t *testing.T) {
+	bind := func(name, ip string) bundle.PlanContainer {
+		return bundle.PlanContainer{Name: name, State: "running", Ports: []bundle.PlanPort{{HostIP: ip, HostPort: "8080", ContainerPort: "80", Proto: "tcp"}}}
+	}
+	cases := []struct {
+		name       string
+		containers []bundle.PlanContainer
+		docker     []DockerPort
+		listeners  []host.Listener
+		conflict   bool
+	}{
+		{"迁移包里不同的地址", []bundle.PlanContainer{bind("a", "127.0.0.1"), bind("b", "127.0.0.2")}, nil, nil, false},
+		{"迁移包里同一个地址", []bundle.PlanContainer{bind("a", "127.0.0.1"), bind("b", "127.0.0.1")}, nil, nil, true},
+		{"迁移包里所有地址和具体地址", []bundle.PlanContainer{bind("a", "0.0.0.0"), bind("b", "127.0.0.1")}, nil, nil, true},
+		{"已有容器在别的地址", []bundle.PlanContainer{bind("a", "127.0.0.2")}, []DockerPort{{Proto: "tcp", IP: "127.0.0.1", Port: "8080", Container: "x"}}, nil, false},
+		{"已有容器在所有地址", []bundle.PlanContainer{bind("a", "127.0.0.2")}, []DockerPort{{Proto: "tcp", IP: "0.0.0.0", Port: "8080", Container: "x"}}, nil, true},
+		{"迁移包要所有地址、已有容器在具体地址", []bundle.PlanContainer{bind("a", "")}, []DockerPort{{Proto: "tcp", IP: "127.0.0.1", Port: "8080", Container: "x"}}, nil, true},
+		{"其他程序在别的地址", []bundle.PlanContainer{bind("a", "127.0.0.2")}, nil, []host.Listener{{Proto: "tcp", Addr: "127.0.0.1", Port: 8080}}, false},
+		{"其他程序在同一个地址", []bundle.PlanContainer{bind("a", "127.0.0.1")}, nil, []host.Listener{{Proto: "tcp", Addr: "127.0.0.1", Port: 8080}}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := testPlan()
+			p.Containers = c.containers
+			tg := testTarget()
+			tg.DockerPorts, tg.Listeners = c.docker, c.listeners
+			if got := find(Evaluate(p, tg, &Decisions{}, Options{}), "port") != nil; got != c.conflict {
+				t.Errorf("冲突：%v，应该：%v", got, c.conflict)
+			}
+		})
 	}
 }

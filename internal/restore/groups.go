@@ -61,7 +61,7 @@ func labels(list []*group) string {
 }
 
 // unionFind 把有关联的东西合并到同一组。键带前缀：c: 容器、p: 项目、v: 数据卷、
-// b: 目录、n: 网络、o: 项目目录以外的文件、w: 临时停止的已有容器。
+// b: 目录、n: 网络、w: 临时停止的已有容器。
 type unionFind map[string]string
 
 func (u unionFind) find(k string) string {
@@ -140,16 +140,29 @@ func (r *run) buildGroups(writers []writer) {
 			}
 		}
 	}
+	// 写到同一处的必须在同一组：路径相同或者互相包含都算（项目目录、项目目录以外的文件、
+	// 挂载目录和指向它的软链接）。不然只删除其中一组时，会删掉或换回另一组还在用的文件。
+	type place struct{ key, path string }
+	var places []place
+	for _, b := range binds {
+		places = append(places, place{"b:" + b.Path, b.Path})
+		for _, l := range b.AllLinks() {
+			places = append(places, place{"b:" + b.Path, l.Link})
+		}
+	}
 	for _, p := range r.projects {
 		k := "p:" + p.Name
 		uf.find(k)
-		for _, b := range binds {
-			if within(p.WorkingDir, b.Path) {
-				uf.union(k, "b:"+b.Path)
-			}
-		}
+		places = append(places, place{k, p.WorkingDir})
 		for _, o := range p.Outside {
-			uf.union(k, "o:"+o)
+			places = append(places, place{k, o})
+		}
+	}
+	for i, a := range places {
+		for _, b := range places[i+1:] {
+			if a.key != b.key && spec.PathsOverlap(a.path, b.path) {
+				uf.union(a.key, b.key)
+			}
 		}
 	}
 	vols, bindPaths := r.dataTargets()
