@@ -191,7 +191,7 @@ wait_out_finished() {
   for i in $(seq 1 60); do
     docker exec "$old" pgrep -f 'dockhop out' >/dev/null || {
       docker exec "$old" cat /root/out.log >"${tmp}/out.log"
-      grep -Fq '新服务器已迁入成功' "${tmp}/out.log" && grep -Fq '✅ 迁出完成' "${tmp}/out.log" && return 0
+      grep -Fq '新服务器已迁入成功' "${tmp}/out.log" && grep -Fq '✅ 迁移完成' "${tmp}/out.log" && return 0
       echo "旧服务器的迁出没有正常结束" >&2
       tail -n 30 "${tmp}/out.log" >&2
       return 1
@@ -267,7 +267,7 @@ run_app() {
   t=$SECONDS
   start_out
   link="$(wait_for_link)"
-  echo "  迁出用时 $(elapsed $((SECONDS - t)))，$(grep -E '^\[[0-9]/7\]' "${tmp}/out.log" | grep '✓' | tail -n 3 | tr '\n' ' ')"
+  echo "  迁出用时 $(elapsed $((SECONDS - t)))，$(grep -E '^\[[0-9]/[0-9]\]' "${tmp}/out.log" | grep '✓' | tail -n 3 | tr '\n' ' ')"
 
   log "[${app}] 新服务器迁入"
   t=$SECONDS
@@ -281,7 +281,7 @@ run_app() {
     tail -n 60 "${tmp}/in.log" >&2
     return 1
   }
-  grep -E '^\[[0-9]/8\].*✓' "${tmp}/in.log" | sed 's/^/  /'
+  grep -E '^\[[0-9]/[0-9]\].*✓' "${tmp}/in.log" | sed 's/^/  /' || true
   echo "  迁入用时 $(elapsed $((SECONDS - t)))"
 
   log "[${app}] 检查新服务器上的应用和数据"
@@ -350,7 +350,7 @@ run_unreachable() {
   grep -Fq "连接旧服务器 old 的端口 ${BACKUP_PORT} 超时" "${tmp}/drop.log"
   grep -Fq "安全组" "${tmp}/drop.log"
   grep -Fq "ufw allow ${BACKUP_PORT}/tcp" "${tmp}/drop.log"
-  grep -Fq "还没有改动新服务器" "${tmp}/drop.log"
+  grep -Fq "还没有下载或改动任何东西" "${tmp}/drop.log"
   echo "  ✓ $((SECONDS - t)) 秒内提示：连接超时，请在安全组和防火墙放行 TCP ${BACKUP_PORT}"
 
   log "[unreachable] 端口被防火墙拒绝"
