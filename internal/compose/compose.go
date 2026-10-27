@@ -63,6 +63,21 @@ func (t *Tool) args(p Project, extra ...string) []string {
 type Service struct {
 	Image       string             `json:"image"`
 	Environment map[string]*string `json:"environment"`
+	Scale       *int               `json:"scale"`
+	Deploy      *struct {
+		Replicas *int `json:"replicas"`
+	} `json:"deploy"`
+}
+
+// Replicas 是配置文件里写的副本个数（deploy.replicas 或 scale），没写时是 1。
+func (s Service) Replicas() int {
+	switch {
+	case s.Deploy != nil && s.Deploy.Replicas != nil:
+		return *s.Deploy.Replicas
+	case s.Scale != nil:
+		return *s.Scale
+	}
+	return 1
 }
 
 // Services 按现在的文件（含 .env、env_file 和当前的环境变量）算出每个服务最终的

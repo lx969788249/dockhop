@@ -558,8 +558,18 @@ func TestInComposePrecheck(t *testing.T) {
 	if _, code = m.in(t, home, nil); code != 0 {
 		t.Fatalf("应成功：%d", code)
 	}
-	if s := state(t, containerByLabel(t, project, "app")); s != "running" {
+	app := containerByLabel(t, project, "app")
+	if s := state(t, app); s != "running" {
 		t.Errorf("app 应在运行：%s", s)
+	}
+	id := inspect(t, app)["Id"]
+	again := exec.Command("docker", "compose", "-p", project, "up", "-d")
+	again.Dir = proj
+	if b, err := again.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, b)
+	}
+	if inspect(t, containerByLabel(t, project, "app"))["Id"] != id {
+		t.Error("迁入后 docker compose up 重建了容器")
 	}
 	m.waitOutSuccess(t)
 	noLeftovers(t, home)
@@ -623,6 +633,19 @@ func TestInComposeReplicas(t *testing.T) {
 		if s := state(t, id); s != "running" {
 			t.Errorf("副本 %s 应在运行：%s", n, s)
 		}
+	}
+	// 迁入后自己 docker compose up，不应重建容器（容器上记的配置摘要和文件一致）。
+	ids := func() string {
+		return sh(t, "docker", "ps", "-aq", "--no-trunc", "--filter", "label=com.docker.compose.project="+project)
+	}
+	before := ids()
+	again := exec.Command(c[0], append(c[1:], "-p", project, "up", "-d")...)
+	again.Dir = proj
+	if b, err := again.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, b)
+	}
+	if after := ids(); after != before {
+		t.Errorf("迁入后 docker compose up 重建了容器：\n%s\n→\n%s", before, after)
 	}
 	m.waitOutSuccess(t)
 	noLeftovers(t, home)

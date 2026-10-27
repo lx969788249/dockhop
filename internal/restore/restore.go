@@ -1441,10 +1441,22 @@ func (r *run) startProject(ctx context.Context, p bundle.Project) error {
 	}
 	// 一个服务可能有多个副本（deploy.replicas、--scale）：按旧服务器上的个数创建，
 	// 再按副本编号一一对应，每个副本的匿名卷和容器里的改动放进对应的新容器。
+	// 只在个数和配置文件里写的不一样时才加 --scale：有的 Compose 版本（例如 2.17）会把它
+	// 算进记在容器上的配置摘要，之后用户自己 docker compose up 时就会重建容器。
 	services := uniqueServices(members)
 	args := []string{"up", "--no-start"}
+	configured, err := r.tool.Services(ctx, cp)
+	if err != nil {
+		r.Log.Printf("读不出 Compose 项目 %s 配置里的副本个数：%v", p.Name, err)
+	}
 	for _, svc := range services {
-		args = append(args, "--scale", fmt.Sprintf("%s=%d", svc, len(replicas(members, svc))))
+		want, have := len(replicas(members, svc)), 1
+		if c, ok := configured[svc]; ok {
+			have = c.Replicas()
+		}
+		if want != have {
+			args = append(args, "--scale", fmt.Sprintf("%s=%d", svc, want))
+		}
 	}
 	if err := r.tool.Exec(ctx, cp, r.Log.Printf, append(args, services...)...); err != nil {
 		return err

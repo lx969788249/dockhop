@@ -1,6 +1,7 @@
 package compose
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -58,5 +59,21 @@ func TestKeyLines(t *testing.T) {
 	}
 	if got := keyLines("a\nb\nc\nd"); got != "b\nc\nd" {
 		t.Errorf("没有报错字样时取最后 3 行：%q", got)
+	}
+}
+
+// 副本个数从 docker compose config 的输出里读：deploy.replicas、scale，都没写时是 1。
+func TestServiceReplicas(t *testing.T) {
+	var cfg struct {
+		Services map[string]Service `json:"services"`
+	}
+	raw := `{"services":{"a":{"image":"x"},"b":{"deploy":{"replicas":3}},"c":{"scale":2},"d":{"deploy":{"resources":{}}}}}`
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	for svc, want := range map[string]int{"a": 1, "b": 3, "c": 2, "d": 1} {
+		if got := cfg.Services[svc].Replicas(); got != want {
+			t.Errorf("%s：%d，应为 %d", svc, got, want)
+		}
 	}
 }
