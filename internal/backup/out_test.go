@@ -11,6 +11,15 @@ import (
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
+func TestPortText(t *testing.T) {
+	if got := portText(8080, 8080); got != "端口 8080" {
+		t.Errorf("没换端口：%q", got)
+	}
+	if got := portText(8080, 8081); got != "端口 8081（8080 被占用）" {
+		t.Errorf("换了端口：%q", got)
+	}
+}
+
 // 交给用户的下一步：只有链接一样东西要复制；两条必须照做的提醒是橙色、不加粗
 // （有的终端里加粗的中文会显示成乱码）；除了链接，每行在 80 列的终端里都不折行。
 func TestInstructions(t *testing.T) {

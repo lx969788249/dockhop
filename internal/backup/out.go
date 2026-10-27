@@ -506,7 +506,7 @@ func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bund
 	r.server = srv
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
-	s.End(fmt.Sprintf("端口 %d", link.Port))
+	s.End(portText(r.opts.Port, link.Port))
 
 	s.Println(r.instructions(ctx, link))
 	live.wait("等待新服务器连接")
@@ -853,6 +853,15 @@ func (r *run) testPause(ctx context.Context, point string) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// portText 是下载服务用的端口。要求的端口被占用、往后换了一个时说明原因：
+// 照着默认端口提前在安全组里放行的人，要知道得改成放行这个端口。
+func portText(want, got int) string {
+	if got == want {
+		return fmt.Sprintf("端口 %d", got)
+	}
+	return fmt.Sprintf("端口 %d（%d 被占用）", got, want)
 }
 
 // downtimeText 是停机时长；不到一秒时不写“0 秒”。
