@@ -78,9 +78,21 @@ type PlanVolume struct {
 
 // PlanBind 是一个宿主机目录或文件。
 type PlanBind struct {
-	Path  string `json:"path"`
-	Link  string `json:"link,omitempty"`
-	Bytes int64  `json:"bytes"`
+	Path  string   `json:"path"`
+	Link  string   `json:"link,omitempty"`
+	Links []string `json:"links,omitempty"` // 全部软链接（1.0.5 起）
+	Bytes int64    `json:"bytes"`
+}
+
+// AllLinks 返回全部软链接；老版本的迁移计划只有 Link。
+func (b PlanBind) AllLinks() []string {
+	if len(b.Links) > 0 {
+		return b.Links
+	}
+	if b.Link != "" {
+		return []string{b.Link}
+	}
+	return nil
 }
 
 // PlanNetwork 是一个自定义网络。

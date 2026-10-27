@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -462,7 +463,14 @@ func (r *run) scan() error {
 		if err := check("binds/"+b.ID, b.Parts, "目录 "+b.Path+" ", strings.TrimPrefix(b.Path, "/")); err != nil {
 			return err
 		}
-		for _, p := range []string{b.Path, b.Link} {
+		paths := []string{b.Path}
+		for _, l := range b.AllLinks() {
+			if !filepath.IsAbs(l.Link) || filepath.Clean(l.Link) != l.Link || l.Link == "/" || !within(l.Target, b.Path) {
+				return fmt.Errorf("迁移包里目录 %s 的软链接不对：%q → %q", b.Path, l.Link, l.Target)
+			}
+			paths = append(paths, l.Link)
+		}
+		for _, p := range paths {
 			if p != "" && !spec.IsSystemPath(p) && spec.PathsOverlap(preflight.Normalize(p), preflight.Normalize(r.Home)) {
 				return fmt.Errorf("挂载目录 %s 和 DockHop 存放迁移文件、回滚资料的目录 %s 重叠，迁入会把它们覆盖。请设置 DOCKHOP_HOME=其他目录后重新运行", p, r.Home)
 			}
@@ -916,14 +924,20 @@ func (r *run) backupProject(ctx context.Context, project string, list []docker.C
 		if err := dc.StopContainer(ctx, o.ID, nil); err != nil {
 			return fail(s, "没能停止已有的 Compose 容器 "+o.Name, err.Error(), "")
 		}
+		// 读不到容器里有没有改动时不能当作没有：接下来要删除这个容器，没备份的改动就找不回来了。
 		changes, err := dc.ContainerChanges(ctx, o.ID)
-		var mounts []string
-		if full, _, err := dc.InspectContainer(ctx, o.ID); err == nil {
-			for _, m := range full.Mounts {
-				mounts = append(mounts, m.Destination)
-			}
+		if err != nil {
+			return fail(s, "读不到已有的 Compose 容器 "+o.Name+" 里有没有改动，为了安全没有删除它", err.Error(), "")
 		}
-		if err != nil || !spec.WritableChanged(changes, mounts) {
+		full, _, err := dc.InspectContainer(ctx, o.ID)
+		if err != nil {
+			return fail(s, "读取已有的 Compose 容器 "+o.Name+" 失败，为了安全没有删除它", err.Error(), "")
+		}
+		var mounts []string
+		for _, m := range full.Mounts {
+			mounts = append(mounts, m.Destination)
+		}
+		if !spec.WritableChanged(changes, mounts) {
 			continue
 		}
 		tag := strings.ToLower(runID + "-" + o.ID[:12])
@@ -968,8 +982,8 @@ func (r *run) usedData() (map[string]bool, map[string]bool) {
 	bindOf := map[string]string{}
 	for _, b := range r.m.Binds {
 		bindOf[b.Path] = b.Path
-		if b.Link != "" {
-			bindOf[b.Link] = b.Path
+		for _, l := range b.AllLinks() {
+			bindOf[l.Link] = b.Path
 		}
 	}
 	for _, it := range r.items {
@@ -1175,7 +1189,12 @@ func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
 		return err
 	}
 	_ = os.RemoveAll(filepath.Join(r.dataDir, "binds", b.ID))
-	return r.restoreLink(b.Link, b.Path)
+	for _, l := range b.AllLinks() {
+		if err := r.restoreLink(l.Link, l.Target); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // restoreLink 源端挂载的是软链接时，数据已经恢复到真实路径，在原路径重建同一个链接。
@@ -1420,24 +1439,40 @@ func (r *run) startProject(ctx context.Context, p bundle.Project) error {
 	if err := r.j.add(Entry{Op: opComposeUp, Name: p.Name, Names: before}); err != nil {
 		return err
 	}
+	// 一个服务可能有多个副本（deploy.replicas、--scale）：按旧服务器上的个数创建，
+	// 再按副本编号一一对应，每个副本的匿名卷和容器里的改动放进对应的新容器。
 	services := uniqueServices(members)
-	if err := r.tool.Exec(ctx, cp, r.Log.Printf, append([]string{"up", "--no-start"}, services...)...); err != nil {
+	args := []string{"up", "--no-start"}
+	for _, svc := range services {
+		args = append(args, "--scale", fmt.Sprintf("%s=%d", svc, len(replicas(members, svc))))
+	}
+	if err := r.tool.Exec(ctx, cp, r.Log.Printf, append(args, services...)...); err != nil {
 		return err
 	}
 	list, err := r.Docker.ContainersByLabel(ctx, "com.docker.compose.project="+p.Name)
 	if err != nil {
 		return err
 	}
-	var start []string
-	for _, it := range members {
+	for _, svc := range services {
+		old := replicas(members, svc)
+		var created []docker.ContainerSummary
 		for _, c := range list {
-			if c.Labels["com.docker.compose.service"] == it.m.Service {
-				it.newID = c.ID
+			if c.Labels["com.docker.compose.service"] == svc {
+				created = append(created, c)
 			}
 		}
-		if it.newID == "" {
-			return fmt.Errorf("没有创建出服务 %s 的容器", it.m.Service)
+		sort.SliceStable(created, func(i, j int) bool {
+			return replicaNumber(created[i].Labels) < replicaNumber(created[j].Labels)
+		})
+		if len(created) != len(old) {
+			return fmt.Errorf("服务 %s 在旧服务器上有 %d 个容器，新服务器上创建出了 %d 个", svc, len(old), len(created))
 		}
+		for i, it := range old {
+			it.newID = created[i].ID
+		}
+	}
+	var start []string
+	for _, it := range members {
 		if err := r.transplantAnonymous(ctx, it, it.newID); err != nil {
 			return err
 		}
@@ -1470,6 +1505,26 @@ func (r *run) startProject(ctx context.Context, p bundle.Project) error {
 		return errors.New("（测试）模拟项目失败")
 	}
 	return nil
+}
+
+// replicas 是服务 svc 在旧服务器上的容器，按副本编号排好。
+func replicas(items []*citem, svc string) []*citem {
+	var out []*citem
+	for _, it := range items {
+		if it.m.Service == svc {
+			out = append(out, it)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return replicaNumber(out[i].c.Config.Labels) < replicaNumber(out[j].c.Config.Labels)
+	})
+	return out
+}
+
+// replicaNumber 是 Compose 给容器记的副本编号（com.docker.compose.container-number）。
+func replicaNumber(labels map[string]string) int {
+	n, _ := strconv.Atoi(labels["com.docker.compose.container-number"])
+	return n
 }
 
 func uniqueServices(items []*citem) []string {

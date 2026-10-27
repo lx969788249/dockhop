@@ -21,8 +21,8 @@ func buildPlan(m *bundle.Manifest, col *collected, bundleSize int64) *bundle.Pla
 	bindOf := map[string]string{} // 挂载用的路径 → 迁移的真实路径
 	for _, b := range col.binds {
 		bindOf[b.path] = b.path
-		if b.link != "" {
-			bindOf[b.link] = b.path
+		for _, l := range b.links {
+			bindOf[l.Link] = b.path
 		}
 	}
 	for _, it := range col.sel.items {
@@ -102,7 +102,7 @@ func buildPlan(m *bundle.Manifest, col *collected, bundleSize int64) *bundle.Pla
 		p.Volumes = append(p.Volumes, bundle.PlanVolume{Name: v.name, Driver: v.driver, Opts: v.opts, Labels: v.labels, Bytes: max(v.bytes, 0)})
 	}
 	for _, b := range col.binds {
-		p.Binds = append(p.Binds, bundle.PlanBind{Path: b.path, Link: b.link, Bytes: b.bytes})
+		p.Binds = append(p.Binds, bundle.PlanBind{Path: b.path, Link: b.link(), Links: linkPaths(b.links), Bytes: b.bytes})
 	}
 	for _, n := range col.networks {
 		p.Networks = append(p.Networks, bundle.PlanNetwork{Name: n.name, Driver: n.driver, Subnets: n.subnets, Compose: n.compose})
@@ -129,4 +129,12 @@ func stateName(status string, paused bool) string {
 		return "paused"
 	}
 	return status
+}
+
+func linkPaths(links []bundle.BindLink) []string {
+	var out []string
+	for _, l := range links {
+		out = append(out, l.Link)
+	}
+	return out
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -114,39 +115,73 @@ func ReadManifest(dir string) (*Manifest, error) {
 	return &m, nil
 }
 
-// OpenStream 把 prefix 下的分段按顺序拼回一条数据流。
+// OpenStream 把 prefix 下的分段按顺序拼回一条数据流。分段一个一个打开、读完就关：
+// 一条流可能有上千个分段（每段 16MB），同时打开会用光进程能打开的文件数。
+// 缺了哪一段在开始读之前就检查出来（只查文件在不在，不打开）。
 func OpenStream(dir, prefix string, parts int) io.ReadCloser {
-	readers := make([]io.Reader, 0, parts)
-	files := make([]*os.File, 0, parts)
-	var openErr error
+	s := &partStream{dir: dir, prefix: prefix, parts: parts}
 	for i := 1; i <= parts; i++ {
-		f, err := os.Open(filepath.Join(dir, filepath.FromSlash(PartName(prefix, i))))
-		if err != nil {
-			openErr = fmt.Errorf("迁移包不完整：缺少 %s（%v）", PartName(prefix, i), err)
+		if _, err := os.Stat(s.path(i)); err != nil {
+			s.err = partError(prefix, i, err)
 			break
 		}
-		files = append(files, f)
-		readers = append(readers, f)
 	}
-	return &multiCloser{r: io.MultiReader(readers...), files: files, err: openErr}
+	return s
 }
 
-type multiCloser struct {
-	r     io.Reader
-	files []*os.File
-	err   error
+type partStream struct {
+	dir, prefix string
+	parts       int
+	next        int // 下一个要打开的分段（从 1 开始）
+	cur         *os.File
+	err         error
 }
 
-func (m *multiCloser) Read(p []byte) (int, error) {
-	if m.err != nil {
-		return 0, m.err
+func (s *partStream) path(i int) string {
+	return filepath.Join(s.dir, filepath.FromSlash(PartName(s.prefix, i)))
+}
+
+func partError(prefix string, i int, err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("迁移包不完整：缺少 %s（%v）", PartName(prefix, i), err)
 	}
-	return m.r.Read(p)
+	return fmt.Errorf("打不开迁移包里的 %s：%v", PartName(prefix, i), err)
 }
 
-func (m *multiCloser) Close() error {
-	for _, f := range m.files {
-		f.Close()
+func (s *partStream) Read(p []byte) (int, error) {
+	for {
+		if s.err != nil {
+			return 0, s.err
+		}
+		if s.cur == nil {
+			if s.next >= s.parts {
+				return 0, io.EOF
+			}
+			s.next++
+			f, err := os.Open(s.path(s.next))
+			if err != nil {
+				s.err = partError(s.prefix, s.next, err)
+				continue
+			}
+			s.cur = f
+		}
+		n, err := s.cur.Read(p)
+		if err == io.EOF {
+			s.cur.Close()
+			s.cur = nil
+			if n > 0 {
+				return n, nil
+			}
+			continue
+		}
+		return n, err
+	}
+}
+
+func (s *partStream) Close() error {
+	if s.cur != nil {
+		s.cur.Close()
+		s.cur = nil
 	}
 	return nil
 }

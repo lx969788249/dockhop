@@ -107,12 +107,30 @@ type Volume struct {
 
 // Bind 是迁移的一个宿主机目录或文件。
 type Bind struct {
-	ID    string `json:"id"`
-	Path  string `json:"path"`           // 真实路径
-	Link  string `json:"link,omitempty"` // 挂载时用的路径是软链接时，记下它
-	Dir   bool   `json:"dir"`
-	Bytes int64  `json:"bytes"`
-	Parts int    `json:"parts"`
+	ID    string     `json:"id"`
+	Path  string     `json:"path"`            // 真实路径
+	Link  string     `json:"link,omitempty"`  // 挂载时用的一个指向 Path 的软链接（老版本只认这一个）
+	Links []BindLink `json:"links,omitempty"` // 挂载时用到的全部软链接（1.0.5 起）
+	Dir   bool       `json:"dir"`
+	Bytes int64      `json:"bytes"`
+	Parts int        `json:"parts"`
+}
+
+// BindLink 是容器挂载时用的一个软链接：Link 指向 Target（就是 Path 或它里面的目录）。
+type BindLink struct {
+	Link   string `json:"link"`
+	Target string `json:"target"`
+}
+
+// AllLinks 返回全部软链接；老版本的迁移包只有 Link。
+func (b Bind) AllLinks() []BindLink {
+	if len(b.Links) > 0 {
+		return b.Links
+	}
+	if b.Link != "" {
+		return []BindLink{{Link: b.Link, Target: b.Path}}
+	}
+	return nil
 }
 
 // Images 是迁移包里的镜像。

@@ -146,6 +146,9 @@ func (r *run) steps(ctx context.Context) error {
 	if err := r.confirmShared(col); err != nil {
 		return err
 	}
+	if err := r.checkAutoRemove(col); err != nil {
+		return err
+	}
 	for _, it := range col.sel.items {
 		if size := col.layerBytes[it]; size > largeLayer {
 			s.Warn("容器 %s 里没挂载出来的改动有 %s，会在停机期间一起打包，停机时间会因此变长；"+
@@ -343,7 +346,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 			return nil, 0, fail(s, "打包目录 "+b.path+" 失败", err.Error(), "")
 		}
 		packed += n
-		m.Binds = append(m.Binds, bundle.Bind{ID: b.id, Path: b.path, Link: b.link, Dir: b.dir, Bytes: b.bytes, Parts: parts})
+		m.Binds = append(m.Binds, bundle.Bind{ID: b.id, Path: b.path, Link: b.link(), Links: b.links, Dir: b.dir, Bytes: b.bytes, Parts: parts})
 	}
 	for _, p := range col.projects {
 		mp := bundle.Project{Name: p.u.project, WorkingDir: p.u.workingDir, ConfigFiles: p.u.files, ConfigArgs: p.u.fileArgs,
@@ -732,6 +735,27 @@ func (r *run) confirmShared(col *collected) error {
 		return fail(r.Screen, "已取消：和选中的容器共用数据的容器不能停止，数据无法保证一致", "", "")
 	}
 	return nil
+}
+
+// checkAutoRemove 停机打包要停止的容器里，有用 --rm 启动的就不能继续：Docker 停止这种
+// 容器时会把它连同匿名卷、容器里没挂载出来的改动一起删掉，打包不到，也恢复不了。
+func (r *run) checkAutoRemove(col *collected) error {
+	if r.opts.NoStop {
+		return nil // 不停机打包，不会停止它们
+	}
+	var names []string
+	for _, it := range append(append([]*item(nil), col.sel.items...), col.shared...) {
+		if it.c.HostConfig.AutoRemove && it.c.State.Running {
+			names = append(names, it.name())
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	list := strings.Join(names, "、")
+	return fail(r.Screen, "容器 "+list+" 是用 --rm 启动的：停机打包时一停止，Docker 就会把它连同匿名卷和容器里的改动一起删掉，"+
+		"没法打包，也没法恢复，已取消（什么都没有改动）", "",
+		"先把它重新创建成不带 --rm 的容器再迁出；或者确认数据都在命名卷、挂载目录里之后，用 --no-stop 不停机打包")
 }
 
 // ignored 是测试时要忽略的容器（例如运行测试的容器自己）。

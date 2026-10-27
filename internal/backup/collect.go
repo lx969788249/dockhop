@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/spec"
@@ -33,10 +34,33 @@ type volumeInfo struct {
 
 type bindInfo struct {
 	id    string
-	path  string // 真实路径
-	link  string // 挂载用的路径是软链接时，记下它
+	path  string            // 真实路径
+	links []bundle.BindLink // 挂载用的路径是软链接时，记下它们（多个软链接可能指向同一个目录）
 	dir   bool
 	bytes int64
+}
+
+// addLinks 记下软链接（去掉重复的）。
+func (b *bindInfo) addLinks(links []bundle.BindLink) {
+	for _, l := range links {
+		dup := false
+		for _, k := range b.links {
+			dup = dup || k.Link == l.Link
+		}
+		if !dup {
+			b.links = append(b.links, l)
+		}
+	}
+}
+
+// link 是指向 path 本身的第一个软链接（写给只认一个软链接的老版本）。
+func (b *bindInfo) link() string {
+	for _, l := range b.links {
+		if l.Target == b.path {
+			return l.Link
+		}
+	}
+	return ""
 }
 
 type networkInfo struct {
@@ -149,7 +173,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 				}
 				b := &bindInfo{path: real}
 				if real != filepath.Clean(m.Source) {
-					b.link = filepath.Clean(m.Source)
+					b.links = []bundle.BindLink{{Link: filepath.Clean(m.Source), Target: real}}
 				}
 				bindPaths = append(bindPaths, b)
 			}
@@ -212,10 +236,12 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 
 	// 去掉重复和嵌套的挂载目录：外层目录迁移了，里面的就不用再迁一次。
 	sort.Slice(bindPaths, func(i, j int) bool { return len(bindPaths[i].path) < len(bindPaths[j].path) })
+	// 数据只迁一份，但每个软链接都要记下：容器挂载时用的可能是其中任何一个。
 	for _, b := range bindPaths {
 		covered := false
 		for _, kept := range out.binds {
 			if b.path == kept.path || strings.HasPrefix(b.path, kept.path+"/") {
+				kept.addLinks(b.links)
 				covered = true
 				break
 			}

@@ -55,7 +55,13 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		e := entries[i]
 		switch e.Op {
 		case opContainer:
-			if c, _, err := u.dc.InspectContainer(ctx, e.Name); err == nil && !oldIDs[c.ID] {
+			// 只有 Docker 明确说没有这个容器，才算已经删掉；其他错误说明不知道它还在不在写数据。
+			c, _, err := u.dc.InspectContainer(ctx, e.Name)
+			switch {
+			case docker.IsNotFound(err):
+			case err != nil:
+				note("没法确认本次新建的容器 %s 已经删除：%v", e.Name, err)
+			case !oldIDs[c.ID]:
 				if err := u.dc.RemoveContainerAndVolumes(ctx, c.ID); err != nil && !docker.IsNotFound(err) {
 					note("本次新建的容器 %s 没能删除：%v", e.Name, err)
 				}
@@ -256,6 +262,10 @@ func (u *undo) undoVolume(ctx context.Context, e Entry, note func(string, ...any
 // undoRename 把改名备份的旧容器改回原名，重新连上原来的网络。
 func (u *undo) undoRename(ctx context.Context, e Entry, note func(string, ...any)) {
 	if _, _, err := u.dc.InspectContainer(ctx, e.Backup); err != nil {
+		if !docker.IsNotFound(err) {
+			note("读不到改名备份的旧容器 %s：%v", e.Backup, err)
+			return
+		}
 		if c, _, err := u.dc.InspectContainer(ctx, e.Name); err == nil && c.ID == e.ID {
 			return // 记下了但还没改名
 		}

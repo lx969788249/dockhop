@@ -54,6 +54,7 @@ type Container struct {
 		PortBindings   map[string][]PortBinding `json:"PortBindings"`
 		Tmpfs          map[string]string        `json:"Tmpfs"`
 		ReadonlyRootfs bool                     `json:"ReadonlyRootfs"`
+		AutoRemove     bool                     `json:"AutoRemove"` // docker run --rm
 	} `json:"HostConfig"`
 	Mounts          []Mount `json:"Mounts"`
 	NetworkSettings struct {

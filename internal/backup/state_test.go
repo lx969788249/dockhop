@@ -96,3 +96,31 @@ func TestRecoverInterruptedUsesLock(t *testing.T) {
 		t.Error("恢复后应删除停机记录")
 	}
 }
+
+// Docker 临时出错、读不到停下的容器时，不能当作容器已经删掉、把停机记录删了。
+func TestRecoverInterruptedKeepsRecordOnDockerError(t *testing.T) {
+	home := t.TempDir()
+	if err := writeStopped(home, []StoppedContainer{{Name: "web", ID: "abc", State: "running"}}); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/version" {
+			w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
+			return
+		}
+		http.Error(w, `{"message":"模拟的 Docker 内部错误"}`, http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err = RecoverInterrupted(context.Background(), dc, home, ui.New(&out, false, nil), ui.NewPrompter(nil, &out))
+	if err == nil || !strings.Contains(err.Error(), "停机记录保留") {
+		t.Fatalf("应报错：%v", err)
+	}
+	if _, err := os.Stat(statePath(home)); err != nil {
+		t.Fatal("停机记录应保留")
+	}
+}

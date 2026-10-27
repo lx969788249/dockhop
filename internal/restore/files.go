@@ -134,17 +134,31 @@ func (r *run) preserve(target string) error {
 	return moveOrCopy(target, backup)
 }
 
-// moveOrCopy 移动文件或目录；不在同一块磁盘上时复制后删除原来的。
+// moveOrCopy 移动文件或目录；不在同一块磁盘上时复制后删除原来的。复制先写到 dst 旁边的
+// 临时名字，完整写完才改名成 dst：回滚只看 dst 在不在，复制到一半失败或被强制结束时，
+// 不能留下一个看起来像完整备份、实际只有一半的 dst，否则回滚会拿它覆盖完整的原件。
 func moveOrCopy(src, dst string) error {
-	err := os.Rename(src, dst)
+	err := rename(src, dst)
 	if err == nil || !errors.Is(err, syscall.EXDEV) {
 		return err
 	}
-	if err := copyTree(src, dst); err != nil {
+	tmp := dst + ".dockhop-partial"
+	if err := os.RemoveAll(tmp); err != nil {
+		return err
+	}
+	if err := copyTree(src, tmp); err != nil {
+		_ = os.RemoveAll(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.RemoveAll(tmp)
 		return err
 	}
 	return os.RemoveAll(src)
 }
+
+// rename 测试时换成模拟跨磁盘的版本。
+var rename = os.Rename
 
 // copyTree 复制文件或目录，保留属主、权限、修改时间和软链接。
 func copyTree(src, dst string) error {

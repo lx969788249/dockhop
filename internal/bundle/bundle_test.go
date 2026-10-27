@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
@@ -158,5 +160,42 @@ func TestValidName(t *testing.T) {
 		if ValidName(n) {
 			t.Errorf("%q 不应合规", n)
 		}
+	}
+}
+
+// 分段一个一个打开：能同时打开的文件数很少时，上千个分段的流也能读完。
+func TestOpenStreamFewFiles(t *testing.T) {
+	dir := t.TempDir()
+	const parts = 300
+	var want bytes.Buffer
+	for i := 1; i <= parts; i++ {
+		p := filepath.Join(dir, filepath.FromSlash(PartName("volumes/big", i)))
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		data := []byte(fmt.Sprintf("part %d\n", i))
+		want.Write(data)
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var old syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &old); err != nil {
+		t.Skip(err)
+	}
+	low := old
+	low.Cur = 64
+	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &low); err != nil {
+		t.Skip(err)
+	}
+	defer syscall.Setrlimit(syscall.RLIMIT_NOFILE, &old)
+	rc := OpenStream(dir, "volumes/big", parts)
+	got, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil || !bytes.Equal(got, want.Bytes()) {
+		t.Fatalf("读到 %d 字节：%v", len(got), err)
+	}
+	// 缺了一段：开始读之前就报出来，说的是缺少，不是别的错误。
+	os.Remove(filepath.Join(dir, filepath.FromSlash(PartName("volumes/big", parts))))
+	if _, err := io.ReadAll(OpenStream(dir, "volumes/big", parts)); err == nil || !strings.Contains(err.Error(), "缺少") {
+		t.Fatalf("应报告缺少分段：%v", err)
 	}
 }

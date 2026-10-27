@@ -383,7 +383,7 @@ test/apps/run.sh wordpress                  # 在两台模拟服务器之间迁�
 | `test/apps` | 两台模拟服务器之间迁移真实应用 |
 | `docs` | [设计方案](docs/design.md) |
 
-每次提交都会在 CI 中运行格式检查、静态检查、单元测试，编译三个架构并测试 `run.sh`，在 Debian、Ubuntu、Rocky Linux、Alpine 上检查程序能直接运行，并在真实 Docker 上跑全部验收测试：12 个容器迁移前后的完整配置逐字段比较，以及失败、被中断、被强制结束后的撤销，只迁入一部分、重试时跳过已迁入的服务等 20 个事务和安全场景。
+每次提交都会在 CI 中运行格式检查、静态检查、单元测试，编译三个架构并测试 `run.sh`，在 Debian、Ubuntu、Rocky Linux、Alpine 上检查程序能直接运行，并在真实 Docker 上跑全部验收测试：12 个容器迁移前后的完整配置逐字段比较，以及失败、被中断、被强制结束、Docker 自己出错时的撤销，只迁入一部分、重试时跳过已迁入的服务，Compose 多副本、多个软链接指向同一个目录、`--rm` 容器等 20 多个事务和安全场景。
 
 另外，[apps 工作流](.github/workflows/apps.yml)会起两台互相独立的模拟服务器（各自运行 Docker，只能通过网络互相访问），把 WordPress、Nextcloud、Gitea、Vaultwarden、Uptime Kuma、Halo、Memos 和一组刁钻的 Compose 写法逐个从旧服务器迁到新服务器，检查业务数据、容器配置、迁移后能否在原目录 `docker compose up`，以及旧服务器是否恢复原状；还会在 Docker 20.10、27、29 之间互相迁移，模拟防火墙拦截和连不上镜像仓库的情况。每次提交都会运行，每周也会再跑一次。
 

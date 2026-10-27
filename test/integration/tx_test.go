@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -559,6 +560,111 @@ func TestInComposePrecheck(t *testing.T) {
 	}
 	if s := state(t, containerByLabel(t, project, "app")); s != "running" {
 		t.Errorf("app 应在运行：%s", s)
+	}
+	m.waitOutSuccess(t)
+	noLeftovers(t, home)
+}
+
+// Compose 服务有多个副本时：按副本个数创建，每个副本的匿名卷和容器里的改动放进对应的新容器，
+// 不能都放进同一个。
+func TestInComposeReplicas(t *testing.T) {
+	p := fmt.Sprintf("dmtest_rp%d", os.Getpid())
+	project := p + "proj"
+	t.Cleanup(func() { removeProject(project); removePrefixed(p) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	proj := filepath.Join(t.TempDir(), "proj")
+	os.MkdirAll(proj, 0o755)
+	os.WriteFile(filepath.Join(proj, "compose.yml"), []byte(`services:
+  worker:
+    image: alpine:3.20
+    command: ["sleep", "600"]
+    labels: {com.centurylinklabs.watchtower.enable: "false"}
+    volumes: ["/data"]
+    deploy: {replicas: 2}
+`), 0o644)
+	c := composeCmd(t)
+	up := exec.Command(c[0], append(c[1:], "-p", project, "up", "-d")...)
+	up.Dir = proj
+	if b, err := up.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, b)
+	}
+	replicas := func() []string {
+		t.Helper()
+		out := sh(t, "docker", "ps", "-a", "--filter", "label=com.docker.compose.project="+project,
+			"--format", `{{.Label "com.docker.compose.container-number"}} {{.Names}}`)
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		sort.Strings(lines)
+		return lines
+	}
+	old := replicas()
+	if len(old) != 2 {
+		t.Skipf("Compose 没有按 deploy.replicas 建出 2 个副本：%v", old)
+	}
+	for _, l := range old {
+		n, id, _ := strings.Cut(l, " ")
+		exec1(t, id, "echo r"+n+" >/data/id && echo r"+n+" >/etc/id")
+	}
+	m := startOut(t, "--include", strings.Fields(old[0])[1])
+	removeProject(project)
+
+	home := t.TempDir()
+	if _, code := m.in(t, home, nil); code != 0 {
+		t.Fatalf("迁入应成功：%d", code)
+	}
+	got := replicas()
+	if len(got) != 2 {
+		t.Fatalf("应有 2 个副本：%v", got)
+	}
+	for _, l := range got {
+		n, id, _ := strings.Cut(l, " ")
+		if v := exec1(t, id, "cat /data/id /etc/id"); v != "r"+n+"\nr"+n {
+			t.Errorf("副本 %s 的数据不对（匿名卷、容器里的改动）：%q", n, v)
+		}
+		if s := state(t, id); s != "running" {
+			t.Errorf("副本 %s 应在运行：%s", n, s)
+		}
+	}
+	m.waitOutSuccess(t)
+	noLeftovers(t, home)
+}
+
+// 好几个软链接指向同一个挂载目录（或者它里面的目录）：数据只迁一份，每个软链接都要在
+// 新服务器上重建，用哪个软链接挂载的容器都能看到数据。
+func TestInSymlinkAliases(t *testing.T) {
+	p := fmt.Sprintf("dmtest_sl%d", os.Getpid())
+	t.Cleanup(func() { removePrefixed(p) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	os.MkdirAll(filepath.Join(real, "sub"), 0o755)
+	os.WriteFile(filepath.Join(real, "top.txt"), []byte("top"), 0o644)
+	os.WriteFile(filepath.Join(real, "sub", "inner.txt"), []byte("inner"), 0o644)
+	l1, l2, l3 := filepath.Join(root, "l1"), filepath.Join(root, "l2"), filepath.Join(root, "l3")
+	os.Symlink(real, l1)
+	os.Symlink(real, l2)
+	os.Symlink(filepath.Join(real, "sub"), l3)
+	a, b := p+"_a", p+"_b"
+	sh(t, "docker", "run", "-d", "--name", a, "--label", noWatchtower, "-v", l1+":/x", "alpine:3.20", "sleep", "600")
+	sh(t, "docker", "run", "-d", "--name", b, "--label", noWatchtower, "-v", l2+":/y", "-v", l3+":/z", "alpine:3.20", "sleep", "600")
+	m := startOut(t, "--include", a+","+b)
+	removeAll(a, b)
+	os.RemoveAll(root)
+	os.MkdirAll(root, 0o755)
+
+	home := t.TempDir()
+	if _, code := m.in(t, home, nil); code != 0 {
+		t.Fatalf("迁入应成功：%d", code)
+	}
+	for link, target := range map[string]string{l1: real, l2: real, l3: filepath.Join(real, "sub")} {
+		if got, err := os.Readlink(link); err != nil || got != target {
+			t.Errorf("软链接 %s 应指向 %s：%q %v", link, target, got, err)
+		}
+	}
+	if v := exec1(t, a, "cat /x/top.txt"); v != "top" {
+		t.Errorf("a 看到的数据：%q", v)
+	}
+	if v := exec1(t, b, "cat /y/top.txt; echo; cat /z/inner.txt"); v != "top\ninner" {
+		t.Errorf("b 看到的数据：%q", v)
 	}
 	m.waitOutSuccess(t)
 	noLeftovers(t, home)

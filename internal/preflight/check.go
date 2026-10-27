@@ -260,7 +260,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 	// ---------- 挂载目录不能盖住 DockHop 自己的文件 ----------
 	if o.Home != "" {
 		for _, b := range plan.Binds {
-			for _, p := range []string{b.Path, b.Link} {
+			for _, p := range append([]string{b.Path}, b.AllLinks()...) {
 				if p == "" || spec.IsSystemPath(p) {
 					continue
 				}

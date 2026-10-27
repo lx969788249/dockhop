@@ -91,8 +91,12 @@ func RecoverInterrupted(ctx context.Context, dc *docker.Client, home string, scr
 	var still []StoppedContainer
 	for _, c := range rec.Containers {
 		ct, _, err := dc.InspectContainer(ctx, c.ID)
-		if err != nil {
+		if docker.IsNotFound(err) {
 			continue // 容器已经被删掉了
+		}
+		if err != nil {
+			// 不能当作容器已经没了：删掉记录，之后就没法自动恢复了。
+			return fmt.Errorf("读不到上次迁出停下的容器 %s 的状态（%v），停机记录保留，处理好 Docker 的问题后重新运行迁出会接着恢复", c.Name, err)
 		}
 		if !ct.State.Running {
 			still = append(still, c)

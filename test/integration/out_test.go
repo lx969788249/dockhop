@@ -484,3 +484,29 @@ func TestOutLargeLayerWarns(t *testing.T) {
 	_ = p.cmd.Process.Signal(os.Interrupt)
 	p.wait(t, time.Minute)
 }
+
+// 用 --rm 启动的容器一停止就会被 Docker 连同匿名卷一起删掉：停机打包之前就要停下，
+// 包括因为共用数据被连带停止的容器。
+func TestOutRefusesAutoRemove(t *testing.T) {
+	p := fmt.Sprintf("dmtest_rm%d", os.Getpid())
+	t.Cleanup(func() { removePrefixed(p) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	sh(t, "docker", "volume", "create", p+"_vol")
+	sh(t, "docker", "run", "-d", "--name", p+"_app", "--label", noWatchtower, "-v", p+"_vol:/data", "alpine:3.20", "sleep", "600")
+	sh(t, "docker", "run", "-d", "--rm", "--name", p+"_tmp", "--label", noWatchtower, "-v", p+"_vol:/data", "-v", "/scratch",
+		"alpine:3.20", "sleep", "600")
+	for _, include := range []string{p + "_tmp", p + "_app"} { // 选中它本身；只选中和它共用卷的 app
+		cmd := exec.Command(bin, "out", "--include", include, "--stop-shared", "--port", fmt.Sprint(nextPort()))
+		cmd.Env = append(os.Environ(), "DOCKHOP_HOME="+t.TempDir())
+		b, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(b), p+"_tmp 是用 --rm 启动的") || strings.Contains(string(b), "[4/7]") {
+			t.Fatalf("应在停机之前停下（--include %s）：%v\n%s", include, err, b)
+		}
+		if s := state(t, p+"_tmp"); s != "running" {
+			t.Fatalf("--rm 容器不应被停止（被删除）：%q", s)
+		}
+		if s := state(t, p+"_app"); s != "running" {
+			t.Fatalf("不应停止任何容器：%q", s)
+		}
+	}
+}

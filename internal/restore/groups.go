@@ -95,7 +95,11 @@ func (r *run) buildGroups(writers []writer) {
 	bindKeys := func(source string) []string {
 		var keys []string
 		for _, b := range binds {
-			if spec.PathsOverlap(source, b.Path) || b.Link != "" && spec.PathsOverlap(source, b.Link) {
+			match := spec.PathsOverlap(source, b.Path)
+			for _, l := range b.AllLinks() {
+				match = match || spec.PathsOverlap(source, l.Link)
+			}
+			if match {
 				keys = append(keys, "b:"+b.Path)
 			}
 		}
@@ -409,8 +413,9 @@ func (r *run) skipDone(ctx context.Context) {
 	}
 	alive := map[string]bool{}
 	for _, c := range st.Containers {
-		cur, _, err := r.Docker.InspectContainer(ctx, c.Name)
-		alive[c.Name] = err == nil && cur.ID == c.ID
+		// 按 ID 找：Compose 副本在新服务器上的编号（名字）可能和旧服务器上不一样。
+		_, _, err := r.Docker.InspectContainer(ctx, c.ID)
+		alive[c.Name] = err == nil
 	}
 	projectOK := map[string]bool{}
 	for _, c := range st.Containers {

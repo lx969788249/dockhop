@@ -291,3 +291,20 @@ func TestJournalDamagedMiddleLine(t *testing.T) {
 		t.Fatalf("没有 op 的记录应算损坏：%v", err)
 	}
 }
+
+// 副本按编号排好，才能和新服务器上的容器一一对应（编号可能不连续）。
+func TestReplicasOrder(t *testing.T) {
+	mk := func(name, svc, num string) *citem {
+		c := &docker.Container{}
+		c.Config.Labels = map[string]string{"com.docker.compose.container-number": num}
+		return &citem{m: bundle.Container{Name: name, Service: svc}, c: c}
+	}
+	items := []*citem{mk("p-web-3", "web", "3"), mk("p-db-1", "db", "1"), mk("p-web-1", "web", "1"), mk("p-web-10", "web", "10")}
+	var got []string
+	for _, it := range replicas(items, "web") {
+		got = append(got, it.m.Name)
+	}
+	if strings.Join(got, ",") != "p-web-1,p-web-3,p-web-10" {
+		t.Errorf("副本顺序：%v", got)
+	}
+}
