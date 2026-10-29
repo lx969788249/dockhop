@@ -2,6 +2,7 @@ package preflight
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -137,11 +138,50 @@ func TestEvaluateExisting(t *testing.T) {
 	if len(kinds(r, Ask)) != 0 || len(kinds(r, Info)) != 2 {
 		t.Errorf("--existing replace 时只提示：%+v", r.Issues)
 	}
-	if find(Evaluate(testPlan(), tg, &Decisions{}, Options{Existing: "skip"}), "skip_with_data") == nil {
-		t.Error("--existing skip 且迁移包里有数据时应停下")
+	if find(Evaluate(testPlan(), tg, &Decisions{}, Options{Existing: "skip"}), "skip_with_data") != nil {
+		t.Error("保留的服务的数据没有别的容器要写入，不用处理")
 	}
 	if len(kinds(Evaluate(testPlan(), tg, &Decisions{ReplaceContainers: []string{"web"}, SkipProjects: []string{"site"}}, Options{}), Ask)) != 0 {
 		t.Error("做了选择之后不应再询问")
+	}
+}
+
+// 保留新服务器上已有的服务时，和它共用数据的其他容器迁入会覆盖它的数据：选择保留和
+// --existing skip 一样要处理。保留的服务用到的数据按新、旧服务器上的挂载一起算。
+func TestEvaluateKeptData(t *testing.T) {
+	p := testPlan()
+	p.Containers[1].Volumes = []string{"data"} // old 和 web 共用卷 data
+	p.Containers[2].Binds = []string{"/srv/shared/site"}
+	tg := testTarget()
+	tg.Containers["web"] = TargetContainer{Binds: []string{"/srv/shared"}}
+	for name, d := range map[string]*Decisions{
+		"选择保留":            {SkipContainers: []string{"web"}},
+		"--existing skip": {},
+	} {
+		o := Options{}
+		if d.SkipContainers == nil {
+			o.Existing = "skip"
+		}
+		r := Evaluate(p, tg, d, o)
+		var got []string
+		for _, i := range r.Issues {
+			if i.Kind == "skip_with_data" {
+				got = append(got, i.Container)
+			}
+		}
+		// old 和旧服务器上的 web 共用卷；site 的目录在新服务器上的 web 挂载的目录里面。
+		if strings.Join(got, ",") != "old,site-app-1" {
+			t.Errorf("%s：%v", name, r.Issues)
+		}
+	}
+	if find(Evaluate(p, tg, &Decisions{ReplaceContainers: []string{"web"}}, Options{}), "skip_with_data") != nil {
+		t.Error("替换已有的服务时不用处理")
+	}
+	d := &Decisions{SkipContainers: []string{"web"}}
+	r := &Runner{Screen: ui.New(io.Discard, false, nil), Prompt: ui.NewPrompter(strings.NewReader("1\n1\n"), io.Discard),
+		Collect: func() (*Target, error) { return tg, nil }}
+	if _, err := r.Run(p, d, Options{}); err != nil || !d.SkippedContainer(p.Containers[1]) || !has(d.SkipProjects, "site") {
+		t.Fatalf("选择一起跳过之后应能继续：%v %+v", err, d)
 	}
 }
 
@@ -379,5 +419,89 @@ func TestPortConflictsByAddress(t *testing.T) {
 				t.Errorf("冲突：%v，应该：%v", got, c.conflict)
 			}
 		})
+	}
+}
+
+// 同一个端口被几个已有容器绑定在不同的地址上：替换掉其中一个，另一个还占着，仍然冲突，
+// 不管 Docker 先列出哪个。全都会被替换时不算冲突，Docker 为它们开的监听（docker-proxy）也不算。
+func TestPortHeldByOthers(t *testing.T) {
+	p := testPlan()
+	p.Containers = []bundle.PlanContainer{{Name: "web", State: "running", Ports: []bundle.PlanPort{{HostPort: "8080", ContainerPort: "80", Proto: "tcp"}}}}
+	web := DockerPort{Proto: "tcp", IP: "127.0.0.1", Port: "8080", Container: "web"}
+	other := DockerPort{Proto: "tcp", IP: "127.0.0.2", Port: "8080", Container: "other"}
+	for _, ports := range [][]DockerPort{{web, other}, {other, web}} {
+		tg := testTarget()
+		tg.Containers["web"], tg.Containers["other"] = TargetContainer{State: "running"}, TargetContainer{State: "running"}
+		tg.DockerPorts = ports
+		i := find(Evaluate(p, tg, &Decisions{}, Options{Existing: "replace"}), "port")
+		if i == nil || !strings.Contains(i.Title, "other") {
+			t.Errorf("%v：%+v", ports, i)
+		}
+	}
+	tg := testTarget()
+	tg.Containers["web"] = TargetContainer{State: "running"}
+	tg.DockerPorts = []DockerPort{web}
+	tg.Listeners = []host.Listener{{Proto: "tcp", Addr: "127.0.0.1", Port: 8080}}
+	if i := find(Evaluate(p, tg, &Decisions{}, Options{Existing: "replace"}), "port"); i != nil {
+		t.Errorf("占用者都会被替换时不算冲突：%+v", i)
+	}
+}
+
+// 几个容器的端口都被占用时，一轮里推荐的空闲端口互不相同，也不会是迁移包里别的容器要用的，
+// --yes 一次全部接受就能通过。
+func TestSuggestedPortsDistinct(t *testing.T) {
+	p := testPlan()
+	p.Containers = nil
+	tg := testTarget()
+	for i := 0; i < 4; i++ {
+		port := 8080 + i
+		p.Containers = append(p.Containers, bundle.PlanContainer{Name: fmt.Sprintf("web%d", i+1), State: "running",
+			Ports: []bundle.PlanPort{{HostPort: fmt.Sprint(port), ContainerPort: "80", Proto: "tcp"}}})
+		tg.Listeners = append(tg.Listeners, host.Listener{Proto: "tcp", Addr: "0.0.0.0", Port: port})
+	}
+	// 8084 是迁移包里另一个（停着的）容器的端口，不能推荐。
+	p.Containers = append(p.Containers, bundle.PlanContainer{Name: "spare", State: "exited",
+		Ports: []bundle.PlanPort{{HostPort: "8084", ContainerPort: "80", Proto: "tcp"}}})
+	var got []string
+	for _, i := range Evaluate(p, tg, &Decisions{}, Options{}).Issues {
+		got = append(got, i.Suggest)
+	}
+	if strings.Join(got, ",") != "8085,8086,8087,8088" {
+		t.Errorf("推荐的端口：%v", got)
+	}
+	r := &Runner{Screen: ui.New(io.Discard, false, nil), Prompt: ui.NewPrompter(nil, io.Discard), Auto: true,
+		Collect: func() (*Target, error) { return tg, nil }}
+	if _, err := r.Run(p, &Decisions{}, Options{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Compose 项目在 external 网络里用固定 IP，新服务器上同名网络的网段不同：迁入时不会改用户的
+// 配置文件，所以不能提供“自动分配 IP”，--yes 也不能自动处理；跳过这个项目之后，网络里剩下
+// 的独立容器照常可以改为自动分配。
+func TestComposeFixedIPNotAuto(t *testing.T) {
+	p := testPlan()
+	p.Containers = []bundle.PlanContainer{
+		{Name: "app-web-1", Project: "app", State: "running", Networks: []bundle.PlanNetAddr{{Name: "ext", IP: "172.20.0.2"}}},
+		{Name: "solo", State: "running", Networks: []bundle.PlanNetAddr{{Name: "ext", IP: "172.20.0.3"}}},
+	}
+	p.Networks = []bundle.PlanNetwork{{Name: "ext", Driver: "bridge", Subnets: []string{"172.20.0.0/16"}}}
+	tg := testTarget()
+	tg.Networks["ext"] = TargetNetwork{Driver: "bridge", Subnets: []string{"172.30.0.0/16"}}
+	i := find(Evaluate(p, tg, &Decisions{}, Options{}), "network_mismatch")
+	if i == nil || i.Project != "app" {
+		t.Fatalf("应该按 Compose 项目报告：%+v", i)
+	}
+	auto := &Runner{Screen: ui.New(io.Discard, false, nil), Prompt: ui.NewPrompter(nil, io.Discard), Auto: true,
+		Collect: func() (*Target, error) { return tg, nil }}
+	d := &Decisions{}
+	if _, err := auto.Run(p, d, Options{}); err == nil || d.AutoIPFor("app-web-1", "ext") {
+		t.Fatalf("--yes 不能替 Compose 项目改为自动分配 IP：%v %+v", err, d)
+	}
+	d = &Decisions{}
+	ask := &Runner{Screen: ui.New(io.Discard, false, nil), Prompt: ui.NewPrompter(strings.NewReader("2\n1\n"), io.Discard),
+		Collect: func() (*Target, error) { return tg, nil }}
+	if _, err := ask.Run(p, d, Options{}); err != nil || !has(d.SkipProjects, "app") || !d.AutoIPFor("solo", "ext") {
+		t.Fatalf("跳过项目后，独立容器改为自动分配：%v %+v", err, d)
 	}
 }

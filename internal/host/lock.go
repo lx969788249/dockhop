@@ -33,6 +33,21 @@ func TryLock(path string) (*Lock, error) {
 	return &Lock{f: f}, nil
 }
 
+// Held 表示 path 这个锁现在被另一个打开者拿着（拿着它的任务还在运行）。锁文件不存在时
+// 当作没人拿着。
+func Held(path string) bool {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return errors.Is(err, unix.EWOULDBLOCK)
+	}
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	return false
+}
+
 // Unlock 释放锁。
 func (l *Lock) Unlock() {
 	if l == nil || l.f == nil {

@@ -272,8 +272,29 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 		}
 		return nil
 
+	case "skip_with_data":
+		what := "容器 " + i.Container
+		if i.Project != "" {
+			what = "Compose 项目 " + i.Project
+		}
+		c, err := choose("把"+what+"也跳过，不动保留的服务的数据（推荐）", "取消迁入")
+		if err != nil {
+			return err
+		}
+		if c != 1 {
+			return errCancel
+		}
+		if i.Project != "" {
+			skipProject("和保留的服务共用数据")
+		} else {
+			d.SkipContainers = add(d.SkipContainers, i.Container)
+			d.Skipped = append(d.Skipped, Skip{Container: i.Container, Reason: "和保留的服务共用数据"})
+		}
+		return nil
+
 	case "ip_conflict", "subnet_conflict", "network_mismatch":
-		if i.Kind == "ip_conflict" && i.Project != "" {
+		if i.Project != "" {
+			// Compose 项目的固定 IP 写在它的配置文件里，不替用户改，只能处理后重查或跳过。
 			if auto {
 				return errCancel
 			}
@@ -286,7 +307,11 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 			case 1:
 				return errRecheck
 			case 2:
-				skipProject("固定 IP 有冲突")
+				reason := "固定 IP 有冲突"
+				if i.Kind != "ip_conflict" {
+					reason = "网络 " + i.Network + " 的网段有冲突，用不了配置文件里的固定 IP"
+				}
+				skipProject(reason)
 				return nil
 			}
 			return errCancel

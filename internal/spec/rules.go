@@ -175,21 +175,6 @@ func WritableChanged(changes []docker.Change, mounts []string) bool {
 	return len(keep)+len(deleted) > 0
 }
 
-// 名字像密码、密钥、令牌的环境变量，它们的值要在日志里隐藏。
-var secretEnvName = regexp.MustCompile(`(?i)pass|pwd|secret|token|key|credential|auth|salt|cookie|session|dsn|database_url`)
-
-// SecretEnvValues 返回环境变量里需要隐藏的值。
-func SecretEnvValues(env []string) []string {
-	var out []string
-	for _, e := range env {
-		k, v, ok := strings.Cut(e, "=")
-		if ok && v != "" && secretEnvName.MatchString(k) {
-			out = append(out, v)
-		}
-	}
-	return out
-}
-
 // 面板（宝塔、1Panel）自身的容器，迁移后可能导致面板异常，默认不选。
 func IsPanelContainer(c *docker.Container) bool {
 	img := strings.ToLower(c.Config.Image)

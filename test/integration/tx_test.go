@@ -651,6 +651,68 @@ func TestInComposeReplicas(t *testing.T) {
 	noLeftovers(t, home)
 }
 
+// 同一个服务一个副本在运行、一个停着：迁入后照旧一个运行、一个停着（docker compose start
+// 会把两个都启动，所以不能用它）；它依赖的服务照常先启动。
+func TestInComposeMixedStates(t *testing.T) {
+	p := fmt.Sprintf("dmtest_ms%d", os.Getpid())
+	project := p + "proj"
+	t.Cleanup(func() { removeProject(project); removePrefixed(p) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	proj := filepath.Join(t.TempDir(), "proj")
+	os.MkdirAll(proj, 0o755)
+	os.WriteFile(filepath.Join(proj, "compose.yml"), []byte(`services:
+  db:
+    image: alpine:3.20
+    command: ["sleep", "600"]
+    labels: {com.centurylinklabs.watchtower.enable: "false"}
+  worker:
+    image: alpine:3.20
+    command: ["sleep", "600"]
+    labels: {com.centurylinklabs.watchtower.enable: "false"}
+    depends_on: [db]
+    deploy: {replicas: 2}
+`), 0o644)
+	c := composeCmd(t)
+	up := exec.Command(c[0], append(c[1:], "-p", project, "up", "-d")...)
+	up.Dir = proj
+	if b, err := up.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, b)
+	}
+	states := func() string {
+		t.Helper()
+		out := sh(t, "docker", "ps", "-a", "--filter", "label=com.docker.compose.project="+project,
+			"--format", `{{.Label "com.docker.compose.service"}}-{{.Label "com.docker.compose.container-number"}} {{.State}}`)
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		sort.Strings(lines)
+		return strings.Join(lines, ",")
+	}
+	if got := states(); got != "db-1 running,worker-1 running,worker-2 running" {
+		t.Skipf("Compose 没有按 deploy.replicas 建出 2 个副本：%s", got)
+	}
+	sh(t, "docker", "stop", "-t", "1", containerByNumber(t, project, "worker", "2"))
+	m := startOut(t, "--include", containerByNumber(t, project, "db", "1"))
+	removeProject(project)
+
+	home := t.TempDir()
+	if _, code := m.in(t, home, nil); code != 0 {
+		t.Fatalf("迁入应成功：%d", code)
+	}
+	// 停着的副本只创建、不启动（和停着的独立容器一样，状态是 created）。
+	if got := states(); got != "db-1 running,worker-1 running,worker-2 created" && got != "db-1 running,worker-1 running,worker-2 exited" {
+		t.Errorf("迁入后的状态：%s", got)
+	}
+	m.waitOutSuccess(t)
+	noLeftovers(t, home)
+}
+
+// containerByNumber 是 Compose 项目里某个服务的第几个副本的容器名。
+func containerByNumber(t *testing.T, project, service, number string) string {
+	t.Helper()
+	return sh(t, "docker", "ps", "-a", "--filter", "label=com.docker.compose.project="+project,
+		"--filter", "label=com.docker.compose.service="+service, "--filter", "label=com.docker.compose.container-number="+number,
+		"--format", "{{.Names}}")
+}
+
 // 好几个软链接指向同一个挂载目录（或者它里面的目录）：数据只迁一份，每个软链接都要在
 // 新服务器上重建，用哪个软链接挂载的容器都能看到数据。
 func TestInSymlinkAliases(t *testing.T) {

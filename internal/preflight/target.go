@@ -45,6 +45,8 @@ type DockerPort struct {
 type TargetContainer struct {
 	Project string
 	State   string
+	Volumes []string // 用到的数据卷
+	Binds   []string // 挂载的目录
 }
 
 // TargetNetwork 是新服务器上已有的一个网络。
@@ -84,7 +86,16 @@ func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, e
 	}
 	for _, c := range list {
 		proj := c.Labels["com.docker.compose.project"]
-		t.Containers[c.Name()] = TargetContainer{Project: proj, State: c.State}
+		tc := TargetContainer{Project: proj, State: c.State}
+		for _, m := range c.Mounts {
+			switch m.Type {
+			case "volume":
+				tc.Volumes = append(tc.Volumes, m.Name)
+			case "bind":
+				tc.Binds = append(tc.Binds, m.Source)
+			}
+		}
+		t.Containers[c.Name()] = tc
 		if proj != "" {
 			t.Projects[proj] = true
 		}

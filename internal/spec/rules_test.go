@@ -86,14 +86,6 @@ func TestLayerChanges(t *testing.T) {
 	}
 }
 
-func TestSecretEnvValues(t *testing.T) {
-	got := SecretEnvValues([]string{"MYSQL_ROOT_PASSWORD=hunter2", "MODE=prod", "API_KEY=abc", "EMPTY_TOKEN=", "DATABASE_URL=postgres://u:p@db/x"})
-	want := []string{"hunter2", "abc", "postgres://u:p@db/x"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("SecretEnvValues = %v", got)
-	}
-}
-
 func TestPanelAndSwarm(t *testing.T) {
 	var c docker.Container
 	c.Config.Image = "moelin/1Panel:latest"

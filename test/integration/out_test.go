@@ -307,7 +307,7 @@ func TestOutBundleContents(t *testing.T) {
 	if imgs := try("docker", "images", "-q", "dockhop-image"); imgs != "" {
 		t.Errorf("临时镜像名没有删除：%s", imgs)
 	}
-	if h := try("docker", "ps", "-aq", "--filter", "label=dockhop.helper=1"); h != "" {
+	if h := try("docker", "ps", "-aq", "--filter", "label=dockhop.helper"); h != "" {
 		t.Errorf("临时容器没有删除：%s", h)
 	}
 	if strings.Contains(readLogs(home), link.Secret()) {

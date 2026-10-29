@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/helper"
 )
 
 // 数据卷的读写都通过临时容器和 Docker 接口完成，不需要 alpine 之类的辅助镜像：
@@ -17,13 +18,11 @@ import (
 //   - 清空：接口没有删除文件的功能，所以启动一个临时容器，在里面运行 DockHop 自己
 //     （程序是静态编译的，任何镜像里都能运行）来删除卷里的文件。
 
-// HelperLabel 标记 DockHop 创建的临时容器，程序被中断后可以据此清理。
-const HelperLabel = "dockhop.helper"
-
 type volumeIO struct {
 	dc        *docker.Client
 	image     string // 用来创建临时容器的镜像（任何本地镜像都行）
 	helperBin string // 宿主机上 DockHop 程序的路径，清空卷时挂进临时容器
+	lock      string // 这个任务拿着的锁，标在临时容器上（见 helper.Label）
 	n         atomic.Int32
 }
 
@@ -40,7 +39,7 @@ func (v *volumeIO) create(ctx context.Context, volume string, entrypoint []strin
 		"Entrypoint": entrypoint,
 		"User":       "0:0",
 		"WorkingDir": "/",
-		"Labels":     map[string]string{HelperLabel: "1"},
+		"Labels":     helper.Labels(v.lock),
 		"HostConfig": hc,
 	}
 	name := fmt.Sprintf("dockhop-helper-%s-%d", runID, v.n.Add(1))
@@ -146,18 +145,4 @@ func prepareHelper(home string) (string, error) {
 		return "", err
 	}
 	return dst, os.Rename(tmp, dst)
-}
-
-// removeHelpers 删除上次被中断时留下的临时容器。只认标签，不看名字：用户自己的容器
-// 名字碰巧也以 dockhop-helper- 开头时不能删。
-func removeHelpers(ctx context.Context, dc *docker.Client) {
-	list, err := dc.Containers(ctx, true)
-	if err != nil {
-		return
-	}
-	for _, c := range list {
-		if c.Labels[HelperLabel] == "1" {
-			_ = dc.RemoveContainerAndVolumes(ctx, c.ID)
-		}
-	}
 }

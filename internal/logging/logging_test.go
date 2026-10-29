@@ -3,6 +3,7 @@ package logging
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -19,6 +20,9 @@ func TestRedact(t *testing.T) {
 		"  admin_password: changeme":                                                          "  admin_password: ***",
 		"key is AGE-SECRET-KEY-1QQQ7ZZ":                                                       "key is ***",
 		"http://1.2.3.4:8080/tok/#a7j8zg6qtzkg8ddwxnzl94th3c4ns7ckdzjxu0w0fypeapduldmqq2q4nn": "http://1.2.3.4:8080/tok/#***",
+		"cannot connect to postgres://app:p%40ss!w0rd@db/app":                                 "cannot connect to postgres://app:***@db/app",
+		"DSN=mysql://root:x@tcp(db)/app":                                                      "DSN=***",
+		"see https://example.com/a@b":                                                         "see https://example.com/a@b",
 		"abc 是普通文字":                                                                           "abc 是普通文字",
 		"MODE=production":                                                                     "MODE=production",
 	}
@@ -26,6 +30,19 @@ func TestRedact(t *testing.T) {
 		if got := r.Redact(in); got != want {
 			t.Errorf("Redact(%q)\n实际 %q\n期望 %q", in, got, want)
 		}
+	}
+}
+
+func TestEnvSecrets(t *testing.T) {
+	got := EnvSecrets([]string{"MYSQL_ROOT_PASSWORD=hunter2", "MODE=prod", "API_KEY=abc", "EMPTY_TOKEN=", "DATABASE_URL=postgres://u:p@db/x", "SENTRY_DSN=https://k@s.io/1"})
+	want := []string{"hunter2", "abc", "postgres://u:p@db/x", "https://k@s.io/1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("EnvSecrets = %v", got)
+	}
+	var nilRedactor *Redactor
+	nilRedactor.AddSecret("hunter2-very-secret")
+	if got := nilRedactor.Redact("DB_PASSWORD=x 普通文字"); got != "DB_PASSWORD=*** 普通文字" {
+		t.Errorf("nil 时仍按写法隐藏：%q", got)
 	}
 }
 

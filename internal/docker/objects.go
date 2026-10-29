@@ -50,6 +50,7 @@ type ContainerSummary struct {
 		PublicPort  int    `json:"PublicPort"`
 		Type        string `json:"Type"`
 	} `json:"Ports"`
+	Mounts []Mount `json:"Mounts"`
 }
 
 // Name 返回不带开头斜杠的容器名。

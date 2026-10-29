@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 )
@@ -59,7 +60,7 @@ func (t *Tool) args(p Project, extra ...string) []string {
 	return append(a, extra...)
 }
 
-// Service 是按现在的文件算出来的一个服务的配置（只取用来核对的部分）。
+// Service 是按现在的文件算出来的一个服务的配置（只取用到的部分）。
 type Service struct {
 	Image       string             `json:"image"`
 	Environment map[string]*string `json:"environment"`
@@ -67,6 +68,26 @@ type Service struct {
 	Deploy      *struct {
 		Replicas *int `json:"replicas"`
 	} `json:"deploy"`
+	DependsOn any `json:"depends_on"` // 名字: {condition…}，或者名字的列表
+}
+
+// Needs 是服务依赖（depends_on）的其他服务，按名字排好。
+func (s Service) Needs() []string {
+	var out []string
+	switch v := s.DependsOn.(type) {
+	case map[string]any:
+		for name := range v {
+			out = append(out, name)
+		}
+	case []any:
+		for _, name := range v {
+			if n, ok := name.(string); ok {
+				out = append(out, n)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Replicas 是配置文件里写的副本个数（deploy.replicas 或 scale），没写时是 1。

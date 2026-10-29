@@ -16,13 +16,14 @@ import (
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
-// Compose 写在容器上的标签。
+// Compose 和 Swarm 写在容器上的标签。
 const (
-	labelProject     = "com.docker.compose.project"
-	labelWorkingDir  = "com.docker.compose.project.working_dir"
-	labelConfigFiles = "com.docker.compose.project.config_files"
-	labelService     = "com.docker.compose.service"
-	labelOneoff      = "com.docker.compose.oneoff"
+	labelProject      = "com.docker.compose.project"
+	labelWorkingDir   = "com.docker.compose.project.working_dir"
+	labelConfigFiles  = "com.docker.compose.project.config_files"
+	labelService      = "com.docker.compose.service"
+	labelOneoff       = "com.docker.compose.oneoff"
+	labelSwarmService = "com.docker.swarm.service.name"
 )
 
 // item 是一个容器：解析后的常用字段，加上完整的原始配置。
@@ -76,7 +77,8 @@ func (u *unit) tags() []string {
 }
 
 type inventory struct {
-	units     []*unit
+	units     []*unit // 菜单里能选的
+	all       []*item // 全部容器，包括不能迁移的：检查共用数据时都要算上
 	unitOf    map[*item]*unit
 	byName    map[string]*item
 	byID      map[string]*item
@@ -105,6 +107,7 @@ func buildInventory(ctx context.Context, dc *docker.Client, screen *ui.Screen) (
 			return nil, err
 		}
 		it := &item{c: c, raw: raw}
+		inv.all = append(inv.all, it)
 		inv.byName[it.name()] = it
 		inv.byID[c.ID] = it
 		labels := c.Config.Labels

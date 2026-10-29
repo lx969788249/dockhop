@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
@@ -27,9 +28,10 @@ type undo struct {
 // rollback 返回没能撤销的地方；为空表示已经全部撤销。
 //
 // 顺序和改动的顺序相反，分三遍：
-//  1. 先停下所有可能在写数据的容器：删除这次新建的容器，再把临时停过、提交时已经重新
-//     启动的已有容器重新停下（之后才出错或被中断时会这样）。没能做到时停下：它们可能还在
-//     写数据，这时放回的数据会被覆盖，回滚资料全部保留，交给人工处理。
+//  1. 先停下所有可能在写数据的容器：删除这次新建的容器，再把临时停过、又在运行的已有容器
+//     重新停下（提交之后才出错或被中断，或者上次回滚已经放回、重建了原来的服务时会这样）。
+//     没能做到时停下：它们可能还在写数据，这时放回的数据会被覆盖，回滚资料全部保留，交给
+//     人工处理。
 //  2. 再处理数据：删除这次写入的网络、Compose 文件、目录、数据卷，放回原有的。
 //  3. 最后放回旧服务：重建旧 Compose 容器、旧容器改回原名、启动临时停下的容器。
 //     原有的数据没能全部放回时，旧服务保持停止，以免在不完整的数据上运行。
@@ -71,6 +73,16 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 			u.removeHelper(ctx, e, note)
 		case opStop:
 			u.restop(ctx, e, note)
+		case opComposeOld:
+			// 原来的 Compose 容器：上次回滚可能已经把它放回去（ID 不变）或者重建了（ID 变了，
+			// 只能按名字找），现在可能在运行。
+			for _, o := range e.Old {
+				ref := o.ID
+				if _, _, err := u.dc.InspectContainer(ctx, ref); docker.IsNotFound(err) {
+					ref = o.Name
+				}
+				u.restop(ctx, Entry{Name: o.Name, ID: ref}, note)
+			}
 		case opComposeUp:
 			list, err := u.dc.ContainersByLabel(ctx, "com.docker.compose.project="+e.Name)
 			if err != nil {
@@ -146,19 +158,38 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 	// 第 3 遍：旧服务。
 	u.screen.Note("放回新服务器上原来的服务")
 	images := map[string]string{}
+	oldNames := map[string]string{}
 	for _, e := range entries {
-		if e.Op == opOldImages {
-			for k, v := range e.Images {
-				images[k] = v
+		for k, v := range e.Images {
+			images[k] = v
+		}
+		for _, o := range e.Old {
+			oldNames[o.ID] = o.Name
+		}
+	}
+	// 原来的 Compose 容器删除、重建之后 ID 就变了：它们之间按 ID 的引用（借用网络的
+	// container:<ID> 等）改成按名字。
+	nameOf := func(ref string) string {
+		for id, name := range oldNames {
+			if id == ref || len(ref) >= 12 && strings.HasPrefix(id, ref) {
+				return name
 			}
 		}
+		return ""
 	}
 	for i := len(entries) - 1; i >= 0; i-- {
 		e := entries[i]
 		switch e.Op {
 		case opComposeOld:
+			// 被借用网络等的容器先重建、先启动。
+			conf := map[string]*docker.Container{}
 			for _, o := range e.Old {
-				u.undoOldCompose(ctx, o, images[o.ID], dataOK, note)
+				conf[o.Name] = &docker.Container{}
+				_ = json.Unmarshal(o.Raw, conf[o.Name])
+			}
+			for _, o := range dependencyOrder(e.Old, func(o OldContainer) string { return o.Name },
+				func(o OldContainer) []string { return containerDeps(conf[o.Name], nameOf) }) {
+				u.undoOldCompose(ctx, o, images[o.ID], dataOK, nameOf, note)
 			}
 		case opRename:
 			u.undoRename(ctx, e, note)
@@ -173,7 +204,8 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 	return problems
 }
 
-// restop 把临时停过、现在又在运行的已有容器重新停下（暂停的先恢复再停）。
+// restop 把临时停过、现在又在运行的已有容器重新停下（暂停的先恢复再停）。e.ID 可以是
+// ID 或名字。
 func (u *undo) restop(ctx context.Context, e Entry, note func(string, ...any)) {
 	c, _, err := u.dc.InspectContainer(ctx, e.ID)
 	switch {
@@ -184,12 +216,12 @@ func (u *undo) restop(ctx context.Context, e Entry, note func(string, ...any)) {
 		return
 	}
 	if c.State.Paused {
-		if err := u.dc.UnpauseContainer(ctx, e.ID); err != nil {
+		if err := u.dc.UnpauseContainer(ctx, c.ID); err != nil {
 			note("临时停过的容器 %s 又在运行，没能停下：%v", e.Name, err)
 			return
 		}
 	}
-	if err := u.dc.StopContainer(ctx, e.ID, nil); err != nil {
+	if err := u.dc.StopContainer(ctx, c.ID, nil); err != nil {
 		note("临时停过的容器 %s 又在运行，没能停下：%v", e.Name, err)
 	}
 }
@@ -345,8 +377,9 @@ func reconnect(ctx context.Context, dc *docker.Client, id string, raw json.RawMe
 	}
 }
 
-// undoOldCompose 按记录原样重建新服务器上原有的 Compose 容器。
-func (u *undo) undoOldCompose(ctx context.Context, o OldContainer, image string, dataOK bool, note func(string, ...any)) {
+// undoOldCompose 按记录原样重建新服务器上原有的 Compose 容器。nameOf 把配置里引用的
+// 旧 ID 换成名字。
+func (u *undo) undoOldCompose(ctx context.Context, o OldContainer, image string, dataOK bool, nameOf func(string) string, note func(string, ...any)) {
 	if c, _, err := u.dc.InspectContainer(ctx, o.ID); err == nil {
 		// 还没被删除：只需恢复状态。
 		if dataOK {
@@ -378,7 +411,7 @@ func (u *undo) undoOldCompose(ctx context.Context, o OldContainer, image string,
 	}
 	built, err := spec.Rebuild{
 		Raw: o.Raw, Image: image, Source: u.defaults, KeepVolumes: o.Volumes,
-		NameOf:       func(ref string) string { return currentName(ctx, u.dc, ref) },
+		NameOf:       nameOf,
 		MultiNetwork: u.dc.AtLeast("1.44"),
 	}.Build()
 	if err != nil {
@@ -400,14 +433,6 @@ func (u *undo) undoOldCompose(ctx context.Context, o OldContainer, image string,
 			note("原来的容器 %s 没能恢复状态：%v", o.Name, err)
 		}
 	}
-}
-
-func currentName(ctx context.Context, dc *docker.Client, ref string) string {
-	c, _, err := dc.InspectContainer(ctx, ref)
-	if err != nil {
-		return ""
-	}
-	return c.ShortName()
 }
 
 // restoreState 把容器恢复成原来的状态：运行或暂停；原来停着的不动。

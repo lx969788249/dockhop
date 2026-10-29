@@ -12,6 +12,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/spec"
 )
 
@@ -92,12 +93,15 @@ func (r *run) buildGroups(writers []writer) {
 			binds = append(binds, b)
 		}
 	}
+	// 路径按新服务器上解析软链接之后的实际位置比较：父目录是软链接时，写法不同的两个路径
+	// 可能是同一处。
+	overlap := func(a, b string) bool { return spec.PathsOverlap(preflight.Normalize(a), preflight.Normalize(b)) }
 	bindKeys := func(source string) []string {
 		var keys []string
 		for _, b := range binds {
-			match := spec.PathsOverlap(source, b.Path)
+			match := overlap(source, b.Path)
 			for _, l := range b.AllLinks() {
-				match = match || spec.PathsOverlap(source, l.Link)
+				match = match || overlap(source, l.Link)
 			}
 			if match {
 				keys = append(keys, "b:"+b.Path)
@@ -144,18 +148,19 @@ func (r *run) buildGroups(writers []writer) {
 	// 挂载目录和指向它的软链接）。不然只删除其中一组时，会删掉或换回另一组还在用的文件。
 	type place struct{ key, path string }
 	var places []place
+	at := func(key, path string) { places = append(places, place{key, preflight.Normalize(path)}) }
 	for _, b := range binds {
-		places = append(places, place{"b:" + b.Path, b.Path})
+		at("b:"+b.Path, b.Path)
 		for _, l := range b.AllLinks() {
-			places = append(places, place{"b:" + b.Path, l.Link})
+			at("b:"+b.Path, l.Link)
 		}
 	}
 	for _, p := range r.projects {
 		k := "p:" + p.Name
 		uf.find(k)
-		places = append(places, place{k, p.WorkingDir})
+		at(k, p.WorkingDir)
 		for _, o := range p.Outside {
-			places = append(places, place{k, o})
+			at(k, o)
 		}
 	}
 	for i, a := range places {
@@ -175,7 +180,7 @@ func (r *run) buildGroups(writers []writer) {
 				uf.union(k, "v:"+m.Name)
 			case m.Type == "bind":
 				for _, b := range bindPaths {
-					if spec.PathsOverlap(m.Source, b) {
+					if overlap(m.Source, b) {
 						uf.union(k, "b:"+b)
 					}
 				}

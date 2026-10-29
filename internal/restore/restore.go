@@ -23,6 +23,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/crypto"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/helper"
 	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/preflight"
@@ -110,14 +111,14 @@ func Run(ctx context.Context, d Deps, o Options) error {
 			r.steps = 3
 		}
 	}
-	lock, err := host.TryLock(filepath.Join(d.Home, "locks", "in.lock"))
+	lock, err := host.TryLock(lockPath(d.Home))
 	if err != nil {
 		d.Screen.Problem(err.Error(), "")
 		return ErrReported
 	}
 	defer lock.Unlock()
 	if !o.CheckOnly {
-		removeHelpers(ctx, d.Docker)
+		helper.Clean(ctx, d.Docker, lockPath(d.Home))
 	}
 	err = r.run(ctx)
 	if err != nil && r.j != nil && !r.committed {
@@ -729,6 +730,10 @@ func (r *run) prepare(ctx context.Context) error {
 		if err := json.Unmarshal(raw, &c); err != nil {
 			return fail(s, "容器 "+mc.Name+" 的配置读不懂", err.Error(), "")
 		}
+		// 容器启动失败时的输出可能带着这些值（例如连接串），日志和报错里都要隐藏。
+		for _, v := range logging.EnvSecrets(c.Config.Env) {
+			r.Redactor.AddSecret(v)
+		}
 		inProject := mc.Project != "" && r.projectRestored(mc.Project)
 		if !inProject {
 			if _, ok := byName[mc.Name]; ok {
@@ -754,7 +759,11 @@ func (r *run) prepare(ctx context.Context) error {
 		return fail(s, "按检查时的选择，没有要迁入的容器了", "", "")
 	}
 
-	// 新服务器上正在运行、和要写入的数据共用卷或目录的容器：要先临时停止，否则数据不一致。
+	// 新服务器上和要写入的数据共用卷或目录的容器：
+	//   - 保留下来的已有服务（检查时选择了保留，或者 --existing skip）：不能覆盖它的数据。
+	//     检查时已经处理过，这里按新服务器现在的情况再确认一次（--skip-check 时没有检查）；
+	//   - 其他正在运行的：要先临时停止，否则数据不一致。
+	// 读不到某个容器的配置时，没法确认它有没有在用这些数据，不能当作没有。
 	volumes, binds := r.dataTargets()
 	self, _ := os.Hostname()
 	ignore := map[string]bool{}
@@ -763,16 +772,25 @@ func (r *run) prepare(ctx context.Context) error {
 	}
 	var writers []writer
 	for _, c := range existing {
-		name := c.Name()
-		if c.State != "running" && c.State != "paused" && c.State != "restarting" {
+		name, project := c.Name(), c.Labels["com.docker.compose.project"]
+		kept := has(r.d.SkipContainers, name) || has(r.d.SkipProjects, project)
+		if !kept && c.State != "running" && c.State != "paused" && c.State != "restarting" {
 			continue
 		}
-		if r.targets[name] || has(replaceProjects, c.Labels["com.docker.compose.project"]) || ignore[name] || (len(self) >= 12 && strings.HasPrefix(c.ID, self)) {
+		if r.targets[name] || has(replaceProjects, project) || ignore[name] || (len(self) >= 12 && strings.HasPrefix(c.ID, self)) {
 			continue
 		}
 		full, _, err := dc.InspectContainer(ctx, c.ID)
-		if err != nil || !usesData(full, volumes, binds) {
+		switch {
+		case docker.IsNotFound(err):
+			continue // 刚好被删掉了
+		case err != nil:
+			return fail(s, "读不到新服务器上的容器 "+name+"，没法确认它有没有在用要写入的数据（还没有改动任何东西）", err.Error(), "确认 Docker 运行正常后重新运行")
+		case !usesData(full, volumes, binds):
 			continue
+		case kept:
+			return fail(s, "保留的已有容器 "+name+" 和要迁入的容器共用数据，迁入会覆盖它正在用的数据（还没有改动任何东西）", "",
+				"重新运行迁入，检查时把共用数据的容器一起跳过，或者替换这个已有的容器")
 		}
 		writers = append(writers, writer{summary: c, full: full})
 	}
@@ -787,14 +805,14 @@ func (r *run) prepare(ctx context.Context) error {
 		return fail(s, "无法创建事务日志，为了安全没有改动任何东西", err.Error(), "检查 "+r.Home+" 是否可写")
 	}
 	r.j = j
-	helper := ""
+	helperBin := ""
 	if dc.Local() {
-		if helper, err = prepareHelper(r.Home); err != nil {
+		if helperBin, err = prepareHelper(r.Home); err != nil {
 			s.Warn("准备清空数据卷用的程序失败：%v", err)
-			helper = ""
+			helperBin = ""
 		}
 	}
-	r.vio = &volumeIO{dc: dc, image: r.helperImage, helperBin: helper}
+	r.vio = &volumeIO{dc: dc, image: r.helperImage, helperBin: helperBin, lock: lockPath(r.Home)}
 	r.undo.vio = r.vio
 
 	stopped := 0
@@ -1033,7 +1051,7 @@ func usesData(c *docker.Container, vols map[string]bool, binds []string) bool {
 			}
 		case "bind":
 			for _, b := range binds {
-				if spec.PathsOverlap(m.Source, b) {
+				if spec.PathsOverlap(preflight.Normalize(m.Source), preflight.Normalize(b)) {
 					return true
 				}
 			}
@@ -1380,7 +1398,7 @@ func (r *run) startGroup(ctx context.Context, g *group, n *int, total int) error
 			standalone = append(standalone, it)
 		}
 	}
-	for _, it := range dependencyOrder(standalone, r.nameOfOld) {
+	for _, it := range dependencyOrder(standalone, (*citem).name, func(it *citem) []string { return containerDeps(it.c, r.nameOfOld) }) {
 		r.in("c:" + it.m.Name)
 		*n++
 		r.Screen.Count("启动容器", *n, total, it.m.Name)
@@ -1500,7 +1518,7 @@ func (r *run) startProject(ctx context.Context, p bundle.Project) error {
 			it.newID = created[i].ID
 		}
 	}
-	var start []string
+	allRunning := true
 	for _, it := range members {
 		if err := r.transplantAnonymous(ctx, it, it.newID); err != nil {
 			return err
@@ -1508,25 +1526,41 @@ func (r *run) startProject(ctx context.Context, p bundle.Project) error {
 		if err := r.applyChanges(ctx, it); err != nil {
 			return err
 		}
-		if it.running() {
-			start = append(start, it.m.Service)
-		}
+		allRunning = allRunning && it.running()
 	}
-	if len(start) > 0 {
-		if err := r.tool.Exec(ctx, cp, r.Log.Printf, append([]string{"start"}, uniq(start)...)...); err != nil {
+	// 每个容器恢复成旧服务器上的状态。docker compose start 会把一个服务的全部容器、连同它
+	// 依赖的服务一起启动，所以只有原来全部在运行时才交给它；有停着的容器（例如同一个服务
+	// 一个副本在运行、一个停着）时，按依赖顺序逐个服务启动原来在运行的容器，等它们就绪
+	// 再启动依赖它们的服务。
+	if allRunning && len(services) > 0 {
+		if err := r.tool.Exec(ctx, cp, r.Log.Printf, append([]string{"start"}, services...)...); err != nil {
 			return err
 		}
 	}
-	for _, it := range members {
-		if !it.running() {
-			continue
+	order := dependencyOrder(services, func(svc string) string { return svc }, func(svc string) []string { return configured[svc].Needs() })
+	for _, svc := range order {
+		var up []*citem
+		for _, it := range replicas(members, svc) {
+			if it.running() {
+				up = append(up, it)
+			}
 		}
-		if err := r.waitReady(ctx, it.m.Name, it.newID); err != nil {
-			return err
+		for _, it := range up {
+			if allRunning {
+				break // 上面 docker compose start 已经启动了
+			}
+			if err := r.Docker.StartContainer(ctx, it.newID); err != nil {
+				return fmt.Errorf("没能启动 %s：%v", it.m.Name, err)
+			}
 		}
-		if it.c.State.Paused {
-			if err := r.Docker.PauseContainer(ctx, it.newID); err != nil {
-				return fmt.Errorf("没能把 %s 恢复成暂停状态：%v", it.m.Name, err)
+		for _, it := range up {
+			if err := r.waitReady(ctx, it.m.Name, it.newID); err != nil {
+				return err
+			}
+			if it.c.State.Paused {
+				if err := r.Docker.PauseContainer(ctx, it.newID); err != nil {
+					return fmt.Errorf("没能把 %s 恢复成暂停状态：%v", it.m.Name, err)
+				}
 			}
 		}
 	}
@@ -1702,8 +1736,11 @@ func (r *run) rollback(ctx context.Context) {
 	}
 }
 
+// lockPath 是迁入任务的锁：同一台服务器上同时只能有一个迁入。
+func lockPath(home string) string { return filepath.Join(home, "locks", "in.lock") }
+
 func (r *run) cleanHelpers(ctx context.Context) {
-	removeHelpers(ctx, r.Docker)
+	helper.Clean(ctx, r.Docker, lockPath(r.Home))
 }
 
 // cleanFiles 删除工作文件：成功时全部删除（--keep-files 时保留）；失败时只删
@@ -1722,7 +1759,9 @@ func (r *run) cleanFiles(success bool) {
 			r.Screen.Warn("临时文件没能删除，请手动删除：%s", r.workdir)
 		}
 	}
-	removeHelpers(context.Background(), r.Docker)
+	if !r.opts.CheckOnly { // 只检查时不改动 Docker
+		r.cleanHelpers(context.Background())
+	}
 }
 
 func (r *run) report(ctx context.Context, err error) error {
@@ -1885,11 +1924,11 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 	if list, err := r.Docker.Containers(ctx, true); err == nil && len(list) > 0 {
 		img = list[0].Image
 	}
-	helper := ""
+	helperBin := ""
 	if r.Docker.Local() {
-		helper, _ = prepareHelper(r.Home)
+		helperBin, _ = prepareHelper(r.Home)
 	}
-	r.undo.vio = &volumeIO{dc: r.Docker, image: img, helperBin: helper}
+	r.undo.vio = &volumeIO{dc: r.Docker, image: img, helperBin: helperBin, lock: lockPath(r.Home)}
 	if committed(entries) {
 		if left := r.undo.cleanupCommitted(ctx, entries); len(left) > 0 {
 			s.Warn("上次迁入已经完成，但有些回滚资料没能删除：%s", strings.Join(left, "；"))
@@ -1935,6 +1974,6 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 		return fail(s, "上次迁入的内容没能全部删除", "", "回滚资料在 "+r.rbDir+"，请人工处理后删除这个目录")
 	}
 	s.Info("已删除上次迁入的内容，回到了上次迁入之前的样子")
-	removeHelpers(ctx, r.Docker)
+	r.cleanHelpers(ctx)
 	return os.RemoveAll(r.rbDir)
 }

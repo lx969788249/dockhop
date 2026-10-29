@@ -1,8 +1,10 @@
 package restore
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -16,7 +18,12 @@ import (
 	"testing"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
+	"github.com/lx969788249/dockhop/internal/compose"
+	"github.com/lx969788249/dockhop/internal/crypto"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/host"
+	"github.com/lx969788249/dockhop/internal/logging"
+	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -283,5 +290,350 @@ func TestRollbackKeepsDataWhenWriterWontStop(t *testing.T) {
 	}
 	if issues := strings.Join(r.rollbackIssues, "；"); !strings.Contains(issues, "没能停下") || !strings.Contains(issues, "没有动数据") {
 		t.Errorf("应说明为什么没动数据：%s", issues)
+	}
+}
+
+// 迁入的容器启动失败时，它最后的输出会写进日志、接在报错后面。输出里带着环境变量里的
+// 连接串时，两处都要隐藏（报错会显示在结果里，用户可能整段复制去求助）。
+func TestStartupFailureHidesEnvSecrets(t *testing.T) {
+	const secret = "postgres://app:only-for-test@db/app"
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		switch req.URL.Path {
+		case "/v1.44/containers/json":
+			io.WriteString(w, `[]`)
+		case "/v1.44/containers/new-web/json":
+			io.WriteString(w, `{"Id":"new-web","Name":"/web","State":{"Status":"exited"}}`)
+		case "/v1.44/containers/new-web/logs":
+			io.WriteString(w, "cannot connect using "+secret)
+		default:
+			return false
+		}
+		return true
+	})
+	root := t.TempDir()
+	data := filepath.Join(root, "data")
+	os.MkdirAll(filepath.Join(data, "containers"), 0o700)
+	os.WriteFile(filepath.Join(data, "containers", "web.json"),
+		[]byte(`{"Id":"old-web","Name":"/web","Config":{"Image":"alpine","Env":["DATABASE_URL=`+secret+`"]}}`), 0o600)
+	rd := &logging.Redactor{}
+	log, err := logging.Open(filepath.Join(root, "logs"), "in", rd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Finish(false, true)
+	var out bytes.Buffer
+	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: rd, Home: root, Getenv: func(string) string { return "" }},
+		dataDir: data, rbDir: filepath.Join(root, "rollback"), undo: &undo{}, anonVolumes: map[string]bundle.Volume{},
+		m: &bundle.Manifest{Containers: []bundle.Container{{Name: "web", Image: "alpine", State: "running"}}}}
+	if err := r.prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer r.j.close()
+	readyErr := r.waitReady(context.Background(), "web", "new-web")
+	if readyErr == nil || !strings.Contains(readyErr.Error(), "cannot connect using") {
+		t.Fatalf("报错里应带着容器最后的输出：%v", readyErr)
+	}
+	logText, _ := os.ReadFile(log.Path())
+	if strings.Contains(readyErr.Error(), "only-for-test") || strings.Contains(string(logText), "only-for-test") {
+		t.Fatalf("连接串没有隐藏：报错 %q\n日志 %s", readyErr, logText)
+	}
+}
+
+// 上次回滚已经重建、启动了原来的 Compose 容器（新的 ID），之后又中断了。再次回滚时，要先
+// 按名字找到它、停下，再放回数据；停不下来时不能动数据。
+func TestRollbackStopsRebuiltOldCompose(t *testing.T) {
+	for _, stopOK := range []bool{true, false} {
+		running, clearedWhileRunning, cleared := true, false, false
+		dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+			p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+			switch {
+			case p == "/volumes/data":
+				io.WriteString(w, `{"Name":"data","Driver":"local"}`)
+			case p == "/containers/old-app/json":
+				http.Error(w, `{"message":"No such container"}`, 404)
+			case p == "/containers/stack-app-1/json":
+				io.WriteString(w, `{"Id":"rebuilt-app","Name":"/stack-app-1","State":{"Running":`+strconv.FormatBool(running)+`}}`)
+			case p == "/containers/rebuilt-app/stop":
+				if !stopOK {
+					return false
+				}
+				running = false
+				w.WriteHeader(204)
+			case strings.HasPrefix(p, "/images/"):
+				io.WriteString(w, `{"Id":"sha256:original"}`)
+			case p == "/containers/create":
+				if strings.HasPrefix(req.URL.Query().Get("name"), "dockhop-helper-") {
+					io.WriteString(w, `{"Id":"helper"}`)
+				} else {
+					io.WriteString(w, `{"Id":"rebuilt-again"}`)
+				}
+			case p == "/containers/helper/start":
+				cleared = true
+				clearedWhileRunning = clearedWhileRunning || running
+				w.WriteHeader(204)
+			case p == "/containers/helper/wait":
+				io.WriteString(w, `{"StatusCode":0}`)
+			case p == "/containers/helper/archive":
+				io.Copy(io.Discard, req.Body)
+			case p == "/containers/rebuilt-again/json":
+				io.WriteString(w, `{"Id":"rebuilt-again","State":{"Running":false}}`)
+			case req.Method == "DELETE", p == "/containers/rebuilt-again/start":
+				w.WriteHeader(204)
+			default:
+				return false
+			}
+			return true
+		})
+		backup := filepath.Join(t.TempDir(), "data.tar")
+		f, _ := os.Create(backup)
+		tw := tar.NewWriter(f)
+		tw.WriteHeader(&tar.Header{Name: "dockhop-data/", Typeflag: tar.TypeDir, Mode: 0o755})
+		tw.Close()
+		f.Close()
+		var out bytes.Buffer
+		u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+			vio: &volumeIO{dc: dc, image: "alpine", helperBin: "/unused"}}
+		problems := u.rollback(context.Background(), []Entry{
+			{Op: opComposeOld, Name: "stack", Old: []OldContainer{{ID: "old-app", Name: "stack-app-1", State: "running",
+				Raw: json.RawMessage(`{"Id":"old-app","Name":"/stack-app-1","Image":"sha256:original","Config":{"Image":"alpine"},"HostConfig":{}}`)}}},
+			{Op: opVolume, Name: "data", Existed: true, Backup: backup},
+		})
+		switch {
+		case clearedWhileRunning:
+			t.Fatalf("stopOK=%v：重建过的原容器还在运行，就放回了数据卷", stopOK)
+		case stopOK && (len(problems) > 0 || !cleared):
+			t.Fatalf("应该停下它、放回数据、再重建：%v", problems)
+		case !stopOK && (cleared || len(problems) == 0):
+			t.Fatalf("停不下来时不能动数据，要报告：cleared=%v %v", cleared, problems)
+		}
+	}
+}
+
+// 原来的 Compose 项目里，sidecar 借用 vpn 的网络（container:<vpn 的 ID>）。两个都删除后
+// 回滚重建：vpn 要先建，sidecar 要改为按名字引用它（旧 ID 已经不存在了）。
+func TestRollbackOldComposeNamespace(t *testing.T) {
+	vpnID, sideID := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	var created []string
+	sideMode := ""
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		switch {
+		case strings.HasPrefix(p, "/images/"):
+			io.WriteString(w, `{"Id":"sha256:original"}`)
+		case req.Method == "GET" && strings.HasPrefix(p, "/containers/"):
+			http.Error(w, `{"message":"No such container"}`, 404)
+		case p == "/containers/create":
+			var body struct{ HostConfig struct{ NetworkMode string } }
+			json.NewDecoder(req.Body).Decode(&body)
+			name := req.URL.Query().Get("name")
+			created = append(created, name)
+			if name == "stack-sidecar-1" {
+				sideMode = body.HostConfig.NetworkMode
+			}
+			io.WriteString(w, `{"Id":"new-`+name+`"}`)
+		default:
+			return false
+		}
+		return true
+	})
+	raw := func(id, name, mode string) json.RawMessage {
+		b, _ := json.Marshal(map[string]any{"Id": id, "Name": "/" + name, "Image": "sha256:original",
+			"Config": map[string]any{"Image": "alpine"}, "HostConfig": map[string]any{"NetworkMode": mode}})
+		return b
+	}
+	var out bytes.Buffer
+	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+	// 原来是停着的：只重建，不启动。sidecar 排在前面，检查重建的顺序。
+	u.rollback(context.Background(), []Entry{{Op: opComposeOld, Name: "stack", Old: []OldContainer{
+		{ID: sideID, Name: "stack-sidecar-1", State: "exited", Raw: raw(sideID, "stack-sidecar-1", "container:"+vpnID)},
+		{ID: vpnID, Name: "stack-vpn-1", State: "exited", Raw: raw(vpnID, "stack-vpn-1", "bridge")},
+	}}})
+	if strings.Join(created, ",") != "stack-vpn-1,stack-sidecar-1" || sideMode != "container:stack-vpn-1" {
+		t.Fatalf("重建顺序 %v，sidecar 的网络 %q", created, sideMode)
+	}
+}
+
+// prepareWith 用要写入目录 shared 的容器 new-app（和一个不用数据的 kept）调用 prepare。新服务器
+// 上的已有容器由 handle 回答（shared 是那个目录的完整路径）。返回屏幕上的输出（prepare 失败时
+// 有原因）和停过的容器。
+func prepareWith(t *testing.T, d preflight.Decisions, handle func(w http.ResponseWriter, p, shared string) bool) (string, []string) {
+	t.Helper()
+	home := t.TempDir()
+	shared := filepath.Join(home, "shared")
+	var stopped []string
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		if strings.HasSuffix(p, "/stop") {
+			stopped = append(stopped, p)
+			w.WriteHeader(204)
+			return true
+		}
+		return handle(w, p, shared)
+	})
+	data := filepath.Join(home, "unpacked")
+	os.MkdirAll(filepath.Join(data, "containers"), 0o700)
+	os.WriteFile(filepath.Join(data, "containers", "new-app.json"),
+		[]byte(`{"Id":"source","Name":"/new-app","Config":{"Image":"alpine"},"Mounts":[{"Type":"bind","Source":"`+shared+`","Destination":"/data"}]}`), 0o600)
+	os.WriteFile(filepath.Join(data, "containers", "kept.json"), []byte(`{"Id":"source-kept","Name":"/kept","Config":{"Image":"alpine"}}`), 0o600)
+	var out bytes.Buffer
+	screen := ui.New(&out, false, nil)
+	r := &run{Deps: Deps{Docker: dc, Home: home, Screen: screen, Getenv: func(string) string { return "" }}, d: d,
+		m:       &bundle.Manifest{Containers: []bundle.Container{{Name: "kept"}, {Name: "new-app"}}, Binds: []bundle.Bind{{Path: shared}}},
+		dataDir: data, rbDir: filepath.Join(home, "rollback", "current"), anonVolumes: map[string]bundle.Volume{},
+		undo: &undo{dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
+	err := r.prepare(context.Background())
+	if r.j != nil {
+		r.j.close()
+	}
+	if err == nil {
+		return "", stopped
+	}
+	return out.String(), stopped
+}
+
+// 选择保留的已有容器（停着的也算）和要迁入的容器共用目录：不能覆盖它的数据，改动之前停下。
+func TestPrepareProtectsKeptData(t *testing.T) {
+	failed, stopped := prepareWith(t, preflight.Decisions{SkipContainers: []string{"kept"}}, func(w http.ResponseWriter, p, shared string) bool {
+		switch p {
+		case "/containers/json":
+			io.WriteString(w, `[{"Id":"kept-id","Names":["/kept"],"State":"exited"}]`)
+		case "/containers/kept-id/json":
+			io.WriteString(w, `{"Id":"kept-id","Name":"/kept","Mounts":[{"Type":"bind","Source":"`+shared+`"}]}`)
+		default:
+			return false
+		}
+		return true
+	})
+	if !strings.Contains(failed, "保留的已有容器 kept") || len(stopped) > 0 {
+		t.Fatalf("应在改动之前停下：%q，停过 %v", failed, stopped)
+	}
+}
+
+// 正在运行的已有容器读不到配置：没法确认它有没有在用要写入的数据，不能继续；
+// Docker 明确说容器不存在（刚好被删掉）时照常继续。
+func TestPrepareUnreadableContainer(t *testing.T) {
+	for _, code := range []int{500, 404} {
+		failed, _ := prepareWith(t, preflight.Decisions{}, func(w http.ResponseWriter, p, _ string) bool {
+			switch p {
+			case "/containers/json":
+				io.WriteString(w, `[{"Id":"other-id","Names":["/other"],"State":"running"}]`)
+			case "/containers/other-id/json":
+				http.Error(w, `{"message":"读不到"}`, code)
+			default:
+				return false
+			}
+			return true
+		})
+		if strings.Contains(failed, "没法确认它有没有在用") != (code == 500) || code == 404 && failed != "" {
+			t.Errorf("Docker 回答 %d 时：%q", code, failed)
+		}
+	}
+}
+
+// 同一个服务一个副本在运行、一个停着：docker compose start web 会把两个都启动，所以要按
+// 容器只启动原来在运行的那个；它依赖的 db 先启动、就绪后再启动它。
+func TestStartProjectKeepsReplicaStates(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, "bin")
+	os.MkdirAll(bin, 0o700)
+	cmdlog := filepath.Join(home, "compose.log")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_COMPOSE_LOG", cmdlog)
+	os.WriteFile(filepath.Join(bin, "docker"), []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_COMPOSE_LOG"
+case " $* " in
+ *" version "*) echo 2.38.0 ;;
+ *" config "*) echo '{"services":{"web":{"image":"alpine","scale":2,"depends_on":{"db":{"condition":"service_healthy"}}},"db":{"image":"alpine"}}}' ;;
+esac
+`), 0o700)
+	tool, err := compose.Detect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var started []string
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		switch {
+		case p == "/networks":
+			io.WriteString(w, `[]`)
+		case p == "/containers/json":
+			io.WriteString(w, `[{"Id":"new-web-1","Labels":{"com.docker.compose.service":"web","com.docker.compose.container-number":"1"}},`+
+				`{"Id":"new-web-2","Labels":{"com.docker.compose.service":"web","com.docker.compose.container-number":"2"}},`+
+				`{"Id":"new-db-1","Labels":{"com.docker.compose.service":"db","com.docker.compose.container-number":"1"}}]`)
+		case strings.HasSuffix(p, "/start"):
+			mu.Lock()
+			started = append(started, strings.TrimSuffix(strings.TrimPrefix(p, "/containers/"), "/start"))
+			mu.Unlock()
+			w.WriteHeader(204)
+		case strings.HasSuffix(p, "/json"):
+			io.WriteString(w, `{"Id":"x","State":{"Status":"running","Running":true},"Config":{"Image":"alpine"}}`)
+		default:
+			return false
+		}
+		return true
+	})
+	member := func(name, svc, number string, running bool) *citem {
+		c := &docker.Container{}
+		c.Config.Image = "alpine"
+		c.Config.Labels = map[string]string{"com.docker.compose.container-number": number}
+		c.State.Running = running
+		return &citem{m: bundle.Container{Name: name, Project: "stack", Service: svc}, c: c}
+	}
+	j, err := openJournal(filepath.Join(home, "rollback"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.close()
+	var out bytes.Buffer
+	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: home, Getenv: func(k string) string {
+		if k == "DOCKHOP_TEST_STARTUP_GRACE" {
+			return "0s"
+		}
+		return ""
+	}}, tool: tool, j: j, workdir: home, items: []*citem{
+		member("stack-web-1", "web", "1", true), member("stack-web-2", "web", "2", false), member("stack-db-1", "db", "1", true)}}
+	if err := r.startProject(context.Background(), bundle.Project{Name: "stack", WorkingDir: home}); err != nil {
+		t.Fatal(err)
+	}
+	log, _ := os.ReadFile(cmdlog)
+	if strings.Join(started, ",") != "new-db-1,new-web-1" || strings.Contains(string(log), " start") {
+		t.Fatalf("启动了 %v；compose 命令：\n%s", started, log)
+	}
+}
+
+// 迁出正在运行（拿着 out.lock）时，它的临时容器在读数据卷：迁入（包括只检查）不能把它
+// 当作遗留的删掉。这里是老版本的临时容器（没记是谁的）；只检查时根本不动 Docker。
+func TestRestoreKeepsRunningExportHelper(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // 不调用这台机器上真的 docker compose
+	for _, checkOnly := range []bool{false, true} {
+		home := t.TempDir()
+		lock, err := host.TryLock(filepath.Join(home, "locks", "out.lock"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var deleted []string
+		dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+			switch {
+			case strings.HasSuffix(req.URL.Path, "/containers/json"):
+				io.WriteString(w, `[{"Id":"export-helper","Names":["/dockhop-helper-x-1"],"Labels":{"dockhop.helper":"1"}}]`)
+			case req.Method == http.MethodDelete:
+				deleted = append(deleted, req.URL.Path)
+				w.WriteHeader(204)
+			default:
+				return false
+			}
+			return true
+		})
+		link, _ := crypto.NewLink("127.0.0.1", 1)
+		file := filepath.Join(home, "broken.bundle")
+		os.WriteFile(file, []byte("不是迁移包"), 0o600)
+		var out bytes.Buffer
+		Run(context.Background(), Deps{Docker: dc, Home: home, Screen: ui.New(&out, false, nil), Prompt: ui.NewPrompter(nil, &out),
+			Getenv: func(string) string { return "" }}, Options{Link: link, File: file, CheckOnly: checkOnly})
+		lock.Unlock()
+		if len(deleted) > 0 {
+			t.Errorf("checkOnly=%v：删除了 %v", checkOnly, deleted)
+		}
 	}
 }

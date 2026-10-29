@@ -16,12 +16,10 @@ import (
 	"syscall"
 
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/helper"
 	"github.com/lx969788249/dockhop/internal/spec"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
-
-// helperLabel 标记 DockHop 创建的临时容器，程序被中断后可以据此清理。
-const helperLabel = "dockhop.helper"
 
 // stopWaves 把要停的容器分批：依赖别人的容器（借用网络等）在前面的批次，被依赖的
 // 在后面；同一批里的容器同时停止，停机时间取决于最慢的一个，而不是全部加起来。
@@ -200,11 +198,11 @@ func changesStream(ctx context.Context, dc *docker.Client, id string, paths []st
 // openVolume 读出卷里的全部内容（tar 流，路径以 dockhop-data/ 开头）。用迁移涉及的
 // 镜像创建一个不启动的临时容器挂载这个卷，通过 Docker 接口读取；不需要额外的镜像，
 // 也不需要联网。close 会删掉临时容器。
-func openVolume(ctx context.Context, dc *docker.Client, v *volumeInfo, name string) (io.ReadCloser, error) {
+func openVolume(ctx context.Context, dc *docker.Client, v *volumeInfo, name, lock string) (io.ReadCloser, error) {
 	spec := map[string]any{
 		"Image":      v.imageID,
 		"Entrypoint": []string{"/dockhop-helper-never-started"},
-		"Labels":     map[string]string{helperLabel: "1"},
+		"Labels":     helper.Labels(lock),
 		"HostConfig": map[string]any{
 			"NetworkMode": "none",
 			"Mounts":      []map[string]any{{"Type": "volume", "Source": v.name, "Target": "/dockhop-data", "ReadOnly": true}},
@@ -362,17 +360,4 @@ type zeroReader struct{}
 func (zeroReader) Read(p []byte) (int, error) {
 	clear(p)
 	return len(p), nil
-}
-
-// removeHelpers 删除上次被中断时留下的临时容器。
-func removeHelpers(ctx context.Context, dc *docker.Client) {
-	list, err := dc.Containers(ctx, true)
-	if err != nil {
-		return
-	}
-	for _, c := range list {
-		if c.Labels[helperLabel] == "1" {
-			_ = dc.RemoveContainerAndVolumes(ctx, c.ID)
-		}
-	}
 }

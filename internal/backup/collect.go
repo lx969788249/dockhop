@@ -13,6 +13,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/spec"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -128,7 +129,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 	images := map[string]int64{}
 	for i, it := range sel.items {
 		screen.Count("读取容器配置", i+1, len(sel.items), it.name())
-		out.secrets = append(out.secrets, spec.SecretEnvValues(it.c.Config.Env)...)
+		out.secrets = append(out.secrets, logging.EnvSecrets(it.c.Config.Env)...)
 		if _, ok := images[it.c.Image]; !ok {
 			size := int64(0)
 			if img, err := dc.InspectImage(ctx, it.c.Image); err == nil {
@@ -277,13 +278,18 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 			p.dirBytes, p.skipped = treeSize(u.workingDir, p.excludes, bigFileLimit)
 		}
 		cp := compose.Project{Name: u.project, WorkingDir: u.workingDir, Files: u.files}
-		for _, r := range compose.DeclaredFiles(cp) {
+		files, unknown := compose.DeclaredFiles(cp)
+		for _, r := range files {
 			if spec.IsSystemPath(r) {
 				continue
 			}
 			p.outside = append(p.outside, r)
 			size, _ := treeSize(r, nil, 0)
 			p.outBytes += size
+		}
+		if len(unknown) > 0 {
+			screen.Warn("Compose 项目 %s 的配置里有带变量的路径（%s），没法确定是哪个文件，不会一起迁移；迁入后请确认新服务器上有这些文件",
+				u.project, ui.Names(unknown))
 		}
 		if tool != nil {
 			if services, err := tool.Services(ctx, cp); err != nil {
@@ -301,6 +307,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 	}
 
 	// 没选中但正在运行、和选中的容器共用数据的容器：打包时也要临时停止，否则数据不一致。
+	// 菜单里不能选的容器（docker compose run 的临时容器等）也算。
 	selected := map[*item]bool{}
 	for _, it := range sel.items {
 		selected[it] = true
@@ -309,33 +316,40 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 	for it := range selected {
 		stopping[it] = true
 	}
-	for _, u := range inv.units {
-		for _, it := range u.items {
-			if selected[it] || !it.c.State.Running || ignore[it.name()] {
-				continue
-			}
-			if sharesData(it, vols, out.binds) {
-				out.shared = append(out.shared, it)
-				stopping[it] = true
-			}
+	share := func(it *item) error {
+		if spec.IsSwarmTask(it.c.Config.Labels) {
+			// Swarm 会马上重新创建停掉的容器，停不住。
+			svc := it.c.Config.Labels[labelSwarmService]
+			return fail(screen, fmt.Sprintf("容器 %s 属于 Swarm 服务 %s，和选中的容器共用数据，但它一停就会被 Swarm 重新启动，打包的数据没法保证一致，已取消（什么都没有改动）", it.name(), svc),
+				"", "先执行 docker service scale "+svc+"=0，迁出后再改回原来的个数")
+		}
+		out.shared = append(out.shared, it)
+		stopping[it] = true
+		return nil
+	}
+	for _, it := range inv.all {
+		if selected[it] || !it.c.State.Running || ignore[it.name()] || !sharesData(it, vols, out.binds) {
+			continue
+		}
+		if err := share(it); err != nil {
+			return nil, err
 		}
 	}
 	// 借用要停止的容器的网络、进程空间的容器（如 VPN 的 sidecar）：被借用的容器
 	// 一停，它们就断了，重启后也不会自己接回去，所以一起临时停止、再一起恢复。
 	for changed := true; changed; {
 		changed = false
-		for _, u := range inv.units {
-			for _, it := range u.items {
-				if stopping[it] || !it.c.State.Running || ignore[it.name()] {
-					continue
-				}
-				for _, ref := range spec.Dependencies(it.c) {
-					if dep := inv.lookup(ref); dep != nil && stopping[dep] {
-						out.shared = append(out.shared, it)
-						stopping[it] = true
-						changed = true
-						break
+		for _, it := range inv.all {
+			if stopping[it] || !it.c.State.Running || ignore[it.name()] {
+				continue
+			}
+			for _, ref := range spec.Dependencies(it.c) {
+				if dep := inv.lookup(ref); dep != nil && stopping[dep] {
+					if err := share(it); err != nil {
+						return nil, err
 					}
+					changed = true
+					break
 				}
 			}
 		}

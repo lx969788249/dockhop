@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
+	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/spec"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -287,7 +288,6 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 	res.NeedBytes = diskIssues(plan, t, d, o, usedVolumes, usedBinds, addIssue)
 
 	// ---------- 已有的同名容器、Compose 项目、数据卷 ----------
-	existingTargets := 0
 	for _, c := range containers {
 		if c.Project != "" {
 			continue
@@ -296,7 +296,6 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		if !ok {
 			continue
 		}
-		existingTargets++
 		if has(d.ReplaceContainers, c.Name) {
 			continue
 		}
@@ -325,7 +324,6 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		if !t.Projects[p] {
 			continue
 		}
-		existingTargets++
 		if has(d.ReplaceProjects, p) {
 			continue
 		}
@@ -345,11 +343,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 				Title: "新服务器上已经有同名的 Compose 项目 " + p})
 		}
 	}
-	if o.Existing == "skip" && existingTargets > 0 && (len(plan.Volumes) > 0 || len(plan.Binds) > 0) {
-		addIssue(Issue{Level: Stop, Kind: "skip_with_data",
-			Title: "--existing skip 时无法判断共用的数据属于谁；迁移包里有数据卷或目录，为了不覆盖已有数据，已停止",
-			Hint:  "改用 --existing replace（失败时放回原来的），或者先处理新服务器上的同名服务"})
-	}
+	keptDataIssues(plan, t, d, o, addIssue)
 	for _, v := range plan.Volumes {
 		if !usedVolumes[v.Name] || d.KeepVolume(v.Name) || spec.IsAnonymousVolume(v.Name) {
 			continue
@@ -383,6 +377,98 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		}
 	}
 	return res
+}
+
+// keptDataIssues 找出和保留下来的已有服务共用数据的容器。保留的服务（检查时选择了保留，
+// 或者 --existing skip）不迁入，但共用数据的其他容器迁入时会写入它的卷和目录，等于没保住
+// 它的数据。保留的服务用到的数据按新服务器上它实际挂载的、加上旧服务器上同名服务挂载的算。
+func keptDataIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, addIssue func(Issue)) {
+	keptProject := func(p string) bool { return t.Projects[p] && (has(d.SkipProjects, p) || o.Existing == "skip") }
+	keptContainer := func(name string) bool {
+		_, ok := t.Containers[name]
+		return ok && (has(d.SkipContainers, name) || o.Existing == "skip")
+	}
+	kept := func(c bundle.PlanContainer) bool {
+		if c.Project != "" {
+			return keptProject(c.Project)
+		}
+		return keptContainer(c.Name)
+	}
+	planProjects := map[string]bool{}
+	standalone := map[string]bool{}
+	for _, c := range plan.Containers {
+		if c.Project != "" {
+			planProjects[c.Project] = true
+		} else {
+			standalone[c.Name] = true
+		}
+	}
+	type owner struct{ path, who string }
+	keptVolumes := map[string]string{} // 卷名 → 谁在用
+	var keptBinds []owner
+	use := func(who string, vols, binds []string) {
+		for _, v := range vols {
+			if !spec.IsAnonymousVolume(v) {
+				keptVolumes[v] = who
+			}
+		}
+		for _, b := range binds {
+			if !spec.IsSystemPath(b) {
+				keptBinds = append(keptBinds, owner{normalize(b), who})
+			}
+		}
+	}
+	for _, c := range plan.Containers {
+		if kept(c) {
+			use(unitName(c), c.Volumes, c.Binds)
+		}
+	}
+	for name, tc := range t.Containers {
+		switch {
+		case tc.Project != "" && planProjects[tc.Project] && keptProject(tc.Project):
+			use("Compose 项目 "+tc.Project, tc.Volumes, tc.Binds)
+		case tc.Project == "" && standalone[name] && keptContainer(name):
+			use("容器 "+name, tc.Volumes, tc.Binds)
+		}
+	}
+	// shared 返回容器 c 要写入的数据里，保留的服务也在用的第一份。
+	shared := func(c bundle.PlanContainer) (who, what string) {
+		for _, v := range c.Volumes {
+			if w, ok := keptVolumes[v]; ok && !d.KeepVolume(v) {
+				return w, "数据卷 " + v
+			}
+		}
+		for _, b := range c.Binds {
+			for _, k := range keptBinds {
+				if !spec.IsSystemPath(b) && spec.PathsOverlap(normalize(b), k.path) {
+					return k.who, "目录 " + b
+				}
+			}
+		}
+		return "", ""
+	}
+	reported := map[string]bool{}
+	for _, c := range plan.Containers {
+		if d.SkippedContainer(c) || kept(c) || reported[unitName(c)] {
+			continue
+		}
+		who, what := shared(c)
+		if who == "" {
+			continue
+		}
+		reported[unitName(c)] = true
+		addIssue(Issue{Level: Ask, Kind: "skip_with_data", Container: c.Name, Project: c.Project,
+			Title: fmt.Sprintf("%s 和保留的%s 共用%s，迁入会覆盖%s 正在用的数据", unitName(c), who, what, who),
+			Hint:  "把共用数据的服务一起跳过，或者替换保留的服务"})
+	}
+}
+
+// unitName 是迁移时的单位：Compose 项目里的容器跟着项目走。
+func unitName(c bundle.PlanContainer) string {
+	if c.Project != "" {
+		return "Compose 项目 " + c.Project
+	}
+	return "容器 " + c.Name
 }
 
 func diskIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, usedVolumes, usedBinds map[string]bool, addIssue func(Issue)) int64 {
@@ -458,10 +544,24 @@ func networkIssues(plan *bundle.Plan, t *Target, d *Decisions, containers []bund
 		if d.ReuseExisting(n.Name) || d.AutoSubnetFor(n.Name) {
 			continue
 		}
+		// 处理这两种问题要让网络里的容器改为自动分配 IP。Compose 项目的固定 IP 写在用户自己的
+		// 配置文件里，迁入时不会去改，所以对它们不提供这个做法，只能处理后重查或者跳过项目。
+		netIssue := func(kind, problem string) {
+			for _, c := range containers {
+				for _, cn := range c.Networks {
+					if cn.Name == n.Name && cn.IP != "" && c.Project != "" {
+						addIssue(Issue{Level: Ask, Kind: kind, Network: n.Name, Container: c.Name, Project: c.Project,
+							Title: fmt.Sprintf("%s；Compose 项目 %s 的容器 %s 在这个网络里用固定 IP %s", problem, c.Project, c.Name, cn.IP),
+							Hint:  "在新服务器上处理好这个网络，或者修改 " + c.Project + " 配置文件里的固定 IP 后重新运行"})
+						return
+					}
+				}
+			}
+			addIssue(Issue{Level: Ask, Kind: kind, Network: n.Name, Title: problem})
+		}
 		if have, ok := t.Networks[n.Name]; ok {
 			if !sameSet(have.Subnets, n.Subnets) || driverOf(have.Driver) != driverOf(n.Driver) {
-				addIssue(Issue{Level: Ask, Kind: "network_mismatch", Network: n.Name,
-					Title: fmt.Sprintf("新服务器已有同名网络 %s，但网段不同（旧服务器 %s，新服务器 %s）", n.Name, joinOr(n.Subnets, "自动"), joinOr(have.Subnets, "自动"))})
+				netIssue("network_mismatch", fmt.Sprintf("新服务器已有同名网络 %s，但网段不同（旧服务器 %s，新服务器 %s）", n.Name, joinOr(n.Subnets, "自动"), joinOr(have.Subnets, "自动")))
 			}
 			continue
 		}
@@ -479,8 +579,7 @@ func networkIssues(plan *bundle.Plan, t *Target, d *Decisions, containers []bund
 				}
 			}
 			if clash != "" {
-				addIssue(Issue{Level: Ask, Kind: "subnet_conflict", Network: n.Name,
-					Title: fmt.Sprintf("网络 %s 要用的网段 %s 和新服务器上的网络 %s 重叠", n.Name, s, clash)})
+				netIssue("subnet_conflict", fmt.Sprintf("网络 %s 要用的网段 %s 和新服务器上的网络 %s 重叠", n.Name, s, clash))
 				break
 			}
 		}
@@ -509,12 +608,33 @@ func sameAddress(a, b string) bool { return wildcard[a] || wildcard[b] || a == b
 type binding struct{ ip, container string }
 
 func portIssues(t *Target, d *Decisions, containers []bundle.PlanContainer, planNames map[string]bool, o Options, addIssue func(Issue)) {
-	busy := map[string]bool{}
+	// 推荐的空闲端口要避开：新服务器上已被占用的、迁移包里的容器要用的，以及这一轮已经推荐
+	// 给别的容器的（suggest 选中时记进来），否则一次接受几个推荐（--yes）时会互相冲突。
+	taken := map[string]bool{}
 	for _, l := range t.Listeners {
-		busy[l.Proto+"/"+strconv.Itoa(l.Port)] = true
+		taken[l.Proto+"/"+strconv.Itoa(l.Port)] = true
 	}
 	for _, p := range t.DockerPorts {
-		busy[p.Proto+"/"+p.Port] = true
+		taken[p.Proto+"/"+p.Port] = true
+	}
+	planProjects := map[string]bool{}
+	for _, c := range containers {
+		planProjects[c.Project] = true
+		for _, p := range c.Ports {
+			if ch := d.currentPort(portRef(c, p)); !ch.Drop {
+				taken[p.Proto+"/"+ch.NewPort] = true
+			}
+		}
+	}
+	// 迁入前会停下、删除的已有容器（被替换的同名容器，同名 Compose 项目的全部容器）让出端口。
+	releases := func(name string) bool {
+		if o.Existing == "skip" {
+			return false
+		}
+		if tc := t.Containers[name]; tc.Project != "" {
+			return planProjects[tc.Project] && !has(d.SkipProjects, tc.Project)
+		}
+		return planNames[name] && !has(d.SkipContainers, name)
 	}
 	requested := map[string][]binding{} // 协议/端口 → 迁移包里要用它的容器
 	for _, c := range containers {
@@ -523,14 +643,12 @@ func portIssues(t *Target, d *Decisions, containers []bundle.PlanContainer, plan
 		}
 		stopped := c.State != "running" && c.State != "paused" && c.State != "restarting"
 		for _, p := range c.Ports {
-			ref := PortRef{Container: c.Name, HostIP: p.HostIP, HostPort: p.HostPort, ContainerPort: p.ContainerPort, Proto: p.Proto}
-			ip, port := p.HostIP, p.HostPort
-			if ch, ok := d.PortFor(ref); ok {
-				if ch.Drop {
-					continue
-				}
-				ip, port = ch.NewIP, ch.NewPort
+			ref := portRef(c, p)
+			ch := d.currentPort(ref)
+			if ch.Drop {
+				continue
 			}
+			ip, port := ch.NewIP, ch.NewPort
 			// 端口绑定的具体 IP 在新服务器上不存在（C12）。
 			if !wildcard[ip] && !isLoopback(ip) && t.HostIPs != nil && !t.HostIPs[ip] {
 				addIssue(Issue{Level: Ask, Kind: "host_ip", Container: c.Name, Project: c.Project, Port: &ref,
@@ -544,17 +662,15 @@ func portIssues(t *Target, d *Decisions, containers []bundle.PlanContainer, plan
 			if other := conflicting(requested[key], ip); other != "" {
 				addIssue(Issue{Level: Ask, Kind: "port", Container: c.Name, Project: c.Project, Port: &ref,
 					Title:   fmt.Sprintf("端口 %s 同时被迁移包里的 %s 和%s使用", port, other, who(c)),
-					Suggest: suggest(p.Proto, port, busy, requested)})
+					Suggest: suggest(p.Proto, port, taken)})
 				continue
 			}
 			requested[key] = append(requested[key], binding{ip: ip, container: c.Name})
-			holder, owner := portHolder(t, p.Proto, ip, port)
-			if holder == "" || (owner != "" && planNames[owner] && replaceable(owner, d, t, o)) {
-				continue
+			if holder := portHolder(t, p.Proto, ip, port, releases); holder != "" {
+				addIssue(Issue{Level: Ask, Kind: "port", Container: c.Name, Project: c.Project, Port: &ref,
+					Title:   fmt.Sprintf("端口 %s 已被%s占用，%s需要使用它", port, ui.CJKSpaced(holder), who(c)),
+					Suggest: suggest(p.Proto, port, taken)})
 			}
-			addIssue(Issue{Level: Ask, Kind: "port", Container: c.Name, Project: c.Project, Port: &ref,
-				Title:   fmt.Sprintf("端口 %s 已被%s占用，%s需要使用它", port, ui.CJKSpaced(holder), who(c)),
-				Suggest: suggest(p.Proto, port, busy, requested)})
 		}
 	}
 	if !t.ListenersOK && len(containers) > 0 {
@@ -567,13 +683,8 @@ func portIssues(t *Target, d *Decisions, containers []bundle.PlanContainer, plan
 	}
 }
 
-// replaceable 表示占用端口的同名容器会在迁入时被替换（替换前先停止），不算冲突。
-func replaceable(name string, d *Decisions, t *Target, o Options) bool {
-	tc := t.Containers[name]
-	if tc.Project != "" {
-		return o.Existing != "skip" && !has(d.SkipProjects, tc.Project)
-	}
-	return o.Existing != "skip" && !has(d.SkipContainers, name)
+func portRef(c bundle.PlanContainer, p bundle.PlanPort) PortRef {
+	return PortRef{Container: c.Name, HostIP: p.HostIP, HostPort: p.HostPort, ContainerPort: p.ContainerPort, Proto: p.Proto}
 }
 
 // conflicting 返回迁移包里和这个地址抢同一个端口的容器；没有时为空。
@@ -586,30 +697,43 @@ func conflicting(list []binding, ip string) string {
 	return ""
 }
 
-func portHolder(t *Target, proto, ip, port string) (holder, owner string) {
+// portHolder 返回在这个地址上占着端口、迁入时不会让开的程序；没有时为空。同一个端口可能
+// 被几个容器绑定在不同的地址上，要逐个看：releases 的容器迁入前会停下，不算占用。
+func portHolder(t *Target, proto, ip, port string, releases func(container string) bool) string {
 	for _, p := range t.DockerPorts {
-		if p.Proto == proto && p.Port == port && sameAddress(p.IP, ip) {
-			return "容器 " + p.Container, p.Container
+		if p.Proto == proto && p.Port == port && sameAddress(p.IP, ip) && !releases(p.Container) {
+			return "容器 " + p.Container
 		}
 	}
 	n, _ := strconv.Atoi(port)
 	for _, l := range t.Listeners {
-		if l.Proto == proto && l.Port == n && sameAddress(l.Addr, ip) {
-			return "其他程序", ""
+		if l.Proto == proto && l.Port == n && sameAddress(l.Addr, ip) && !dockerListener(t, l) {
+			return "其他程序"
 		}
 	}
-	return "", ""
+	return ""
 }
 
-// suggest 找一个空闲端口：在任何地址上都没人用的才算，免得换过去又冲突。
-func suggest(proto, port string, busy map[string]bool, requested map[string][]binding) string {
+// dockerListener 表示这个监听是 Docker 为容器开放的端口（docker-proxy），上面已经按容器查过。
+func dockerListener(t *Target, l host.Listener) bool {
+	for _, p := range t.DockerPorts {
+		if p.Proto == l.Proto && p.Port == strconv.Itoa(l.Port) && sameAddress(p.IP, l.Addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// suggest 找一个空闲端口：在任何地址上都没人用、也没推荐给别人的才算，免得换过去又冲突。
+// 选中的记进 taken。
+func suggest(proto, port string, taken map[string]bool) string {
 	n, err := strconv.Atoi(port)
 	if err != nil {
 		return ""
 	}
 	for p := n + 1; p < n+200 && p <= 65535; p++ {
-		k := proto + "/" + strconv.Itoa(p)
-		if !busy[k] && len(requested[k]) == 0 {
+		if k := proto + "/" + strconv.Itoa(p); !taken[k] {
+			taken[k] = true
 			return strconv.Itoa(p)
 		}
 	}

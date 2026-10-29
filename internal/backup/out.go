@@ -21,6 +21,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/crypto"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/helper"
 	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/transfer"
@@ -85,7 +86,7 @@ func Run(ctx context.Context, d Deps, o Options) error {
 		return ErrReported
 	}
 	defer lock.Unlock()
-	removeHelpers(ctx, d.Docker)
+	helper.Clean(ctx, d.Docker, lockPath(d.Home))
 
 	err = r.steps(ctx)
 	r.cleanup()
@@ -135,6 +136,9 @@ func (r *run) steps(ctx context.Context) error {
 
 	s.Begin(3, totalSteps, "读取配置")
 	col, err := collect(ctx, dc, tool, inv, sel, s, r.ignored(), r.opts.Snapshot != "never")
+	if errors.Is(err, ErrReported) {
+		return err
+	}
 	if err != nil {
 		return fail(s, err.Error(), "", "")
 	}
@@ -335,7 +339,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	}
 
 	for i, v := range col.volumes {
-		rc, err := openVolume(ctx, dc, v, fmt.Sprintf("dockhop-helper-%s-%d", r.rid, i+1))
+		rc, err := openVolume(ctx, dc, v, fmt.Sprintf("dockhop-helper-%s-%d", r.rid, i+1), lockPath(r.Home))
 		if err != nil {
 			return nil, 0, fail(s, err.Error(), "", "")
 		}
@@ -655,7 +659,7 @@ func (r *run) cleanup() {
 		r.stopped = nil
 	}
 	r.removeTempTags()
-	removeHelpers(ctx, r.Docker)
+	helper.Clean(ctx, r.Docker, lockPath(r.Home))
 	if r.workdir != "" {
 		if err := os.RemoveAll(r.workdir); err != nil {
 			r.Screen.Warn("临时文件没能删除，请手动删除：%s", r.workdir)

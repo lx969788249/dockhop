@@ -158,7 +158,7 @@ func dirFiles(t *testing.T, dir string) string {
 // noLeftovers 确认迁入结束后没有留下临时容器和回滚资料。
 func noLeftovers(t *testing.T, home string) {
 	t.Helper()
-	if h := try("docker", "ps", "-aq", "--filter", "label=dockhop.helper=1"); h != "" {
+	if h := try("docker", "ps", "-aq", "--filter", "label=dockhop.helper"); h != "" {
 		t.Errorf("临时容器没有删除：%s", h)
 	}
 	// 做带删除改动的镜像用的临时容器没有标签（标签会进到镜像里），按名字查。

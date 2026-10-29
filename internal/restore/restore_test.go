@@ -148,7 +148,7 @@ func TestDependencyOrder(t *testing.T) {
 		return ""
 	}
 	var got []string
-	for _, it := range dependencyOrder(items, nameOf) {
+	for _, it := range dependencyOrder(items, (*citem).name, func(it *citem) []string { return containerDeps(it.c, nameOf) }) {
 		got = append(got, it.m.Name)
 	}
 	pos := map[string]int{}
@@ -160,7 +160,7 @@ func TestDependencyOrder(t *testing.T) {
 	}
 	// 循环依赖时不卡住。
 	a, b := mk("a", "container:b"), mk("b", "container:a")
-	if n := len(dependencyOrder([]*citem{a, b}, func(string) string { return "" })); n != 2 {
+	if n := len(dependencyOrder([]*citem{a, b}, (*citem).name, func(it *citem) []string { return containerDeps(it.c, func(string) string { return "" }) })); n != 2 {
 		t.Errorf("循环依赖：%d", n)
 	}
 }
@@ -333,6 +333,28 @@ func TestBuildGroupsSharedPaths(t *testing.T) {
 				t.Errorf("同组：%v，应该：%v（%d 组）", together, c.together, len(r.groups))
 			}
 		})
+	}
+}
+
+// 父目录是软链接时，写法不同的两个路径可能是同一处（还不存在的末级目录、文件也一样），
+// 要按实际位置分到同一组。
+func TestBuildGroupsSymlinkParent(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "real"), 0o755)
+	os.Symlink(filepath.Join(root, "real"), filepath.Join(root, "alias"))
+	for name, projects := range map[string][]bundle.Project{
+		"项目目录": {{Name: "a", WorkingDir: filepath.Join(root, "alias", "app")}, {Name: "b", WorkingDir: filepath.Join(root, "real", "app")}},
+		"目录外的文件": {{Name: "a", WorkingDir: filepath.Join(root, "a"), Outside: []string{filepath.Join(root, "alias", "shared.env")}},
+			{Name: "b", WorkingDir: filepath.Join(root, "b"), Outside: []string{filepath.Join(root, "real", "shared.env")}}},
+	} {
+		r := &run{m: &bundle.Manifest{Projects: projects}, projects: projects}
+		for _, p := range projects {
+			r.items = append(r.items, &citem{m: bundle.Container{Name: p.Name + "-web-1", Project: p.Name}, c: &docker.Container{}})
+		}
+		r.buildGroups(nil)
+		if r.groupOf["p:a"] != r.groupOf["p:b"] {
+			t.Errorf("%s：经过软链接写到同一处，应在同一组", name)
+		}
 	}
 }
 

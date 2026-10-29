@@ -24,6 +24,8 @@ type citem struct {
 	applied bool   // 容器里的改动已经包含在 img 里
 }
 
+func (it *citem) name() string { return it.m.Name }
+
 func (it *citem) running() bool {
 	return it.c.State.Running || it.c.State.Paused || it.c.State.Status == "restarting"
 }
@@ -307,8 +309,9 @@ func (r *run) waitReady(ctx context.Context, name, id string) error {
 	}
 }
 
+// logsHint 是容器最后的输出，接在报错后面。报错会显示在屏幕和结果里，所以先隐藏秘密。
 func (r *run) logsHint(ctx context.Context, id string) string {
-	if logs := r.Docker.ContainerLogs(ctx, id, 5); logs != "" {
+	if logs := r.Redactor.Redact(r.Docker.ContainerLogs(ctx, id, 5)); logs != "" {
 		r.Log.Printf("容器最后的输出：\n%s", logs)
 		return "，最后的输出：" + lastLine(logs)
 	}
@@ -358,27 +361,23 @@ func sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// dependencyOrder 按依赖排序：被借用网络、--link、--volumes-from 的容器先创建。
-// 循环依赖时按原来的顺序。
-func dependencyOrder(items []*citem, nameOf func(string) string) []*citem {
-	in := map[string]*citem{}
+// dependencyOrder 按依赖排序，被依赖的排在前面（例如被借用网络、--link、--volumes-from
+// 的容器先创建）。deps 返回一项依赖的其他项的名字。循环依赖时按原来的顺序。
+func dependencyOrder[T any](items []T, name func(T) string, deps func(T) []string) []T {
+	in := map[string]bool{}
 	for _, it := range items {
-		in[it.m.Name] = it
+		in[name(it)] = true
 	}
 	done := map[string]bool{}
-	var out []*citem
-	pending := append([]*citem(nil), items...)
+	var out []T
+	pending := append([]T(nil), items...)
 	for len(pending) > 0 {
-		var next []*citem
+		var next []T
 		progressed := false
 		for _, it := range pending {
 			blocked := false
-			for _, ref := range spec.Dependencies(it.c) {
-				dep := ref
-				if n := nameOf(ref); n != "" {
-					dep = n
-				}
-				if dep != it.m.Name && in[dep] != nil && !done[dep] {
+			for _, dep := range deps(it) {
+				if dep != name(it) && in[dep] && !done[dep] {
 					blocked = true
 				}
 			}
@@ -387,13 +386,26 @@ func dependencyOrder(items []*citem, nameOf func(string) string) []*citem {
 				continue
 			}
 			out = append(out, it)
-			done[it.m.Name] = true
+			done[name(it)] = true
 			progressed = true
 		}
 		if !progressed {
 			return append(out, next...)
 		}
 		pending = next
+	}
+	return out
+}
+
+// containerDeps 是容器依赖的其他容器（借用网络、--link、--volumes-from），nameOf 把引用的
+// ID 换成名字（认不出的原样保留）。
+func containerDeps(c *docker.Container, nameOf func(string) string) []string {
+	var out []string
+	for _, ref := range spec.Dependencies(c) {
+		if n := nameOf(ref); n != "" {
+			ref = n
+		}
+		out = append(out, ref)
 	}
 	return out
 }
