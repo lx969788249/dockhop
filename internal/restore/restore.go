@@ -35,14 +35,9 @@ import (
 // Options 是迁入的选项。
 type Options struct {
 	Link          crypto.Link
-	File          string // 用别的方式带过来的迁移包
 	Yes           bool
 	Existing      string // replace、skip、fail；空表示询问
-	SkipCheck     bool
-	HealthTimeout time.Duration
-	KeepFiles     bool
-	CheckOnly     bool // 只检查，不下载、不改动
-	KeepSucceeded bool // 有的服务没能启动时，不提问，保留已经正常运行的
+	KeepSucceeded bool   // 有的服务没能启动时，不提问，保留已经正常运行的
 }
 
 // Deps 是迁入需要的外部条件。
@@ -100,26 +95,18 @@ type run struct {
 	cleanupLeft    []string
 }
 
-// Run 执行迁入（或者只检查）。
+// Run 执行迁入。
 func Run(ctx context.Context, d Deps, o Options) error {
 	r := &run{Deps: d, opts: o, started: time.Now(), imageAs: map[string]string{}, anonVolumes: map[string]bundle.Volume{},
 		rbDir: filepath.Join(d.Home, "rollback", "current")}
 	r.steps = 6
-	if o.CheckOnly {
-		r.steps = 2
-		if o.File != "" {
-			r.steps = 3
-		}
-	}
 	lock, err := host.TryLock(lockPath(d.Home))
 	if err != nil {
 		d.Screen.Problem(err.Error(), "")
 		return ErrReported
 	}
 	defer lock.Unlock()
-	if !o.CheckOnly {
-		helper.Clean(ctx, d.Docker, lockPath(d.Home))
-	}
+	helper.Clean(ctx, d.Docker, lockPath(d.Home))
 	err = r.run(ctx)
 	if err != nil && r.j != nil && !r.committed {
 		r.rollback(context.WithoutCancel(ctx))
@@ -169,63 +156,32 @@ func (r *run) run(ctx context.Context) error {
 		r.tool = t
 		summary += " · Compose " + t.Version
 	}
-	if !r.opts.CheckOnly {
-		if err := r.recoverInterrupted(ctx); err != nil {
-			return err
-		}
+	if err := r.recoverInterrupted(ctx); err != nil {
+		return err
 	}
 	s.End(summary)
 
-	if r.opts.File == "" {
-		s.Begin(2, r.steps, "迁入前检查")
-		if err := r.fetchPlan(ctx); err != nil {
-			return err
-		}
-		summary, err := r.check(ctx)
-		if err != nil {
-			return err
-		}
-		s.End(summary)
-		if r.opts.CheckOnly {
-			return nil
-		}
-		s.Begin(3, r.steps, "下载迁移包")
-		if err := r.download(ctx); err != nil {
-			return err
-		}
-		summary, err = r.unpack(ctx)
-		if err != nil {
-			return err
-		}
-		if err := r.checkCompose(ctx); err != nil {
-			return err
-		}
-		s.End(summary)
-	} else {
-		s.Begin(2, r.steps, "解开迁移包")
-		r.bundlePath = r.opts.File
-		if err := r.prepareWorkdir(""); err != nil {
-			return err
-		}
-		summary, err := r.unpack(ctx)
-		if err != nil {
-			return err
-		}
-		s.End(summary)
-		s.Begin(3, r.steps, "迁入前检查")
-		summary, err = r.check(ctx)
-		if err != nil {
-			return err
-		}
-		if r.opts.CheckOnly {
-			s.End(summary)
-			return nil
-		}
-		if err := r.checkCompose(ctx); err != nil {
-			return err
-		}
-		s.End(summary)
+	s.Begin(2, r.steps, "迁入前检查")
+	if err := r.fetchPlan(ctx); err != nil {
+		return err
 	}
+	summary, err = r.check(ctx)
+	if err != nil {
+		return err
+	}
+	s.End(summary)
+	s.Begin(3, r.steps, "下载迁移包")
+	if err := r.download(ctx); err != nil {
+		return err
+	}
+	summary, err = r.unpack(ctx)
+	if err != nil {
+		return err
+	}
+	if err := r.checkCompose(ctx); err != nil {
+		return err
+	}
+	s.End(summary)
 
 	s.Begin(4, r.steps, "加载镜像")
 	if err := r.loadImages(ctx); err != nil {
@@ -288,10 +244,6 @@ func (r *run) check(ctx context.Context) (string, error) {
 	if r.plan == nil {
 		return "跳过", nil
 	}
-	if r.opts.SkipCheck {
-		s.Warn("按 --skip-check 跳过迁入前检查")
-		return "跳过", nil
-	}
 	runner := &preflight.Runner{Screen: s, Prompt: r.Prompt, Auto: r.opts.Yes,
 		Collect: func() (*preflight.Target, error) {
 			v := ""
@@ -300,8 +252,7 @@ func (r *run) check(ctx context.Context) (string, error) {
 			}
 			return preflight.Collect(context.Background(), r.Docker, v)
 		}}
-	res, err := runner.Run(r.plan, &r.d, preflight.Options{Existing: r.opts.Existing, BaseDir: r.workBase(),
-		BundleOnDisk: r.opts.File != "", Home: r.Home})
+	res, err := runner.Run(r.plan, &r.d, preflight.Options{Existing: r.opts.Existing, BaseDir: r.workBase(), Home: r.Home})
 	if ui.Canceled(err) {
 		return "", err
 	}
@@ -415,12 +366,6 @@ func (r *run) unpack(ctx context.Context) (string, error) {
 		return "", fail(s, err.Error(), "", "")
 	}
 	r.m = m
-	if r.plan == nil {
-		var pl bundle.Plan
-		if b, err := os.ReadFile(filepath.Join(r.dataDir, "plan.json")); err == nil && json.Unmarshal(b, &pl) == nil {
-			r.plan = &pl
-		}
-	}
 	if err := r.scan(); err != nil {
 		return "", fail(s, err.Error(), "", "在旧服务器重新运行迁出")
 	}
@@ -1743,14 +1688,10 @@ func (r *run) cleanHelpers(ctx context.Context) {
 	helper.Clean(ctx, r.Docker, lockPath(r.Home))
 }
 
-// cleanFiles 删除工作文件：成功时全部删除（--keep-files 时保留）；失败时只删
-// 解密后的数据，保留加密的下载文件，重试时不用重新下载。
+// cleanFiles 删除工作文件：成功时全部删除；失败时只删解密后的数据，保留加密的
+// 下载文件，重试时不用重新下载。
 func (r *run) cleanFiles(success bool) {
 	if r.workdir == "" {
-		return
-	}
-	if success && r.opts.KeepFiles {
-		r.Screen.Println("按 --keep-files 保留了下载和解开的文件：" + r.workdir)
 		return
 	}
 	_ = os.RemoveAll(r.dataDir)
@@ -1759,9 +1700,7 @@ func (r *run) cleanFiles(success bool) {
 			r.Screen.Warn("临时文件没能删除，请手动删除：%s", r.workdir)
 		}
 	}
-	if !r.opts.CheckOnly { // 只检查时不改动 Docker
-		r.cleanHelpers(context.Background())
-	}
+	r.cleanHelpers(context.Background())
 }
 
 func (r *run) report(ctx context.Context, err error) error {
@@ -1780,27 +1719,10 @@ func (r *run) report(ctx context.Context, err error) error {
 		r.Screen.Fail()
 	}
 	var lines []string
-	if r.opts.CheckOnly {
-		rep := ui.Report{Title: "迁入前检查", Elapsed: time.Since(r.started), Success: success}
-		if success {
-			rep.Result = "✅ 迁入前检查通过"
-			if r.plan == nil {
-				rep.Result = "⚠️ 旧服务器没有提供迁移计划，没法检查"
-			}
-		} else {
-			rep.Result = "❌ 检查没有通过"
-			rep.LogPath = r.Log.Path()
-		}
-		r.Screen.PrintReport(rep)
-		if success {
-			return nil
-		}
-		return ErrReported
-	}
 	status := transfer.Status{Result: "failed"}
 	rep := ui.Report{Title: "迁入结果", Elapsed: time.Since(r.started)}
 	untouched := "（还没有改动新服务器）"
-	if !r.downloaded && r.opts.File == "" {
+	if !r.downloaded {
 		untouched = "（还没有下载或改动任何东西）"
 	}
 	switch {

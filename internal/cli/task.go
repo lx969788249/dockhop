@@ -45,12 +45,18 @@ func startTask(env *Env, kind string) (*task, error) {
 		return nil, errReported
 	}
 	t.docker = dc
+	// 出问题时用户只需附上日志：Docker 的情况也记下来。
+	if info, err := dc.Info(env.Context); err == nil {
+		t.log.Printf("Docker %s · %s · %s · 存储 %s · cgroup v%s · %d 核 · 内存 %s · 数据目录 %s", info.ServerVersion,
+			info.OperatingSystem, info.Architecture, info.Driver, info.CgroupVersion, info.NCPU,
+			ui.HumanBytes(info.MemTotal), info.DockerRootDir)
+	}
 	return t, nil
 }
 
-// finish 结束日志：成功删除，失败保留（DOCKHOP_KEEP_LOG=1 时成功也保留）。
+// finish 结束日志：成功删除，失败保留（测试时 DOCKHOP_TEST_KEEP_LOG=1 成功也保留）。
 func (t *task) finish(success bool) {
-	t.log.Finish(success, t.env.Getenv("DOCKHOP_KEEP_LOG") == "1")
+	t.log.Finish(success, t.env.Getenv("DOCKHOP_TEST_KEEP_LOG") == "1")
 }
 
 func explainDockerError(err error) (string, string) {

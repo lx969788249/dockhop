@@ -1,9 +1,9 @@
 // Package ui 负责用户在屏幕上看到的一切：分步骤显示、进度、警告、提问和结果摘要。
 //
 // 每个步骤在屏幕上只占一行：进行中时由进度原地刷新这一行，完成后换成
-// “✓ 结果 · 耗时”。警告单独占一行并汇总到最终结果；细节只写日志
-// （--verbose 时也显示在屏幕上）。步骤里问过问题（菜单、选择）的，这一步结束时
-// 清屏重画，屏幕上只留下程序名字和各步骤的结果。
+// “✓ 结果 · 耗时”。警告单独占一行并汇总到最终结果；细节只写日志。
+// 步骤里问过问题（菜单、选择）的，这一步结束时清屏重画，屏幕上只留下程序名字和
+// 各步骤的结果。
 package ui
 
 import (
@@ -46,7 +46,6 @@ type Screen struct {
 	mu       sync.Mutex
 	out      io.Writer
 	tty      bool
-	verbose  bool
 	log      Logger
 	now      func() time.Time
 	cur      *stage
@@ -116,9 +115,9 @@ func (s *Screen) keep(line string) {
 }
 
 // redraw 清屏，重新显示程序名字和留下来的行，去掉菜单、问题这些已经回答过的内容。
-// --verbose 时不清屏：要看的就是全部细节。调用方需持有锁。
+// 调用方需持有锁。
 func (s *Screen) redraw() {
-	if !s.tty || s.verbose {
+	if !s.tty {
 		return
 	}
 	s.clearLine()
@@ -129,9 +128,6 @@ func (s *Screen) redraw() {
 	}
 	fmt.Fprint(s.out, b.String())
 }
-
-// SetVerbose 打开后，细节也会显示在屏幕上。
-func (s *Screen) SetVerbose(v bool) { s.verbose = v }
 
 // IsTTY 表示输出是否是交互终端。
 func (s *Screen) IsTTY() bool { return s.tty }
@@ -269,17 +265,9 @@ func (s *Screen) FailedStage() string {
 	return s.failed
 }
 
-// Detail 写进日志；--verbose 时也显示在屏幕上。
+// Detail 只写进日志，不显示在屏幕上。
 func (s *Screen) Detail(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	s.log.Printf("%s", msg)
-	if !s.verbose {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.clearLine()
-	fmt.Fprintf(s.out, "    %s\n", msg)
+	s.log.Printf(format, args...)
 }
 
 // Warn 显示一条警告，写进日志，并汇总到最终结果。
@@ -455,7 +443,7 @@ func (s *Screen) PrintReport(r Report) {
 		}
 		if r.LogPath != "" {
 			b.WriteString("日志：" + r.LogPath + "\n")
-			b.WriteString("      反馈问题时请附上这个文件（密钥和密码已自动隐藏），或运行 dockhop diagnose 生成诊断文件。\n")
+			b.WriteString("      反馈问题时请附上这个文件（密钥和密码已自动隐藏）。\n")
 		}
 	}
 	b.WriteString(strings.Repeat("━", 20+displayWidth(middle)) + "\n")

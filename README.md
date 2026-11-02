@@ -97,7 +97,7 @@ bash <(curl -fsSL https://dockhop.run)
 - 只依赖 Docker：一个静态编译的程序，不往系统里装 jq、python3 之类的软件
 - **下载之前先检查**：CPU 类型、磁盘空间、端口占用、网段冲突、固定 IP、同名服务、显卡、按摘要固定版本的镜像……有问题当场让你选择怎么处理（例如自动换一个空闲端口）
 - 停机前先算出要打包多少数据，容器里改动特别大时提前提醒
-- 下载断了自动从断点继续；两台服务器网络不通时，可以把迁移包用别的方式带过去
+- 下载断了自动从断点继续
 - 新服务器迁入成功后，旧服务器自动结束
 - 在 Docker 20.10 到 29 之间互相迁移都经过测试
 - 全部提示都是大白话
@@ -171,63 +171,32 @@ sequenceDiagram
 
 ## 🔧 高级用法
 
-### 命令
-
-下面用 `dockhop` 代表程序。通过一行命令运行时，把参数接在后面即可，例如 `bash <(curl -fsSL https://dockhop.run) out --include web,db`。
-
-```bash
-# 只迁移指定的容器（或它们所在的 Compose 项目），不显示菜单
-dockhop out --include nginx,mysql
-
-# 不停机打包（数据库等正在写入的数据可能不一致，谨慎使用）
-dockhop out --no-stop
-
-# 在新服务器直接迁入
-dockhop in 'http://…完整链接…'
-
-# 不提问：检查发现的问题自动采用推荐做法（例如自动换一个空闲端口）
-dockhop in --yes 'http://…完整链接…'
-
-# 两台服务器网络不通：把迁移包用 scp、网盘等带过来，再用同一个链接迁入
-dockhop in --file /root/bundle 'http://…完整链接…'
-
-# 只做迁入前检查，不下载、不改动任何东西
-dockhop check 'http://…完整链接…'
-
-# 在屏幕上显示每一步的细节（默认只写进日志）
-dockhop out -v
-
-# 出问题时收集诊断信息，生成一个可以附到 Issue 里的文件
-dockhop diagnose
-```
-
-在没有终端的环境（定时任务、`nohup`）里迁出时，下载服务会一直运行，并提示一条 `kill -TERM <进程号>` 命令；新服务器迁入成功后它也会自动结束。
+平时运行一行命令、按菜单走就行，下面这些只在特殊情况下才用得上。通过一行命令运行时，把选项接在后面即可，例如 `bash <(curl -fsSL https://dockhop.run) out --port 9000`。
 
 ### 选项
+
+| 选项 | 默认 | 什么时候用 |
+|---|---|---|
+| `out --port 端口` | `8080` | 安全组里只放行了某个端口时，让下载服务用它（被占用时自动往后找） |
+| `out --host 地址` | 自动探测 | 链接里使用的 IP 或域名：NAT、多网卡、自动探测不准，或者两台服务器在同一个内网、想走内网传输时 |
+
+下面几个是给脚本、定时任务这类不能提问的场合用的；平时遇到这些情况，DockHop 会直接问你：
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | `out --include a,b` | 显示菜单 | 只迁移这些容器（或它们所在的 Compose 项目） |
-| `out --no-stop` | 停机打包 | 不停机打包 |
-| `out --stop-shared` | 询问 | 不能提问时，允许临时停止和所选容器共用数据或网络的其他容器（打包完自动恢复） |
-| `out --snapshot auto\|always\|never` | `auto` | 容器里没挂载出来的改动：有改动才迁移 / 连运行时临时目录也迁移 / 不迁移 |
-| `out --port 端口` | `8080` | 下载服务的端口，被占用时自动往后找 |
-| `out --host 地址` | 自动探测 | 链接里使用的公网 IP 或域名（NAT、多网卡或探测不准时设置） |
-| `out --workdir 目录` | `~/.dockhop/work` | 存放迁移包的目录 |
-| `in --file 迁移包` | 下载 | 用别的方式带过来的迁移包 |
-| `in --yes` | 询问 | 不能提问时，检查发现的问题自动采用推荐做法；没法自动处理的仍会停下 |
+| `out --stop-shared` | 询问 | 允许临时停止和所选容器共用数据或网络的其他容器（打包完自动恢复） |
+| `in --yes` | 询问 | 检查发现的问题自动采用推荐做法；没法自动处理的仍会停下 |
 | `in --existing replace\|skip\|fail` | 询问 | 新服务器已有同名服务时：替换（失败时放回原来的）/ 保留已有的 / 停止 |
-| `in --skip-check` | 检查 | 跳过迁入前检查 |
-| `in --health-timeout 秒` | `60` | 健康检查至少等多久（会按容器自己的检查间隔自动加长） |
-| `in --keep-files` | 删除 | 迁入成功后保留下载和解开的文件 |
-| `in --keep-succeeded` | 全部删除 | 有服务没能启动时，不提问，保留已经正常运行的、只删除没启动的 |
+| `in --keep-succeeded` | 全部删除 | 有服务没能启动时，保留已经正常运行的、只删除没启动的 |
+
+在没有终端的环境（定时任务、`nohup`）里迁出时，下载服务会一直运行，并提示一条 `kill -TERM <进程号>` 命令；新服务器迁入成功后它也会自动结束。
 
 ### 环境变量
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `DOCKHOP_HOME` | `~/.dockhop` | 日志（`logs/`）、中断记录（`state/`）、回滚资料（`rollback/`）和工作文件（`work/`）都放在这里 |
-| `DOCKHOP_KEEP_LOG` | — | 设为 `1` 时，成功后也保留日志 |
+| `DOCKHOP_HOME` | `~/.dockhop` | 日志、中断记录、回滚资料和工作文件（迁移包、下载的文件）都放在这里。系统盘不够大时，在命令前面加上 `DOCKHOP_HOME=/大一点的盘/dockhop` |
 | `DOCKHOP_NO_STATS` | — | 设为 `1` 时不统计、也不在菜单里显示成功完成迁移的次数（也认 `DO_NOT_TRACK=1`），见下面的常见问题 |
 | `DOCKHOP_MIRROR` | Gitee 和 GitHub Releases，先比一比，用快的 | 一行命令下载程序用的镜像站（设置后只用它）；程序的校验值写在 `run.sh` 里，从镜像站下载也能确认没被改动 |
 
@@ -239,7 +208,7 @@ dockhop diagnose
 - Docker 20.10 或更新的版本
 - 迁移 Compose 项目时，新服务器需要 `docker compose`；只有老的 docker-compose 1.x 时，有些新写法读不懂，迁入前检查会提醒，建议先装新版
 - 一行命令需要 `curl`（或 `wget`）和 `sha256sum`，除此之外不需要任何其他软件
-- 旧服务器对新服务器开放一个 TCP 端口（默认 8080）；实在开放不了，可以用 `--file` 把迁移包带过去
+- 新服务器要能连上旧服务器的一个 TCP 端口（默认 8080），需要在安全组和防火墙里放行
 
 ## ❓ 常见问题
 
@@ -270,7 +239,7 @@ dockhop diagnose
 - **停下来让你选择**：端口被占用（自动换一个空闲端口、手动输入端口、不对外开放，或先处理再重新检查）、已有同名容器或 Compose 项目（替换或保留）、网段冲突或固定 IP 被占用（改为自动分配）、端口绑定的地址在新服务器上不存在（改绑到所有地址）、按摘要固定的镜像拉不到（改用迁移包里的）、磁盘空间不够等。Compose 项目的端口和固定 IP 写在你自己的文件里，DockHop 不替你改，可以先自己修改，或暂时跳过这个项目。
 - **无法继续**：两台服务器的 CPU 类型不同、缺少显卡运行环境或卷插件等。
 
-所有调整都会列在最后的结果里，例如“端口变更：web 80 → 8081”。想在正式迁移前先看一遍，可以用 `dockhop check '链接'`。
+所有调整都会列在最后的结果里，例如“端口变更：web 80 → 8081”。检查在下载之前进行，停下来问你的时候，新服务器上还什么都没改动。
 </details>
 
 <details>
@@ -339,7 +308,7 @@ DockHop 会把有关联的服务分成一组（同一个 Compose 项目，或者
 <details>
 <summary><b>出错了怎么反馈？</b></summary>
 
-每次运行都会把完整过程写进日志（`~/.dockhop/logs/`）。成功后日志自动删除；失败时结果里会给出日志路径，提交 [Issue](https://github.com/lx969788249/dockhop/issues) 时附上它即可。也可以运行 `dockhop diagnose` 生成一份包含系统、Docker 状态和最近日志的诊断文件。日志和诊断文件里的迁移密钥、容器密码等敏感信息会自动替换为 `***`。
+每次运行都会把完整过程写进日志（`~/.dockhop/logs/`），包括系统和 Docker 的版本。成功后日志自动删除；失败时结果里会给出日志路径，提交 [Issue](https://github.com/lx969788249/dockhop/issues) 时附上它即可。日志里的迁移密钥、容器密码等敏感信息会自动替换为 `***`。
 </details>
 
 <details>
@@ -352,12 +321,6 @@ DockHop 会把有关联的服务分成一组（同一个 Compose 项目，或者
 <summary><b>链接泄露了会怎样？</b></summary>
 
 拿到完整链接的人可以在下载服务开着的时候下载并解开迁移包。迁入成功后旧服务器会自动关闭下载服务，链接随之失效；也可以随时在旧服务器按 Esc 再按回车提前关闭。只拿到下载地址、没有 `#` 后面密钥的人，下载到的只是解不开的密文。
-</details>
-
-<details>
-<summary><b>从 docker_migrate 换过来要注意什么？</b></summary>
-
-DockHop 是 [docker_migrate](https://github.com/lx969788249/docker_migrate) 的 Go 重写版，用法基本一样，但两者的链接和迁移包互不通用：两台服务器请都用 DockHop。拿 docker_migrate 的链接给 DockHop，会直接提示请在旧服务器改用 DockHop 重新迁出。
 </details>
 
 ## 🛠️ 参与开发
@@ -378,7 +341,7 @@ test/apps/run.sh wordpress                  # 在两台模拟服务器之间迁�
 | `cmd/dockhop` | 程序入口 |
 | `internal/cli` | 命令、选项、菜单 |
 | `internal/ui` | 分步骤显示、进度条、提问、结果摘要 |
-| `internal/logging` | 运行日志、隐藏密钥和密码、诊断文件 |
+| `internal/logging` | 运行日志、隐藏密钥和密码 |
 | `internal/docker` | 精简的 Docker 接口客户端（容器配置按原始 JSON 读写） |
 | `internal/spec` | 迁出、迁入共用的规则：系统路径、容器依赖、可写层改动、秘密变量；按原始配置重建容器 |
 | `internal/compose` | 调用服务器上的 docker compose |
@@ -400,7 +363,7 @@ test/apps/run.sh wordpress                  # 在两台模拟服务器之间迁�
 
 ## 💬 反馈
 
-- 遇到问题请提交 [Issue](https://github.com/lx969788249/dockhop/issues)，附上失败时给出的日志文件，或运行 `dockhop diagnose` 生成的诊断文件（密钥和密码已自动隐藏）。
+- 遇到问题请提交 [Issue](https://github.com/lx969788249/dockhop/issues)，附上失败时给出的日志文件（密钥和密码已自动隐藏）。
 - 版本变化见 [Releases](https://github.com/lx969788249/dockhop/releases)。
 
 如果这个项目帮你省下了一次搬家的时间，欢迎点一个 ⭐ Star。

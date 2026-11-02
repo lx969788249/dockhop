@@ -31,12 +31,9 @@ import (
 // Options 是迁出的选项。
 type Options struct {
 	Include    []string
-	NoStop     bool
 	StopShared bool
-	Snapshot   string // auto、always、never
 	Port       int
 	Host       string
-	Workdir    string
 }
 
 // Deps 是迁出需要的外部条件。
@@ -135,7 +132,7 @@ func (r *run) steps(ctx context.Context) error {
 	s.End(r.chosen)
 
 	s.Begin(3, totalSteps, "读取配置")
-	col, err := collect(ctx, dc, tool, inv, sel, s, r.ignored(), r.opts.Snapshot != "never")
+	col, err := collect(ctx, dc, tool, inv, sel, s, r.ignored())
 	if errors.Is(err, ErrReported) {
 		return err
 	}
@@ -164,7 +161,7 @@ func (r *run) steps(ctx context.Context) error {
 	for _, it := range col.sel.items {
 		if size := col.layerBytes[it]; size > largeLayer {
 			s.Warn("容器 %s 里没挂载出来的改动有 %s，会在停机期间一起打包，停机时间会因此变长；"+
-				"如果是日志、缓存、崩溃转储这类没用的文件，可以先删掉再迁出，或者用 --snapshot never 不迁移容器里的改动",
+				"如果是日志、缓存、崩溃转储这类没用的文件，可以先删掉再迁出",
 				it.name(), ui.HumanBytes(size))
 		}
 	}
@@ -173,17 +170,13 @@ func (r *run) steps(ctx context.Context) error {
 			s.Warn("Compose 项目 %s 目录里的大文件 %s 没有迁移（超过 100MB）；需要的话请手动复制", p.u.project, f)
 		}
 	}
-	r.workdir = r.opts.Workdir
-	if r.workdir == "" {
-		r.workdir = filepath.Join(r.Home, "work")
-	}
-	r.workdir = filepath.Join(r.workdir, "out-"+r.rid)
+	r.workdir = filepath.Join(r.Home, "work", "out-"+r.rid)
 	need := col.dataBytes() + col.imageBytes
 	disk, err := host.DiskOf(r.workdir)
 	if err == nil && disk.Free < uint64(need) {
 		return fail(s, fmt.Sprintf("磁盘空间可能不够：迁移包最多需要约 %s（压缩前），%s 所在磁盘只剩 %s",
 			ui.HumanBytes(need), disk.Path, ui.HumanBytes(int64(disk.Free))),
-			"清理磁盘，或用 --workdir 指定一个空间更大的目录", "")
+			"清理磁盘，或在命令前面加上 DOCKHOP_HOME=空间更大的目录 再运行", "")
 	}
 	if err := os.MkdirAll(r.workdir, 0o700); err != nil {
 		return fail(s, "无法创建工作目录 "+r.workdir, err.Error(), "")
@@ -275,21 +268,17 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	// 停机：先登记再停，程序在任何时候被强制结束，下次运行都能恢复它们。
 	var stopList []StoppedContainer
 	var waves [][]StoppedContainer
-	if r.opts.NoStop {
-		s.Warn("不停机打包：数据库等正在写入的数据可能不一致")
-	} else {
-		all := append(append([]*item(nil), col.shared...), col.sel.items...)
-		for _, wave := range stopWaves(&inventory{byName: indexByName(all), byID: indexByID(all)}, all) {
-			var w []StoppedContainer
-			for _, it := range wave {
-				if it.c.State.Running {
-					w = append(w, StoppedContainer{Name: it.name(), ID: it.c.ID, State: stateName("running", it.c.State.Paused)})
-				}
+	all := append(append([]*item(nil), col.shared...), col.sel.items...)
+	for _, wave := range stopWaves(&inventory{byName: indexByName(all), byID: indexByID(all)}, all) {
+		var w []StoppedContainer
+		for _, it := range wave {
+			if it.c.State.Running {
+				w = append(w, StoppedContainer{Name: it.name(), ID: it.c.ID, State: stateName("running", it.c.State.Paused)})
 			}
-			if len(w) > 0 {
-				waves = append(waves, w)
-				stopList = append(stopList, w...)
-			}
+		}
+		if len(w) > 0 {
+			waves = append(waves, w)
+			stopList = append(stopList, w...)
 		}
 	}
 	downStart := time.Now()
@@ -310,7 +299,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	var packed int64
 	for i, it := range col.sel.items {
 		s.Count("检查容器里的改动", i+1, len(col.sel.items), it.name())
-		moved, keep, deleted, err := layerState(ctx, dc, it, r.opts.Snapshot)
+		moved, keep, deleted, err := layerState(ctx, dc, it)
 		if err != nil {
 			return nil, 0, fail(s, "检查容器 "+it.name()+" 的改动失败", err.Error(), "")
 		}
@@ -438,10 +427,6 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	m.Images.Bytes, m.Images.Parts = n, parts
 	r.removeTempTags()
 
-	// 包里也放一份迁移计划：用 --file 迁入时没有下载服务，靠它做迁入前检查。
-	if err := w.AddJSON("plan.json", buildPlan(m, col, 0)); err != nil {
-		return nil, 0, fail(s, "写入迁移包失败", err.Error(), "")
-	}
 	if err := w.AddJSON("manifest.json", m); err != nil {
 		return nil, 0, fail(s, "写入迁移包失败", err.Error(), "")
 	}
@@ -789,10 +774,6 @@ func (r *run) confirmShared(col *collected) error {
 		names[i] = it.name()
 	}
 	list := strings.Join(names, "、")
-	if r.opts.NoStop {
-		return fail(r.Screen, "没有选中的容器 "+list+" 和选中的容器共用数据或网络，不停机打包无法保证数据一致，已取消", "",
-			"去掉 --no-stop，让 DockHop 临时停止并自动恢复它们")
-	}
 	if r.opts.StopShared {
 		r.Screen.Warn("没有选中的容器 %s 和选中的容器共用数据或网络，打包时会临时停止，打包完自动恢复", list)
 		return nil
@@ -815,9 +796,6 @@ func (r *run) confirmShared(col *collected) error {
 // checkAutoRemove 停机打包要停止的容器里，有用 --rm 启动的就不能继续：Docker 停止这种
 // 容器时会把它连同匿名卷、容器里没挂载出来的改动一起删掉，打包不到，也恢复不了。
 func (r *run) checkAutoRemove(col *collected) error {
-	if r.opts.NoStop {
-		return nil // 不停机打包，不会停止它们
-	}
 	var names []string
 	for _, it := range append(append([]*item(nil), col.sel.items...), col.shared...) {
 		if it.c.HostConfig.AutoRemove && it.c.State.Running {
@@ -830,7 +808,7 @@ func (r *run) checkAutoRemove(col *collected) error {
 	list := strings.Join(names, "、")
 	return fail(r.Screen, "容器 "+list+" 是用 --rm 启动的：停机打包时一停止，Docker 就会把它连同匿名卷和容器里的改动一起删掉，"+
 		"没法打包，也没法恢复，已取消（什么都没有改动）", "",
-		"先把它重新创建成不带 --rm 的容器再迁出；或者确认数据都在命名卷、挂载目录里之后，用 --no-stop 不停机打包")
+		"先把它重新创建成不带 --rm 的容器再迁出")
 }
 
 // ignored 是测试时要忽略的容器（例如运行测试的容器自己）。

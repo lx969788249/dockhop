@@ -159,7 +159,7 @@ dump_state() {
 start_out() {
   local containers
   containers="$(docker exec "$old" docker ps -a --format '{{.Names}}' | sort | paste -sd, -)"
-  docker exec -d "$old" bash -c "cd /root && DOCKHOP_KEEP_LOG=1 dockhop out --include '${containers}' \
+  docker exec -d "$old" bash -c "cd /root && DOCKHOP_TEST_KEEP_LOG=1 dockhop out --include '${containers}' \
     --stop-shared --host old --port ${BACKUP_PORT} </dev/null >/root/out.log 2>&1"
 }
 
@@ -217,7 +217,7 @@ run_in() {
   local link="$1" log="$2"
   shift 2
   docker exec -e DH_LINK="$link" "$@" "$new" bash -c \
-    'cd /root && DOCKHOP_KEEP_LOG=1 dockhop in --yes "$DH_LINK" </dev/null' >"$log" 2>&1
+    'cd /root && DOCKHOP_TEST_KEEP_LOG=1 dockhop in --yes "$DH_LINK" </dev/null' >"$log" 2>&1
 }
 
 compare_state() {

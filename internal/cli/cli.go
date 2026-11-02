@@ -1,4 +1,4 @@
-// Package cli 解析命令和选项，把工作分派给迁出、迁入、检查和诊断。
+// Package cli 解析命令和选项，把工作分派给迁出和迁入。
 package cli
 
 import (
@@ -35,7 +35,6 @@ type Env struct {
 	Input    io.Reader // 可以提问时是终端输入，否则为 nil
 	Getenv   func(string) string
 	Version  string
-	Workdir  string // 当前目录，诊断文件写在这里
 	Context  context.Context
 	HomeDir  func() (string, error)
 	Platform string     // 例如 linux/amd64
@@ -84,35 +83,21 @@ const helpText = `DockHop：一条链接，把 Docker 服务连同数据从旧�
   dockhop                     显示菜单
   dockhop out [选项]          迁出：打包这台服务器上的服务，生成迁移链接（在旧服务器上运行）
   dockhop in [链接] [选项]    迁入：将服务迁到这台服务器（在新服务器上运行）
-  dockhop check 链接          只检查这台服务器能不能迁入，不下载、不改动
-  dockhop diagnose            收集诊断信息，生成一个可以附到 Issue 里的文件
   dockhop version             显示版本
 
 迁出选项：
-  --include a,b        只迁移指定的容器（或它们所在的 Compose 项目），不显示菜单
-  --no-stop            不停机打包（数据库等的数据可能不一致）
-  --stop-shared        不能提问时，允许临时停止和所选容器共用数据的其他容器
-  --snapshot 方式      容器里没有挂载出来的改动：auto 有改动才迁移（默认）、always 总是、never 不迁移
   --port 端口          下载服务的端口（默认 8080，被占用时自动往后找）
   --host 地址          链接里使用的公网 IP 或域名（默认自动探测）
-  --workdir 目录       存放迁移包的目录（默认 ~/.dockhop/work）
+  --include a,b        只迁移指定的容器（或它们所在的 Compose 项目），不显示菜单
+  --stop-shared        不能提问时，允许临时停止和所选容器共用数据的其他容器
 
-迁入选项：
-  --file 迁移包        用别的方式（scp、网盘等）带过来的迁移包，不再下载
-  --yes                不能提问时，预检发现的问题自动采用推荐做法
-  --existing 方式      已有同名服务时：replace 替换（失败时放回原来的）、skip 跳过、fail 停止；不写时会询问
-  --skip-check         跳过迁移前预检
-  --health-timeout 秒  健康检查至少等待的秒数（默认 60，会按容器自己的检查间隔自动加长）
-  --keep-files         迁入成功后保留下载和解压的文件
-  --keep-succeeded     有服务没能启动时，不提问，保留已经正常运行的（默认全部删除）
-
-通用选项：
-  -v, --verbose        在屏幕上显示每一步的细节
-  -h, --help           显示帮助
+迁入选项（都是给不能提问的场合用的，平时会直接问你）：
+  --yes                检查发现的问题自动采用推荐做法
+  --existing 方式      已有同名服务时：replace 替换（失败时放回原来的）、skip 跳过、fail 停止
+  --keep-succeeded     有服务没能启动时，保留已经正常运行的（默认全部删除）
 
 环境变量：
-  DOCKHOP_HOME         日志、记录和工作文件的目录（默认 ~/.dockhop）
-  DOCKHOP_KEEP_LOG=1   成功后也保留日志
+  DOCKHOP_HOME         日志、记录和工作文件的目录（默认 ~/.dockhop），磁盘不够时换到大一点的盘
   DOCKHOP_NO_STATS=1   不统计、也不显示成功完成迁移的次数（也认 DO_NOT_TRACK=1）
 
 迁移链接里有特殊字符，在命令里使用时请用单引号括起来：dockhop in '链接'
@@ -129,13 +114,10 @@ func Run(args []string, env Env) int {
 		return ExitOK
 	}
 	env.fill()
-	verbose := false
-	// 通用选项可以写在子命令前后任意位置。
+	// 帮助和版本可以写在子命令前后任意位置。
 	var rest []string
 	for _, a := range args {
 		switch a {
-		case "-v", "--verbose":
-			verbose = true
 		case "-h", "--help", "help":
 			fmt.Fprint(env.Stdout, helpText)
 			return ExitOK
@@ -151,7 +133,6 @@ func Run(args []string, env Env) int {
 	}
 	env.Args = args
 	env.screen = ui.New(env.Stderr, env.TTY, nil)
-	env.screen.SetVerbose(verbose)
 	env.screen.SetWidth(env.Width)
 	env.screen.SetBanner(ui.Banner(env.Version, env.TTY))
 	env.prompt = ui.NewPrompter(env.Input, env.Stderr).WithContext(env.Context)
@@ -174,25 +155,12 @@ func dispatch(cmd string, args []string, env *Env) error {
 		env.screen.Start()
 		return runOut(env, opts)
 	case "in":
-		opts, err := parseIn(args, false)
+		opts, err := parseIn(args)
 		if err != nil {
 			return err
 		}
 		env.screen.Start()
-		return runIn(env, opts, false)
-	case "check":
-		opts, err := parseIn(args, true)
-		if err != nil {
-			return err
-		}
-		env.screen.Start()
-		return runIn(env, opts, true)
-	case "diagnose":
-		if len(args) > 0 {
-			return usageErr("diagnose 不需要参数")
-		}
-		env.screen.Start()
-		return runDiagnose(env)
+		return runIn(env, opts)
 	default:
 		if strings.HasPrefix(cmd, "-") {
 			return usageErr("不认识的选项 %s，运行 dockhop --help 查看用法", cmd)
@@ -211,20 +179,15 @@ func menu(env *Env) error {
 	if n > 0 {
 		env.screen.Println(" 已成功完成迁移：" + env.screen.Green(strconv.Itoa(n)) + " 次\n")
 	}
-	choice, err := env.prompt.Choose([]string{"迁出", "迁入", "收集诊断信息"}, 1)
+	choice, err := env.prompt.Choose([]string{"迁出", "迁入"}, 1)
 	if err != nil {
 		return err
 	}
-	switch choice {
-	case 1:
+	if choice == 1 {
 		env.screen.Refresh()
-		return runOut(env, OutOptions{Snapshot: "auto", Port: 8080})
-	case 2:
-		return runIn(env, InOptions{HealthTimeout: defaultHealthTimeout}, false) // 粘贴完链接再清屏
-	default:
-		env.screen.Refresh()
-		return runDiagnose(env)
+		return runOut(env, OutOptions{Port: 8080})
 	}
+	return runIn(env, InOptions{}) // 粘贴完链接再清屏
 }
 
 func runOut(env *Env, opts OutOptions) error {
@@ -243,10 +206,7 @@ func runOut(env *Env, opts OutOptions) error {
 	err = backup.Run(env.Context, backup.Deps{
 		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
 		Home: t.home, Version: env.Version, Getenv: env.Getenv,
-	}, backup.Options{
-		Include: opts.Include, NoStop: opts.NoStop, StopShared: opts.StopShared, Snapshot: opts.Snapshot,
-		Port: opts.Port, Host: opts.Host, Workdir: opts.Workdir,
-	})
+	}, backup.Options{Include: opts.Include, StopShared: opts.StopShared, Port: opts.Port, Host: opts.Host})
 	t.finish(err == nil)
 	if errors.Is(err, backup.ErrReported) {
 		return errReported
@@ -274,11 +234,11 @@ func readLink(env *Env, given string) (crypto.Link, error) {
 	return link, err
 }
 
-func runIn(env *Env, opts InOptions, checkOnly bool) error {
+func runIn(env *Env, opts InOptions) error {
 	link, err := readLink(env, opts.Link)
 	if err != nil {
 		var le *crypto.LinkError
-		if errors.As(err, &le) || errors.Is(err, crypto.ErrOldLink) {
+		if errors.As(err, &le) {
 			env.screen.Problem(err.Error(), "")
 			return errReported
 		}
@@ -287,17 +247,7 @@ func runIn(env *Env, opts InOptions, checkOnly bool) error {
 	if opts.Link == "" {
 		env.screen.Refresh() // 菜单和粘贴的一长串链接不用留在屏幕上
 	}
-	if opts.File != "" {
-		if _, err := os.Stat(opts.File); err != nil {
-			env.screen.Problem("找不到迁移包 "+opts.File, "确认 --file 后面的路径写对了")
-			return errReported
-		}
-	}
-	kind := "in"
-	if checkOnly {
-		kind = "check"
-	}
-	t, err := startTask(env, kind)
+	t, err := startTask(env, "in")
 	if err != nil {
 		return err
 	}
@@ -305,13 +255,9 @@ func runIn(env *Env, opts InOptions, checkOnly bool) error {
 	err = restore.Run(env.Context, restore.Deps{
 		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
 		Home: t.home, Version: env.Version, Getenv: env.Getenv,
-	}, restore.Options{
-		Link: link, File: opts.File, Yes: opts.Yes, Existing: opts.Existing, SkipCheck: opts.SkipCheck,
-		HealthTimeout: opts.HealthTimeout, KeepFiles: opts.KeepFiles, CheckOnly: checkOnly,
-		KeepSucceeded: opts.KeepSucceeded,
-	})
+	}, restore.Options{Link: link, Yes: opts.Yes, Existing: opts.Existing, KeepSucceeded: opts.KeepSucceeded})
 	t.finish(err == nil)
-	if err == nil && !checkOnly {
+	if err == nil {
 		countMigration(env)
 	}
 	if errors.Is(err, restore.ErrReported) {

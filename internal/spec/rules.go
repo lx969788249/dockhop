@@ -102,15 +102,6 @@ var (
 // 挂载点（新版 Docker 会把为挂载创建的空目录也算作新增）和它们的上级目录、只因为子项
 // 变化而被标记为“修改”的目录。
 func LayerChanges(changes []docker.Change, mounts []string) (keep, deleted []string) {
-	return layerChanges(changes, mounts, false)
-}
-
-// AllLayerChanges 和 LayerChanges 一样，只是运行时临时目录里的改动也算（--snapshot always）。
-func AllLayerChanges(changes []docker.Change, mounts []string) (keep, deleted []string) {
-	return layerChanges(changes, mounts, true)
-}
-
-func layerChanges(changes []docker.Change, mounts []string, withRuntime bool) (keep, deleted []string) {
 	parents := map[string]bool{}
 	for _, c := range changes {
 		for p := path.Dir(c.Path); p != "/" && p != "."; p = path.Dir(p) {
@@ -128,7 +119,7 @@ func layerChanges(changes []docker.Change, mounts []string, withRuntime bool) (k
 	var adds, dels []string
 	for _, c := range changes {
 		p := path.Clean(c.Path)
-		if (!withRuntime && runtimeDir.MatchString(p)) || dockerManaged[p] || mountDirs[p] || p == "/dev" || strings.HasPrefix(p, "/dev/") || strings.HasPrefix(p, "/proc") || strings.HasPrefix(p, "/sys") {
+		if runtimeDir.MatchString(p) || dockerManaged[p] || mountDirs[p] || p == "/dev" || strings.HasPrefix(p, "/dev/") || strings.HasPrefix(p, "/proc") || strings.HasPrefix(p, "/sys") {
 			continue
 		}
 		switch c.Kind {

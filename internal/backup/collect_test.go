@@ -101,7 +101,7 @@ func TestSharedWritersIncludeUnlisted(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		col, err := collect(context.Background(), dc, nil, inv, &selection{units: inv.units, items: inv.units[0].items}, s, nil, false)
+		col, err := collect(context.Background(), dc, nil, inv, &selection{units: inv.units, items: inv.units[0].items}, s, nil)
 		switch {
 		case want == "停止" && (err != nil || len(col.shared) != 1 || col.shared[0].name() != "writer"):
 			t.Errorf("临时容器应一起停止：%v", err)

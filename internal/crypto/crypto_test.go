@@ -50,7 +50,6 @@ func TestParseLinkErrors(t *testing.T) {
 		want string
 	}{
 		{"", "没有提供迁移链接"},
-		{"http://1.2.3.4:8080/abc/docker_migrate_x.tar.gz.enc#sha256=00", "docker_migrate 生成的"},
 		{"ftp://1.2.3.4/abc", "这不是迁移链接"},
 		{"1.2.3.4:8080", "这不是迁移链接"},
 		{l.Base(), "缺少 # 后面的密钥"},
@@ -64,9 +63,6 @@ func TestParseLinkErrors(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("ParseLink(%q) 应提示「%s」，实际：%v", c.in, c.want, err)
 		}
-	}
-	if _, err := ParseLink("http://1.2.3.4:8080/a/b.tar.gz.enc#x"); !errors.Is(err, ErrOldLink) {
-		t.Errorf("旧链接应返回 ErrOldLink：%v", err)
 	}
 }
 

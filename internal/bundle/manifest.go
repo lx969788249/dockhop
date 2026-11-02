@@ -14,8 +14,9 @@
 //	compose/<项目>/dir/part-*      Compose 项目目录（tar，路径相对于项目目录）
 //	compose/<项目>/outside/part-*  项目目录以外被引用的文件（tar，路径相对于根目录）
 //	images/part-*              镜像（docker save 的输出）
-//	plan.json                  迁移计划（和下载服务提供的那份相同，只是没有迁移包大小）
 //	manifest.json              清单，最后写入
+//
+// 迁移计划不在包里，由下载服务单独提供（新服务器下载之前先用它做检查）。
 package bundle
 
 import "time"

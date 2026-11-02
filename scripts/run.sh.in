@@ -23,7 +23,7 @@ fail() {
 }
 
 case "$VERSION" in
-  "" | *_VERSION_*) fail "DockHop 还没有发布正式版本" "现在请先使用 docker_migrate：https://github.com/lx969788249/docker_migrate" ;;
+  "" | *_VERSION_*) fail "DockHop 还没有发布正式版本" ;;
 esac
 
 [[ "$(uname -s)" == "Linux" ]] || fail "DockHop 只能在 Linux 服务器上运行"

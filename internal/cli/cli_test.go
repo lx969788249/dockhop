@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/lx969788249/dockhop/internal/crypto"
 )
@@ -29,7 +28,6 @@ func runCLI(t *testing.T, input string, env map[string]string, args ...string) r
 		Stderr:   &errb,
 		Version:  "1.0.0-test",
 		Platform: "linux/amd64",
-		Workdir:  t.TempDir(),
 		Getenv:   func(k string) string { return env[k] },
 		HomeDir:  func() (string, error) { return t.TempDir(), nil },
 		Context:  context.Background(),
@@ -67,17 +65,16 @@ func TestUsageErrors(t *testing.T) {
 		{[]string{"out", "--bogus"}, "不认识的选项 --bogus"},
 		{[]string{"out", "--port", "abc"}, "选项 --port 的值不对：abc"},
 		{[]string{"out", "--port", "0"}, "1 到 65535"},
-		{[]string{"out", "--snapshot", "sometimes"}, "auto、always 或 never"},
 		{[]string{"out", "--include"}, "--include 后面需要写一个值"},
 		{[]string{"out", "--include", " , "}, "需要写容器名"},
 		{[]string{"out", "web"}, "迁出不需要参数"},
-		{[]string{"out", "--no-stop", "--stop-shared"}, "不能一起用"},
 		{[]string{"in", "a", "b"}, "只需要一个迁移链接"},
 		{[]string{"in", "--existing", "merge", "x"}, "replace、skip 或 fail"},
-		{[]string{"in", "--health-timeout", "0", "x"}, "1 到 3600"},
 		{[]string{"in", "--yes=maybe"}, "选项 --yes 的值不对"},
-		{[]string{"check"}, "请在命令后面写上迁移链接"},
-		{[]string{"diagnose", "x"}, "diagnose 不需要参数"},
+		{[]string{"check", "x"}, "不认识的命令 check"}, // 已经去掉的命令
+		{[]string{"diagnose"}, "不认识的命令 diagnose"},
+		{[]string{"in", "--file", "f", "x"}, "不认识的选项 --file"},
+		{[]string{"out", "--no-stop"}, "不认识的选项 --no-stop"},
 		{[]string{"in"}, "请在命令后面写上迁移链接"}, // 没有终端可以粘贴
 		{[]string{}, "没有可以输入的终端"},
 	}
@@ -90,27 +87,23 @@ func TestUsageErrors(t *testing.T) {
 }
 
 func TestParseOptions(t *testing.T) {
-	o, err := parseOut([]string{"--include", "web, db", "--port=9000", "--snapshot", "never", "-host", "1.2.3.4"})
-	if err != nil || strings.Join(o.Include, "|") != "web|db" || o.Port != 9000 || o.Snapshot != "never" || o.Host != "1.2.3.4" {
+	o, err := parseOut([]string{"--include", "web, db", "--port=9000", "--stop-shared", "-host", "1.2.3.4"})
+	if err != nil || strings.Join(o.Include, "|") != "web|db" || o.Port != 9000 || !o.StopShared || o.Host != "1.2.3.4" {
 		t.Fatalf("parseOut：%+v %v", o, err)
 	}
 	// 选项和链接可以前后穿插。
-	i, err := parseIn([]string{"--yes", "LINK", "--existing", "skip", "--health-timeout", "120", "--keep-files", "--keep-succeeded"}, false)
-	if err != nil || i.Link != "LINK" || !i.Yes || i.Existing != "skip" || i.HealthTimeout != 120*time.Second || !i.KeepFiles || !i.KeepSucceeded {
+	i, err := parseIn([]string{"--yes", "LINK", "--existing", "skip", "--keep-succeeded"})
+	if err != nil || i.Link != "LINK" || !i.Yes || i.Existing != "skip" || !i.KeepSucceeded {
 		t.Fatalf("parseIn：%+v %v", i, err)
 	}
-	d, _ := parseIn(nil, false)
-	if d.Existing != "" || d.HealthTimeout != 60*time.Second {
+	d, _ := parseIn(nil)
+	if d.Existing != "" || d.Yes || d.KeepSucceeded {
 		t.Fatalf("默认值不对：%+v", d)
 	}
 }
 
 func TestInLinkMessages(t *testing.T) {
-	r := runCLI(t, "", nil, "in", "http://1.2.3.4:8080/x/docker_migrate_1.tar.gz.enc#sha256=00")
-	if r.code != ExitFailed || !strings.Contains(r.stderr, "docker_migrate 生成的") {
-		t.Errorf("旧链接：%d %q", r.code, r.stderr)
-	}
-	r = runCLI(t, "", nil, "in", "http://1.2.3.4:8080/abcdefghijkl/")
+	r := runCLI(t, "", nil, "in", "http://1.2.3.4:8080/abcdefghijkl/")
 	if r.code != ExitFailed || !strings.Contains(r.stderr, "缺少 # 后面的密钥") {
 		t.Errorf("缺密钥：%d %q", r.code, r.stderr)
 	}
@@ -126,7 +119,7 @@ func TestInLinkMessages(t *testing.T) {
 func TestMenu(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
 	r := runCLI(t, "1\n", nil)
-	if !strings.Contains(r.stderr, "1) 迁出\n") || !strings.Contains(r.stderr, "2) 迁入\n") || !strings.Contains(r.stderr, "3) 收集诊断信息\n") {
+	if !strings.Contains(r.stderr, "1) 迁出\n") || !strings.Contains(r.stderr, "2) 迁入\n") || strings.Contains(r.stderr, "3) ") {
 		t.Fatalf("菜单文字不对：%q", r.stderr)
 	}
 	if r.code != ExitFailed || !strings.Contains(r.stderr, "连不上 Docker") || !strings.Contains(r.stderr, "systemctl start docker") {
@@ -150,7 +143,7 @@ func TestMenuClearsScreen(t *testing.T) {
 	}
 }
 
-// fakeDockerSock 在 unix socket 上模拟一个 Docker，供诊断使用。
+// fakeDockerSock 在 unix socket 上模拟一个 Docker。
 func fakeDockerSock(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "dh")
@@ -168,7 +161,7 @@ func fakeDockerSock(t *testing.T) string {
 		fmt.Fprint(w, `{"Version":"29.2.1","ApiVersion":"1.53"}`)
 	})
 	mux.HandleFunc("/v1.53/info", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `{"OperatingSystem":"Debian","Architecture":"x86_64","NCPU":2,"MemTotal":2147483648,"Driver":"overlay2","DockerRootDir":"/","CgroupVersion":"2","Runtimes":{"runc":{}},"DefaultRuntime":"runc","Swarm":{"LocalNodeState":"inactive"}}`)
+		fmt.Fprint(w, `{"ServerVersion":"29.2.1","OperatingSystem":"Debian","Architecture":"x86_64","NCPU":2,"MemTotal":2147483648,"Driver":"overlay2","DockerRootDir":"/","CgroupVersion":"2","Runtimes":{"runc":{}},"DefaultRuntime":"runc","Swarm":{"LocalNodeState":"inactive"}}`)
 	})
 	mux.HandleFunc("/v1.53/containers/json", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, `[{"Id":"0123456789abcdef","Names":["/web"],"Image":"nginx","State":"running","Status":"Up 2 hours","Labels":{"com.docker.compose.project":"site"},"Ports":[{"IP":"0.0.0.0","PrivatePort":80,"PublicPort":8080,"Type":"tcp"}]}]`)
@@ -185,50 +178,22 @@ func fakeDockerSock(t *testing.T) string {
 	return "unix://" + sock
 }
 
-func TestDiagnose(t *testing.T) {
+// 失败时保留的日志里要有系统和 Docker 的情况：反馈问题时附上日志就够了。
+func TestFailureLogRecordsEnvironment(t *testing.T) {
 	home := t.TempDir()
-	logs := filepath.Join(home, "logs")
-	os.MkdirAll(logs, 0o700)
-	os.WriteFile(filepath.Join(logs, "in-1.log"), []byte("[12:00:00] -e DB_PASSWORD=hunter2\n[12:00:01] 恢复失败\n"), 0o600)
-
 	t.Setenv("DOCKER_HOST", fakeDockerSock(t))
-	r := runCLI(t, "", map[string]string{"DOCKHOP_HOME": home}, "diagnose")
-	if r.code != ExitOK {
-		t.Fatalf("diagnose 失败：%d %q", r.code, r.stderr)
+	r := runCLI(t, "", map[string]string{"DOCKHOP_HOME": home}, "out", "--include", "nosuch")
+	if r.code != ExitFailed {
+		t.Fatalf("应失败：%d %q", r.code, r.stderr)
 	}
-	path := ""
-	for _, l := range strings.Split(r.stderr, "\n") {
-		if strings.HasPrefix(l, "诊断文件：") {
-			path = strings.TrimPrefix(l, "诊断文件：")
+	logs, _ := filepath.Glob(filepath.Join(home, "logs", "out-*.log"))
+	if len(logs) != 1 {
+		t.Fatalf("失败时应保留日志：%v", logs)
+	}
+	b, _ := os.ReadFile(logs[0])
+	for _, want := range []string{"===== DockHop 1.0.0-test · out =====", "Docker 29.2.1 · Debian · x86_64 · 存储 overlay2 · cgroup v2 · 2 核"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("日志里缺少「%s」：\n%s", want, b)
 		}
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("读不到诊断文件 %q：%v", path, err)
-	}
-	report := string(b)
-	for _, want := range []string{
-		"DockHop：1.0.0-test（linux/amd64）",
-		"版本：29.2.1 · 接口 1.53（使用 1.53）",
-		"存储：overlay2 · / · cgroup v2",
-		"web · nginx · running · Up 2 hours · 端口 0.0.0.0:8080->80/tcp · Compose 项目 site",
-		"site_default · bridge · 172.18.0.0/16",
-		"site_data · local · Compose 项目 site",
-		"===== 最近的运行日志",
-		"DB_PASSWORD=***",
-	} {
-		if !strings.Contains(report, want) {
-			t.Errorf("诊断文件里缺少「%s」", want)
-		}
-	}
-	if strings.Contains(report, "hunter2") {
-		t.Error("诊断文件里不应出现密码")
-	}
-
-	// 连不上 Docker 时照样生成诊断文件，并写明原因。
-	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
-	r = runCLI(t, "", map[string]string{"DOCKHOP_HOME": home}, "diagnose")
-	if r.code != ExitOK || !strings.Contains(r.stderr, "诊断文件：") {
-		t.Fatalf("连不上 Docker 时也应生成诊断文件：%d %q", r.code, r.stderr)
 	}
 }

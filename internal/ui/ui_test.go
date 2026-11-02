@@ -116,16 +116,11 @@ func TestFailureKeepsFirstReason(t *testing.T) {
 	}
 }
 
-func TestVerboseDetail(t *testing.T) {
+func TestDetailOnlyLogged(t *testing.T) {
 	s, out, _ := newScreen(false)
 	s.Detail("只写日志")
 	if out.Len() != 0 {
-		t.Fatalf("默认不应显示细节：%q", out.String())
-	}
-	s.SetVerbose(true)
-	s.Detail("也显示在屏幕上")
-	if !strings.Contains(out.String(), "    也显示在屏幕上\n") {
-		t.Fatalf("--verbose 时应显示细节：%q", out.String())
+		t.Fatalf("细节不应显示在屏幕上：%q", out.String())
 	}
 }
 
@@ -221,17 +216,13 @@ func TestRedrawAfterQuestions(t *testing.T) {
 	if strings.Count(out.String(), clearScreen) != 1 {
 		t.Errorf("没问过问题的步骤不应清屏：%q", out.String())
 	}
-	// 不是终端时、--verbose 时从不清屏。
+	// 不是终端时从不清屏。
 	p, pout, _ := newScreen(false)
-	v, vout, _ := newScreen(true)
-	v.SetVerbose(true)
-	for _, x := range []*Screen{p, v} {
-		x.Begin(2, 6, "选择要迁移的服务")
-		x.Hold()
-		x.End("web")
-	}
-	if strings.Contains(pout.String(), clearScreen) || strings.Contains(vout.String(), clearScreen) {
-		t.Errorf("不是终端时、--verbose 时不应清屏：%q %q", pout.String(), vout.String())
+	p.Begin(2, 6, "选择要迁移的服务")
+	p.Hold()
+	p.End("web")
+	if strings.Contains(pout.String(), clearScreen) {
+		t.Errorf("不是终端时不应清屏：%q", pout.String())
 	}
 }
 

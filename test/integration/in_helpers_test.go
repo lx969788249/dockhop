@@ -36,7 +36,7 @@ func startOut(t *testing.T, args ...string) *migration {
 	t.Helper()
 	home := t.TempDir()
 	all := append([]string{"out", "--stop-shared", "--host", "127.0.0.1", "--port", fmt.Sprint(nextPort())}, args...)
-	p := start(t, []string{"DOCKHOP_HOME=" + home, "DOCKHOP_KEEP_LOG=1"}, all...)
+	p := start(t, []string{"DOCKHOP_HOME=" + home, "DOCKHOP_TEST_KEEP_LOG=1"}, all...)
 	m := &migration{out: p, link: p.waitFor(t, linkPattern, 10*time.Minute)}
 	t.Cleanup(func() {
 		_ = p.cmd.Process.Signal(os.Interrupt)
@@ -59,7 +59,7 @@ func runIn(t *testing.T, home string, env []string, args ...string) (string, int
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Env = append(append(os.Environ(), "DOCKHOP_HOME="+home, "DOCKHOP_KEEP_LOG=1", "DOCKHOP_TEST_STARTUP_GRACE=2s"), env...)
+	cmd.Env = append(append(os.Environ(), "DOCKHOP_HOME="+home, "DOCKHOP_TEST_KEEP_LOG=1", "DOCKHOP_TEST_STARTUP_GRACE=2s"), env...)
 	b, err := cmd.CombinedOutput()
 	code := 0
 	if ee, ok := err.(*exec.ExitError); ok {

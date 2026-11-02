@@ -241,9 +241,6 @@ func TestEvaluateDiskAndDigest(t *testing.T) {
 	if i := find(Evaluate(testPlan(), tg, &Decisions{}, Options{}), "disk_base"); i == nil || !strings.Contains(i.Title, "550MB") {
 		t.Errorf("磁盘不够：%+v", i)
 	}
-	if find(Evaluate(testPlan(), tg, &Decisions{}, Options{BundleOnDisk: true}), "disk_base") == nil {
-		t.Error("迁移包已在本机时仍要检查解开需要的空间")
-	}
 	p := testPlan()
 	p.Containers[0].DigestPinned = true
 	p.Containers[0].Image = "nginx:1.25@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

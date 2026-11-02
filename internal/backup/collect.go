@@ -116,7 +116,7 @@ func (c *collected) dataBytes() int64 {
 }
 
 // collect 读取选中内容的全部配置和大小。只读，不改动任何东西。
-func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *inventory, sel *selection, screen *ui.Screen, ignore map[string]bool, layers bool) (*collected, error) {
+func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *inventory, sel *selection, screen *ui.Screen, ignore map[string]bool) (*collected, error) {
 	out := &collected{sel: sel, layerBytes: map[*item]int64{}}
 	usage, err := dc.VolumeUsage(ctx)
 	if err != nil {
@@ -212,19 +212,17 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		out.imageBytes += size
 	}
 	// 容器里没挂载出来的改动要在停机期间打包：先量一下，太大的提前提醒（停机会更久）。
-	if layers {
-		for i, it := range sel.items {
-			if it.c.HostConfig.ReadonlyRootfs {
-				continue
-			}
-			screen.Count("统计容器里的改动", i+1, len(sel.items), it.name())
-			size, err := dc.ContainerSize(ctx, it.c.ID)
-			if err != nil {
-				screen.Detail("读不到容器 %s 里改动的大小：%v", it.name(), err)
-				continue
-			}
-			out.layerBytes[it] = size
+	for i, it := range sel.items {
+		if it.c.HostConfig.ReadonlyRootfs {
+			continue
 		}
+		screen.Count("统计容器里的改动", i+1, len(sel.items), it.name())
+		size, err := dc.ContainerSize(ctx, it.c.ID)
+		if err != nil {
+			screen.Detail("读不到容器 %s 里改动的大小：%v", it.name(), err)
+			continue
+		}
+		out.layerBytes[it] = size
 	}
 	for _, v := range vols {
 		out.volumes = append(out.volumes, v)

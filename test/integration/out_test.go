@@ -117,7 +117,7 @@ func freePort() int { return 30000 + os.Getpid()%5000 }
 func TestOutBundleContents(t *testing.T) {
 	f := setup(t)
 	home := t.TempDir()
-	env := []string{"DOCKHOP_HOME=" + home, "DOCKHOP_KEEP_LOG=1"}
+	env := []string{"DOCKHOP_HOME=" + home, "DOCKHOP_TEST_KEEP_LOG=1"}
 	p := start(t, env, "out", "--include", f.web+","+f.app, "--stop-shared", "--host", "127.0.0.1", "--port", fmt.Sprint(freePort()))
 	link, err := crypto.ParseLink(p.waitFor(t, linkPattern, 5*time.Minute))
 	if err != nil {
@@ -362,10 +362,10 @@ func TestOutDiskCheckBeforeStop(t *testing.T) {
 	}
 	defer exec.Command("sudo", "-n", "umount", small).Run()
 	f := setup(t)
-	cmd := exec.Command(bin, "out", "--include", f.web, "--stop-shared", "--workdir", small, "--port", fmt.Sprint(freePort()+2))
-	cmd.Env = append(os.Environ(), "DOCKHOP_HOME="+t.TempDir())
+	cmd := exec.Command(bin, "out", "--include", f.web, "--stop-shared", "--port", fmt.Sprint(freePort()+2))
+	cmd.Env = append(os.Environ(), "DOCKHOP_HOME="+small)
 	b, err := cmd.CombinedOutput()
-	if err == nil || !strings.Contains(string(b), "磁盘空间可能不够") || !strings.Contains(string(b), "--workdir") {
+	if err == nil || !strings.Contains(string(b), "磁盘空间可能不够") || !strings.Contains(string(b), "DOCKHOP_HOME=") {
 		t.Fatalf("磁盘不够时应停下并提示：%v\n%s", err, b)
 	}
 	if strings.Contains(string(b), "[4/6]") {
@@ -373,17 +373,6 @@ func TestOutDiskCheckBeforeStop(t *testing.T) {
 	}
 	if s := state(t, f.web); s != "running" {
 		t.Fatalf("磁盘不够时不应停止任何容器，web：%s", s)
-	}
-}
-
-// 不停机打包时，和别的容器共用数据就无法保证一致，直接拒绝。
-func TestOutNoStopWithSharedData(t *testing.T) {
-	f := setup(t)
-	cmd := exec.Command(bin, "out", "--include", f.web, "--no-stop", "--port", fmt.Sprint(freePort()+3))
-	cmd.Env = append(os.Environ(), "DOCKHOP_HOME="+t.TempDir())
-	b, err := cmd.CombinedOutput()
-	if err == nil || !strings.Contains(string(b), "不停机打包无法保证数据一致") {
-		t.Fatalf("应拒绝：%v\n%s", err, b)
 	}
 }
 

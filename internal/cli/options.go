@@ -7,29 +7,21 @@ import (
 	"io"
 	"regexp"
 	"strings"
-	"time"
 )
 
 // OutOptions 是迁出的选项。
 type OutOptions struct {
 	Include    []string
-	NoStop     bool
 	StopShared bool
-	Snapshot   string // auto、always、never
 	Port       int
 	Host       string
-	Workdir    string
 }
 
-// InOptions 是迁入（以及只检查）的选项。
+// InOptions 是迁入的选项。
 type InOptions struct {
 	Link          string
-	File          string
 	Yes           bool
 	Existing      string // replace、skip、fail；空表示询问
-	SkipCheck     bool
-	HealthTimeout time.Duration
-	KeepFiles     bool
 	KeepSucceeded bool
 }
 
@@ -96,15 +88,12 @@ func translateFlagError(err error) error {
 }
 
 func parseOut(args []string) (OutOptions, error) {
-	o := OutOptions{Snapshot: "auto", Port: 8080}
+	o := OutOptions{Port: 8080}
 	fs := flag.NewFlagSet("out", flag.ContinueOnError)
 	include := fs.String("include", "", "")
-	fs.BoolVar(&o.NoStop, "no-stop", false, "")
 	fs.BoolVar(&o.StopShared, "stop-shared", false, "")
-	fs.StringVar(&o.Snapshot, "snapshot", "auto", "")
 	fs.IntVar(&o.Port, "port", 8080, "")
 	fs.StringVar(&o.Host, "host", "", "")
-	fs.StringVar(&o.Workdir, "workdir", "", "")
 	rest, err := parseArgs(fs, args)
 	if err != nil {
 		return o, err
@@ -120,57 +109,32 @@ func parseOut(args []string) (OutOptions, error) {
 	if *include != "" && len(o.Include) == 0 {
 		return o, usageErr("--include 后面需要写容器名，多个用逗号分开")
 	}
-	switch o.Snapshot {
-	case "auto", "always", "never":
-	default:
-		return o, usageErr("--snapshot 只能是 auto、always 或 never，不能是 %s", o.Snapshot)
-	}
 	if o.Port < 1 || o.Port > 65535 {
 		return o, usageErr("--port 必须是 1 到 65535 之间的端口号")
-	}
-	if o.NoStop && o.StopShared {
-		return o, usageErr("--no-stop 和 --stop-shared 不能一起用：不停机时不会停止任何容器")
 	}
 	return o, nil
 }
 
-const defaultHealthTimeout = 60 * time.Second
-
-func parseIn(args []string, needLink bool) (InOptions, error) {
-	o := InOptions{HealthTimeout: defaultHealthTimeout}
+func parseIn(args []string) (InOptions, error) {
+	var o InOptions
 	fs := flag.NewFlagSet("in", flag.ContinueOnError)
-	fs.StringVar(&o.File, "file", "", "")
 	fs.BoolVar(&o.Yes, "yes", false, "")
 	fs.StringVar(&o.Existing, "existing", "", "")
-	fs.BoolVar(&o.SkipCheck, "skip-check", false, "")
-	seconds := fs.Int("health-timeout", 60, "")
-	fs.BoolVar(&o.KeepFiles, "keep-files", false, "")
 	fs.BoolVar(&o.KeepSucceeded, "keep-succeeded", false, "")
 	rest, err := parseArgs(fs, args)
 	if err != nil {
 		return o, err
 	}
-	switch len(rest) {
-	case 0:
-		if needLink {
-			return o, usageErr("请在命令后面写上迁移链接，例如 dockhop check '链接'")
-		}
-	case 1:
-		o.Link = rest[0]
-	default:
+	if len(rest) > 1 {
 		return o, usageErr("只需要一个迁移链接，多出来的是：%s。链接里有特殊字符，记得用单引号括起来", strings.Join(rest[1:], " "))
+	}
+	if len(rest) == 1 {
+		o.Link = rest[0]
 	}
 	switch o.Existing {
 	case "", "replace", "skip", "fail":
 	default:
 		return o, usageErr("--existing 只能是 replace、skip 或 fail，不能是 %s", o.Existing)
-	}
-	if *seconds < 1 || *seconds > 3600 {
-		return o, usageErr("--health-timeout 必须是 1 到 3600 之间的秒数")
-	}
-	o.HealthTimeout = time.Duration(*seconds) * time.Second
-	if o.File != "" && o.Link == "" && needLink {
-		return o, usageErr("用 --file 时也需要迁移链接：链接里有解开迁移包的密钥")
 	}
 	return o, nil
 }

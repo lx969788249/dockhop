@@ -21,14 +21,12 @@ func main() {
 	defer stop()
 
 	tty := term.IsTerminal(int(os.Stderr.Fd()))
-	wd, _ := os.Getwd()
 	code := cli.Run(os.Args[1:], cli.Env{
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
 		TTY:     tty,
 		Input:   terminalInput(tty),
 		Version: version,
-		Workdir: wd,
 		Context: ctx,
 		Width:   terminalWidth,
 		Count:   "https://dockhop.run/count",

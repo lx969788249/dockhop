@@ -38,10 +38,11 @@ jobs:
       - name: 在真实 Docker 上运行
         run: |
           ./dist/dockhop-linux-amd64 version
-          cd "$(mktemp -d)"
-          "$GITHUB_WORKSPACE/dist/dockhop-linux-amd64" diagnose
-          grep -q "版本：" dockhop-diagnose-*.txt
-          grep -q "===== 监听端口 =====" dockhop-diagnose-*.txt
+          # 连上 Docker、读出容器，找不到要迁移的容器时说明原因；失败时留下的日志里记着 Docker 的情况。
+          export DOCKHOP_HOME="$(mktemp -d)"
+          if ./dist/dockhop-linux-amd64 out --include dockhop-ci-none </dev/null >out.txt 2>&1; then exit 1; fi
+          grep -q "没有找到容器 dockhop-ci-none" out.txt
+          grep -q "Docker [0-9]" "$DOCKHOP_HOME"/logs/out-*.log
       - uses: actions/upload-artifact@v5
         with:
           name: dist
@@ -86,5 +87,4 @@ jobs:
           docker run --rm -v "$PWD/dist:/dist" "${{ matrix.image }}" sh -c '
             /dist/dockhop-linux-amd64 version &&
             /dist/dockhop-linux-amd64 --help >/dev/null &&
-            cd /tmp && /dist/dockhop-linux-amd64 diagnose &&
-            grep -q "连不上 Docker" dockhop-diagnose-*.txt'
+            { /dist/dockhop-linux-amd64 out </dev/null 2>&1; true; } | grep -q "连不上 Docker"'

@@ -281,7 +281,7 @@ func (r *run) waitReady(ctx context.Context, name, id string) error {
 			}
 		}
 	}
-	timeout := healthTimeout(r.opts.HealthTimeout, hc.StartPeriod, hc.Interval, hc.Timeout)
+	timeout := healthTimeout(minHealthWait, hc.StartPeriod, hc.Interval, hc.Timeout)
 	for {
 		c, _, err := r.Docker.InspectContainer(ctx, id)
 		if err != nil {
@@ -326,6 +326,9 @@ func lastLine(s string) string {
 	}
 	return l
 }
+
+// minHealthWait 是健康检查至少等多久。
+const minHealthWait = 60 * time.Second
 
 // healthTimeout 是健康检查最长等多久：至少 base，并且够容器自己的健康检查跑完第一次。
 // 有的镜像每 60 秒才检查一次（例如 Vaultwarden），固定等 60 秒会在第一次检查出结果之前就超时。

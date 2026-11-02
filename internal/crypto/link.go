@@ -11,7 +11,6 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -32,9 +31,6 @@ var (
 	tokenPattern = regexp.MustCompile(`^[A-Za-z0-9]{8,64}$`)
 	keyPattern   = regexp.MustCompile(`^[0-9a-z]{58}$`)
 )
-
-// ErrOldLink 表示这是 bash 版 docker_migrate 生成的链接。
-var ErrOldLink = errors.New("这个链接是 docker_migrate 生成的，DockHop 不能使用。请在旧服务器改用 DockHop 重新运行迁出")
 
 // LinkError 说明链接哪里不对。
 type LinkError struct{ Reason string }
@@ -108,9 +104,6 @@ func ParseLink(s string) (Link, error) {
 	s = strings.Trim(s, `"'`)
 	if s == "" {
 		return Link{}, &LinkError{"没有提供迁移链接"}
-	}
-	if strings.Contains(s, ".tar.gz.enc") {
-		return Link{}, ErrOldLink
 	}
 	u, err := url.Parse(s)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {

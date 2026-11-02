@@ -111,8 +111,7 @@ func stopOne(ctx context.Context, dc *docker.Client, c StoppedContainer) error {
 
 // layerState 检查容器的镜像和可写层：moved 说明原来的镜像名为什么不能用（已经指向
 // 别的版本或已删除）；keep、deleted 是要迁移的新增或修改的路径、删除的路径。
-// --snapshot never 时不迁移改动，always 时运行时目录里的改动也迁移。
-func layerState(ctx context.Context, dc *docker.Client, it *item, mode string) (moved string, keep, deleted []string, err error) {
+func layerState(ctx context.Context, dc *docker.Client, it *item) (moved string, keep, deleted []string, err error) {
 	img, err := dc.InspectImage(ctx, it.c.Config.Image)
 	switch {
 	case err != nil && docker.IsNotFound(err):
@@ -122,7 +121,7 @@ func layerState(ctx context.Context, dc *docker.Client, it *item, mode string) (
 	case img.ID != it.c.Image:
 		moved = "镜像名 " + it.c.Config.Image + " 已经指向别的版本"
 	}
-	if mode == "never" || it.c.HostConfig.ReadonlyRootfs {
+	if it.c.HostConfig.ReadonlyRootfs {
 		return moved, nil, nil, nil // 只读的容器里不会有改动
 	}
 	changes, err := dc.ContainerChanges(ctx, it.c.ID)
@@ -137,9 +136,6 @@ func layerState(ctx context.Context, dc *docker.Client, it *item, mode string) (
 		mounts = append(mounts, dest) // --tmpfs 不在 Mounts 里
 	}
 	keep, deleted = spec.LayerChanges(changes, mounts)
-	if mode == "always" {
-		keep, deleted = spec.AllLayerChanges(changes, mounts)
-	}
 	return moved, keep, deleted, nil
 }
 

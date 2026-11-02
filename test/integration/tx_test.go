@@ -5,8 +5,10 @@ package integration
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/transfer"
 )
 
 // 事务和安全场景（设计文档附录 C）：新服务器上已经有同名的服务、数据时，迁入失败或
@@ -371,7 +374,12 @@ func TestInRejectsUnsafeBundle(t *testing.T) {
 	removeAll(p + "_web")
 	try("docker", "volume", "rm", p+"_vol")
 
-	link, _ := crypto.NewLink("127.0.0.1", 9)
+	// 用一个下载服务把它发给新服务器。没有迁移计划：下载前的检查会跳过，解开时照样要拒绝。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, _ := crypto.NewLink("127.0.0.1", ln.Addr().(*net.TCPAddr).Port)
 	path := filepath.Join(t.TempDir(), "bundle")
 	out, _ := os.Create(path)
 	w, _ := bundle.NewWriter(out, link)
@@ -397,9 +405,15 @@ func TestInRejectsUnsafeBundle(t *testing.T) {
 	w.AddJSON("manifest.json", m)
 	w.Close()
 	out.Close()
+	srv, err := transfer.NewServer(ln, link, path, "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
 
 	home := t.TempDir()
-	got, code := runIn(t, home, nil, "in", "--yes", "--file", path, link.String())
+	got, code := runIn(t, home, nil, "in", "--yes", link.String())
 	if code == 0 || !strings.Contains(got, "已拒绝迁入") {
 		t.Fatalf("应拒绝不安全的迁移包：%d", code)
 	}
@@ -412,9 +426,6 @@ func TestInRejectsUnsafeBundle(t *testing.T) {
 	}
 	if left, _ := filepath.Glob(filepath.Join(home, "work", "*", "data")); len(left) > 0 {
 		t.Errorf("失败时应删除解密后的数据：%v", left)
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Error("用 --file 给的迁移包不能删")
 	}
 }
 

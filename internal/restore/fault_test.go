@@ -602,38 +602,34 @@ esac
 	}
 }
 
-// 迁出正在运行（拿着 out.lock）时，它的临时容器在读数据卷：迁入（包括只检查）不能把它
-// 当作遗留的删掉。这里是老版本的临时容器（没记是谁的）；只检查时根本不动 Docker。
+// 迁出正在运行（拿着 out.lock）时，它的临时容器在读数据卷：迁入不能把它当作遗留的删掉。
+// 这里是老版本的临时容器（没记是谁的）；旧服务器连不上，迁入在下载之前就结束。
 func TestRestoreKeepsRunningExportHelper(t *testing.T) {
 	t.Setenv("PATH", t.TempDir()) // 不调用这台机器上真的 docker compose
-	for _, checkOnly := range []bool{false, true} {
-		home := t.TempDir()
-		lock, err := host.TryLock(filepath.Join(home, "locks", "out.lock"))
-		if err != nil {
-			t.Fatal(err)
+	home := t.TempDir()
+	lock, err := host.TryLock(filepath.Join(home, "locks", "out.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Unlock()
+	var deleted []string
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/containers/json"):
+			io.WriteString(w, `[{"Id":"export-helper","Names":["/dockhop-helper-x-1"],"Labels":{"dockhop.helper":"1"}}]`)
+		case req.Method == http.MethodDelete:
+			deleted = append(deleted, req.URL.Path)
+			w.WriteHeader(204)
+		default:
+			return false
 		}
-		var deleted []string
-		dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-			switch {
-			case strings.HasSuffix(req.URL.Path, "/containers/json"):
-				io.WriteString(w, `[{"Id":"export-helper","Names":["/dockhop-helper-x-1"],"Labels":{"dockhop.helper":"1"}}]`)
-			case req.Method == http.MethodDelete:
-				deleted = append(deleted, req.URL.Path)
-				w.WriteHeader(204)
-			default:
-				return false
-			}
-			return true
-		})
-		link, _ := crypto.NewLink("127.0.0.1", 1)
-		file := filepath.Join(home, "broken.bundle")
-		os.WriteFile(file, []byte("不是迁移包"), 0o600)
-		var out bytes.Buffer
-		Run(context.Background(), Deps{Docker: dc, Home: home, Screen: ui.New(&out, false, nil), Prompt: ui.NewPrompter(nil, &out),
-			Getenv: func(string) string { return "" }}, Options{Link: link, File: file, CheckOnly: checkOnly})
-		lock.Unlock()
-		if len(deleted) > 0 {
-			t.Errorf("checkOnly=%v：删除了 %v", checkOnly, deleted)
-		}
+		return true
+	})
+	link, _ := crypto.NewLink("127.0.0.1", 1)
+	var out bytes.Buffer
+	Run(context.Background(), Deps{Docker: dc, Home: home, Screen: ui.New(&out, false, nil), Prompt: ui.NewPrompter(nil, &out),
+		Getenv: func(string) string { return "" }}, Options{Link: link})
+	if len(deleted) > 0 {
+		t.Errorf("删除了 %v", deleted)
 	}
 }

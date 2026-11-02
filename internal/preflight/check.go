@@ -160,10 +160,9 @@ func (d *Decisions) AutoSubnetFor(network string) bool { return has(d.AutoSubnet
 
 // Options 是检查的选项。
 type Options struct {
-	Existing     string // replace、skip、fail；空表示有同名服务时询问
-	BaseDir      string // 存放下载和解压文件的目录
-	BundleOnDisk bool   // 迁移包已经在本机（--file），不需要下载
-	Home         string // DockHop 自己的目录，挂载目录不能和它重叠
+	Existing string // replace、skip、fail；空表示有同名服务时询问
+	BaseDir  string // 存放下载和解压文件的目录
+	Home     string // DockHop 自己的目录，挂载目录不能和它重叠
 }
 
 var archAlias = map[string]string{"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64",
@@ -476,9 +475,6 @@ func diskIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, usedVolum
 		return 0
 	}
 	bundleBytes := plan.Sizes.Bundle
-	if o.BundleOnDisk {
-		bundleBytes = 0
-	}
 	var keptVolumes int64
 	for _, v := range plan.Volumes {
 		if d.KeepVolume(v.Name) || !usedVolumes[v.Name] {
