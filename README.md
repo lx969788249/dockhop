@@ -49,8 +49,6 @@ bash <(curl -fsSL https://dockhop.run)
 | 3 | 新服务器 | 选择 `2) 迁入`，粘贴链接，自动完成检查、下载和迁入 |
 | 4 | 旧服务器 | 新服务器迁入成功后，旧服务器这边自动结束、清理临时文件 |
 
-也可以直接带上命令，跳过菜单：在旧服务器 `bash <(curl -fsSL https://dockhop.run) out`，在新服务器 `bash <(curl -fsSL https://dockhop.run) in '迁移链接'`。
-
 > [!WARNING]
 > 迁移链接里包含解开这次迁移包的密钥。请完整复制，只通过可信的渠道发送，不要公开。
 
