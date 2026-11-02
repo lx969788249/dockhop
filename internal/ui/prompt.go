@@ -6,8 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
+
+	"golang.org/x/term"
 )
 
 // ErrNotInteractive 表示没有终端可以提问（定时任务、管道、nohup 等）。
@@ -27,6 +30,7 @@ type Prompter struct {
 	out   io.Writer
 	ctx   context.Context
 	lines chan readResult // 正在读的那一行；被 Ctrl+C 打断时留给下一次提问
+	tty   int             // 输入是终端时是它的文件描述符（Keys 要用），否则为 -1
 }
 
 type readResult struct {
@@ -36,9 +40,12 @@ type readResult struct {
 
 // NewPrompter 创建提问器。in 通常是 /dev/tty；不能交互时传 nil。
 func NewPrompter(in io.Reader, out io.Writer) *Prompter {
-	p := &Prompter{out: out}
+	p := &Prompter{out: out, tty: -1}
 	if in != nil {
 		p.in = bufio.NewReader(in)
+		if f, ok := in.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+			p.tty = int(f.Fd())
+		}
 	}
 	return p
 }
@@ -156,6 +163,3 @@ func (p *Prompter) Ask(label string, valid func(string) error) (string, error) {
 		return line, nil
 	}
 }
-
-// ReadLine 等用户输入一行（例如按回车结束传输）。
-func (p *Prompter) ReadLine() (string, error) { return p.readLine() }

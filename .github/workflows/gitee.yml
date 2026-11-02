@@ -1,0 +1,37 @@
+name: gitee
+
+# 把 GitHub 上已经发布的一个版本同步到 Gitee（代码、标签和发行版里的文件），国内服务器从 Gitee
+# 下载程序快得多。发布时 release 工作流会自动调用这里；同步失败时，可以在 Actions 里手动运行
+# 这个工作流，填上版本标签重新同步。需要仓库的 Secrets 里有 GITEE_TOKEN（Gitee 的私人令牌）。
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 版本标签，例如 v1.1.3
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  gitee:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: 同步到 Gitee
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release download "$TAG" -D dist
+          scripts/gitee-release.sh "$TAG" dist/*

@@ -1,7 +1,7 @@
 name: release
 
 # 推送 v1.2.3 这样的标签时自动发布：编译三个架构、生成校验值、创建 GitHub Release，
-# 并把带新版本号和校验值的 run.sh 提交到 main（一行命令用的就是它）。
+# 把带新版本号和校验值的 run.sh 提交到 main（一行命令用的就是它），再同步到 Gitee。
 on:
   push:
     tags: ["v*"]
@@ -44,3 +44,11 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "发布 ${GITHUB_REF_NAME}：更新 run.sh 的版本号和校验值"
           git push origin main
+
+  # 同步失败不影响上面已经完成的 GitHub 发布，run.sh 会改从 GitHub 下载；可以在 Actions 里重跑这一步。
+  gitee:
+    needs: release
+    uses: ./.github/workflows/gitee.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit

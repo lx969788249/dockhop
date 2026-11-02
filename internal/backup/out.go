@@ -482,7 +482,7 @@ func (r *run) addStream(w *bundle.Writer, prefix, label string, rc io.Reader, to
 	return parts, n, err
 }
 
-// serve 是最后一步：提供下载，直到新服务器迁入成功、用户输入 q 结束或程序被结束。
+// serve 是最后一步：提供下载，直到新服务器迁入成功、用户按 Esc 和回车结束或程序被结束。
 func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bundlePath, planPath string, size int64) error {
 	s := r.Screen
 	live := &liveLine{s: s}
@@ -514,30 +514,31 @@ func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bund
 
 	s.Println(r.instructions(ctx, link))
 	live.wait("等待新服务器连接")
-	quit := make(chan struct{}, 1)
-	if r.Prompt.Interactive() {
-		go func() {
-			for {
-				line, err := r.Prompt.ReadLine()
-				if err != nil {
-					return
-				}
-				if strings.EqualFold(line, "q") {
-					quit <- struct{}{}
-					return
-				}
-				s.Println("要结束传输，请输入 q 再按回车。")
-			}
-		}()
-	}
+	keys, restore := r.Prompt.Keys()
+	defer restore()
+	asked := false // 按了 Esc，在等回车确认
 	for {
 		select {
 		case <-ctx.Done():
 			s.Detail("收到结束信号，结束传输")
 			return nil
-		case <-quit:
-			s.Detail("用户输入 q 结束传输")
-			return nil
+		case k := <-keys:
+			// 按 Esc 再按回车结束。q 和 Esc 一样：手机上的 SSH 软件不一定有 Esc 键，以前也是输入 q 结束。
+			switch {
+			case k == ui.KeyEsc || k == 'q' || k == 'Q':
+				if !asked {
+					asked = true
+					s.Println("再按回车结束传输，链接随即失效；按其他键继续等待。")
+				}
+			case k == ui.KeyEnter && asked:
+				s.Detail("用户按 Esc 和回车结束传输")
+				return nil
+			case k == ui.KeyEnter:
+				s.Println("要结束传输，请先按 Esc，再按回车。")
+			case asked:
+				asked = false
+				s.Println("继续等待。")
+			}
 		case <-completeCh:
 			s.Println("新服务器已经下载完迁移包，正在迁入……")
 			live.wait("新服务器正在迁入")
@@ -631,7 +632,7 @@ func (r *run) instructions(ctx context.Context, link crypto.Link) string {
 	}
 	b.WriteString("· 链接里含有解密密钥，不要发给别人\n")
 	if r.Prompt.Interactive() {
-		b.WriteString("· 不想迁了：输入 q 再按回车结束传输，链接随即失效\n")
+		b.WriteString("· 不想迁了：按 Esc 再按回车结束传输，链接随即失效\n")
 	} else {
 		b.WriteString(fmt.Sprintf("· 不想迁了：执行 kill -TERM %d 结束传输，链接随即失效\n", os.Getpid()))
 	}
