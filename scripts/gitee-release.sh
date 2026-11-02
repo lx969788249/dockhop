@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 把 GitHub 上已经发布的一个版本同步到 Gitee：推送代码和标签，创建同名的发行版，上传文件。
-# 国内服务器从 Gitee 下载程序快得多（run.sh 会先比较 Gitee 和 GitHub 的速度）。
-# 从 GitHub 的服务器往 Gitee 上传很慢（实测每秒只有十几到几十 KB，还会断），所以只传 run.sh
-# 要用的文件（由调用的地方挑选）；Gitee 上已经有的不再重传，失败了重新运行就能接着传。
+# 把 GitHub 上已经发布的一个版本同步到 Gitee：推送代码和标签，创建同名的发行版，上传和 GitHub
+# 上一样的文件。国内服务器从 Gitee 下载程序快得多（run.sh 会先比较 Gitee 和 GitHub 的速度）。
+# 从 GitHub 的服务器往 Gitee 上传很慢（实测每秒十几到几十 KB，还会断），所以文件按给出的顺序
+# 上传（run.sh 要用的压缩包放在前面）；Gitee 上已经有的不再重传，失败了重新运行就能接着传。
 # Gitee 上每个仓库的附件合计不能超过 1GB，所以只保留最近 10 个版本。
 #   GITEE_TOKEN=私人令牌 scripts/gitee-release.sh 标签 文件……
 set -euo pipefail
@@ -46,8 +46,8 @@ for f in "$@"; do
       echo "已有 $(basename "$f")"
       continue 2
     fi
-    # 每次最多传 20 分钟。断了、超时了，下一次先看看是不是其实已经传上去了。
-    if curl -fsS --max-time 1200 -X POST "${api}/releases/${id}/attach_files" \
+    # 慢不要紧，5 分钟几乎没有进展才放弃这一次。下一次先看看是不是其实已经传上去了。
+    if curl -fsS --speed-limit 1024 --speed-time 300 -X POST "${api}/releases/${id}/attach_files" \
       -F "access_token=${token}" -F "file=@${f}" >/dev/null; then
       echo "已上传 $(basename "$f")"
       continue 2
