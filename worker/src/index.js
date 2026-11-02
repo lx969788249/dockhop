@@ -6,6 +6,9 @@
 // /v版本号/dockhop-linux-架构[.gz] 是 GitHub Release 里的程序，由这里转发并缓存在
 // Cloudflare 上：国内服务器从 GitHub 下载常常很慢甚至断开。run.sh 会核对下载的程序的
 // SHA-256，这里转发的内容就算出了问题也不会被运行。
+//
+// /count 是成功完成迁移的次数（D1 里只存这一个数字）：程序开头的菜单读出来显示；迁入
+// 成功时程序发一个空的 POST，次数加 1。不记录任何别的东西。
 
 const SCRIPT = "https://raw.githubusercontent.com/lx969788249/dockhop/main/run.sh";
 const REPO = "https://github.com/lx969788249/dockhop";
@@ -28,6 +31,9 @@ export default {
     if (url.protocol === "http:") {
       url.protocol = "https:";
       return Response.redirect(url.toString(), 301);
+    }
+    if (url.pathname === "/count") {
+      return count(request, env);
     }
     const asset = url.pathname.match(ASSET);
     if (asset) {
@@ -80,4 +86,24 @@ async function release(request, ctx, version, name) {
   res.headers.set("cache-control", "public, max-age=31536000, immutable");
   ctx.waitUntil(cache.put(key, res.clone()));
   return request.method === "HEAD" ? new Response(null, res) : res;
+}
+
+// count 读出或增加成功完成迁移的次数。出了问题（例如免费额度用完）返回 503，程序会当作
+// 读不到：菜单里不显示这一行，迁移照常进行。
+async function count(request, env) {
+  try {
+    if (request.method === "POST") {
+      // 只认 DockHop 发来的；同一个地址一分钟最多算 5 次，防止有人刷数字。
+      const ua = request.headers.get("user-agent") ?? "";
+      const ip = request.headers.get("cf-connecting-ip") ?? "";
+      if (ua.startsWith("DockHop/") && (await env.LIMIT.limit({ key: ip })).success) {
+        await env.DB.prepare("UPDATE counter SET n = n + 1").run();
+      }
+      return new Response(null, { status: 204 });
+    }
+    const row = await env.DB.prepare("SELECT n FROM counter").first();
+    return text(`${row?.n ?? 0}\n`, 200);
+  } catch {
+    return text("暂时读不到\n", 503);
+  }
 }

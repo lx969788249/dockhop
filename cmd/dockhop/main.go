@@ -31,6 +31,7 @@ func main() {
 		Workdir: wd,
 		Context: ctx,
 		Width:   terminalWidth,
+		Count:   "https://dockhop.run/count",
 	})
 	os.Exit(code)
 }

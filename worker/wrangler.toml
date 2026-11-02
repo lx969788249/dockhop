@@ -6,3 +6,15 @@ workers_dev = false
 
 # 直接挂在 dockhop.run 上，Cloudflare 会自动加好 DNS 和证书。
 routes = [{ pattern = "dockhop.run", custom_domain = true }]
+
+# 成功完成迁移的次数（见 src/index.js 的 count），建库和建表的命令写在 schema.sql 里。
+[[d1_databases]]
+binding = "DB"
+database_name = "dockhop"
+database_id = "b2041e01-9a71-4ba6-b2aa-80fe1af1d650"
+
+# 计数按来源地址限速：同一个地址一分钟最多算 5 次。
+[[ratelimits]]
+name = "LIMIT"
+namespace_id = "1001"
+simple = { limit = 5, period = 60 }

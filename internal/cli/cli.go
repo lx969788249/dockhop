@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/lx969788249/dockhop/internal/backup"
@@ -40,6 +41,7 @@ type Env struct {
 	Platform string     // 例如 linux/amd64
 	Width    func() int // 终端有多少列；0 表示不知道
 	Args     []string
+	Count    string // 成功完成迁移的次数的地址（见 count.go）；为空时不访问
 
 	// 一次运行只有一个屏幕和一个提问器：同一个终端输入只能有一个地方在读。
 	screen *ui.Screen
@@ -111,6 +113,7 @@ const helpText = `DockHop：一条链接，把 Docker 服务连同数据从旧�
 环境变量：
   DOCKHOP_HOME         日志、记录和工作文件的目录（默认 ~/.dockhop）
   DOCKHOP_KEEP_LOG=1   成功后也保留日志
+  DOCKHOP_NO_STATS=1   不统计、也不显示成功完成迁移的次数（也认 DO_NOT_TRACK=1）
 
 迁移链接里有特殊字符，在命令里使用时请用单引号括起来：dockhop in '链接'
 `
@@ -203,7 +206,11 @@ func menu(env *Env) error {
 		fmt.Fprint(env.Stdout, helpText)
 		return usageErr("没有可以输入的终端，请直接写明命令，例如 dockhop out 或 dockhop in '链接'")
 	}
+	n := migrations(env)
 	env.screen.Start()
+	if n > 0 {
+		env.screen.Println(" 已成功完成迁移：" + env.screen.Green(strconv.Itoa(n)) + " 次\n")
+	}
 	choice, err := env.prompt.Choose([]string{"迁出", "迁入", "收集诊断信息"}, 1)
 	if err != nil {
 		return err
@@ -304,6 +311,9 @@ func runIn(env *Env, opts InOptions, checkOnly bool) error {
 		KeepSucceeded: opts.KeepSucceeded,
 	})
 	t.finish(err == nil)
+	if err == nil && !checkOnly {
+		countMigration(env)
+	}
 	if errors.Is(err, restore.ErrReported) {
 		return errReported
 	}

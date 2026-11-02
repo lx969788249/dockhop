@@ -230,6 +230,7 @@ dockhop diagnose
 |---|---|---|
 | `DOCKHOP_HOME` | `~/.dockhop` | 日志（`logs/`）、中断记录（`state/`）、回滚资料（`rollback/`）和工作文件（`work/`）都放在这里 |
 | `DOCKHOP_KEEP_LOG` | — | 设为 `1` 时，成功后也保留日志 |
+| `DOCKHOP_NO_STATS` | — | 设为 `1` 时不统计、也不在菜单里显示成功完成迁移的次数（也认 `DO_NOT_TRACK=1`），见下面的常见问题 |
 | `DOCKHOP_MIRROR` | dockhop.run，不行时 GitHub Releases | 一行命令下载程序用的镜像站（设置后只用它）；程序的校验值写在 `run.sh` 里，从镜像站下载也能确认没被改动 |
 
 完整说明见 `dockhop --help`。
@@ -341,6 +342,12 @@ DockHop 会把有关联的服务分成一组（同一个 Compose 项目，或者
 <summary><b>出错了怎么反馈？</b></summary>
 
 每次运行都会把完整过程写进日志（`~/.dockhop/logs/`）。成功后日志自动删除；失败时结果里会给出日志路径，提交 [Issue](https://github.com/lx969788249/dockhop/issues) 时附上它即可。也可以运行 `dockhop diagnose` 生成一份包含系统、Docker 状态和最近日志的诊断文件。日志和诊断文件里的迁移密钥、容器密码等敏感信息会自动替换为 `***`。
+</details>
+
+<details>
+<summary><b>菜单里的“已成功完成迁移”次数是怎么来的？会上传我的信息吗？</b></summary>
+
+迁入成功后，程序向 `dockhop.run` 发一个不带任何内容的请求，把这个次数加 1；开头的菜单读出这个次数显示出来。服务器上只存这一个数字，不记录 IP、服务器、容器或任何其他信息。连不上 `dockhop.run` 时菜单里不显示这一行，迁移照常进行，不会报错。不想发送这个请求，运行前设置 `DOCKHOP_NO_STATS=1`（或 `DO_NOT_TRACK=1`）即可。
 </details>
 
 <details>
