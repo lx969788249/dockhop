@@ -4,15 +4,17 @@
 #
 # 判断 CPU 架构 → 下载对应的程序 → 核对 SHA-256 → 运行 → 删除。
 # 程序的校验值写在这个脚本里（发布时自动生成），从哪里下载都能确认没被篡改。
-# 先从 dockhop.run 下载（Cloudflare 缓存，国内一般比 GitHub 快），太慢或失败时自动换 GitHub；
+# 程序同时发布在 Gitee 和 GitHub 上：先同时各试 2 秒，从快的那个下载（国内服务器一般是 Gitee，
+# 海外的一般是 GitHub）；太慢或失败时换另一个，能接着下载就接着下载。
 # 设置了 DOCKHOP_MIRROR=镜像站地址 时只用这个镜像站。
 set -euo pipefail
 
-VERSION="1.1.2"
-SHA256_AMD64="d323b3fab95a533cdfb3778f4824e4108bc6f5626506130d0edb25edcd4fb5ba"
-SHA256_ARM64="f86dda828ad8851aa592d702f7b126e1d39167483d6e99a6da581009a9099b2e"
-SHA256_ARMV7="7f03109f1f828ee73441c45dca6f2cb6027650761688a25a5409758c117873c2"
-RELEASES="https://github.com/lx969788249/dockhop/releases/download"
+VERSION="1.1.3"
+SHA256_AMD64="61bc8a99c0d7ad9204fdac97ef57127e6bf3749b27ac03b2b307429daaf60402"
+SHA256_ARM64="9be2555d064d3a489f02e5e63a0e25c39ed446a7725d35a21943f9733eaaa099"
+SHA256_ARMV7="1f7e3061390ac0a752cdb23d29ebbc8d7b7910c2a09f968f0381a5d79473c156"
+GITEE="https://gitee.com/lx969788249/dockhop/releases/download"
+GITHUB="https://github.com/lx969788249/dockhop/releases/download"
 
 fail() {
   printf '✗ %s\n' "$1" >&2
@@ -37,7 +39,7 @@ name="dockhop-linux-${arch}"
 if [[ -n "${DOCKHOP_MIRROR:-}" ]]; then
   sources=("${DOCKHOP_MIRROR%/}")
 else
-  sources=("https://dockhop.run" "$RELEASES")
+  sources=("$GITEE" "$GITHUB")
 fi
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/dockhop.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
@@ -59,21 +61,35 @@ else
 fi
 sha256() { "${sumcmd[@]}" "$1" | awk '{print $1}'; }
 
+# 有 gzip 时下载压缩过的程序（小一半多）。
+gz=""
+if command -v gzip >/dev/null 2>&1; then
+  gz=".gz"
+fi
+
 human() { awk -v n="$1" 'BEGIN { if (n >= 1048576) printf "%.1fMB", n / 1048576; else printf "%dKB", n / 1024 }'; }
+
+# host 地址：只取出主机名（和端口），用在提示里。
+host() {
+  local h="${1#*://}"
+  printf '%s' "${h%%/*}"
+}
 
 # show_progress 下载进程 文件：下载时每隔一会儿在同一行显示下载了多少、速度，下载完擦掉这一行。
 # 不用 curl 自己的进度条：它出错时会在屏幕上打出“curl: (28) …”这样的英文。
 show_progress() {
-  local pid="$1" out="$2" start=$SECONDS size total line
+  local pid="$1" out="$2" start=$SECONDS from size total line
+  from="$(wc -c <"$out" 2>/dev/null || echo 0)"
   while kill -0 "$pid" 2>/dev/null; do
     size="$(wc -c <"$out" 2>/dev/null || echo 0)"
-    total="$(awk 'tolower($1) == "content-length:" { n = $2 + 0 } END { print n + 0 }' "${tmp}/headers" 2>/dev/null || echo 0)"
+    # 总大小：接着下载时看 Content-Range（bytes 起-止/总大小），否则看 Content-Length。
+    total="$(awk 'tolower($1) == "content-length:" { n = $2 + 0 } tolower($1) == "content-range:" { split($NF, a, "/"); r = a[2] + 0 } END { print (r ? r : n) + 0 }' "${tmp}/headers" 2>/dev/null || echo 0)"
     line="已下载 $(human "$size")"
     if ((total > 0 && size <= total)); then
       line="${line} / $(human "$total")（$((size * 100 / total))%）"
     fi
     if ((SECONDS > start)); then
-      line="${line} · $(human $((size / (SECONDS - start))))/s"
+      line="${line} · $(human $(((size - from) / (SECONDS - start))))/s"
     fi
     printf '\r  %s\033[K' "$line" >&2
     sleep 0.3 2>/dev/null || sleep 1
@@ -82,14 +98,16 @@ show_progress() {
 }
 
 # fetch 地址 文件 是否最后一个地址：下载一个文件，屏幕是终端时显示进度。
+# 文件里已经有上一个地址下载的一部分时，用 curl 接着下载；这个地址不支持接着下载时从头下载。
 # 不是最后一个地址时，连不上或者 15 秒内平均不到 20KB/s 就放弃，换下一个地址。
 # 返回 2 表示地址上没有这个文件（例如老版本没有压缩包），其他非 0 表示下载失败。
 fetch() {
-  local url="$1" out="$2" last="$3" rc=0 pid
-  : >"$out"
+  local url="$1" out="$2" last="$3" rc=0 pid code
   : >"${tmp}/headers"
+  : >>"$out" # 先建好文件（已有的内容不动），显示进度时要读它的大小
   if [[ "$getter" == curl ]]; then
     local -a opts=(-sL --connect-timeout 10 -o "$out" -D "${tmp}/headers" -w '%{http_code}')
+    [[ ! -s "$out" ]] || opts+=(-C -)
     if [[ "$last" == 1 ]]; then
       opts+=(--retry 3)
     else
@@ -97,6 +115,7 @@ fetch() {
     fi
     curl "${opts[@]}" "$url" >"${tmp}/code" &
   else
+    : >"$out"
     local -a opts=(-q -T 15 -O "$out")
     if [[ "$last" == 1 ]]; then opts+=(-t 3); else opts+=(-t 1); fi
     wget "${opts[@]}" "$url" &
@@ -104,28 +123,37 @@ fetch() {
   pid=$!
   [[ ! -t 2 ]] || show_progress "$pid" "$out"
   wait "$pid" || rc=$?
-  if [[ "$getter" == curl ]]; then
-    ((rc == 0)) || return "$rc"
-    case "$(cat "${tmp}/code")" in
-      404) return 2 ;;
-      2??) return 0 ;;
-      *) return 1 ;;
-    esac
+  if [[ "$getter" != curl ]]; then
+    ((rc != 8)) || return 2 # wget：服务器返回了错误（例如 404）
+    return "$rc"
   fi
-  ((rc != 8)) || return 2 # wget：服务器返回了错误（例如 404）
-  return "$rc"
+  if ((rc == 33)); then
+    : >"$out" # 这个地址不支持接着下载（例如 Gitee），从头下载
+    rc=0
+    fetch "$url" "$out" "$last" || rc=$?
+    return "$rc"
+  fi
+  code="$(cat "${tmp}/code")"
+  # 只留下程序本身的内容给下一个地址接着下载，错误页面之类的不能留。
+  [[ "$code" == 2?? ]] || : >"$out"
+  ((rc == 0)) || return "$rc"
+  case "$code" in
+    404) return 2 ;;
+    2??) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # download 地址 是否最后一个地址：从一个地址下载程序到 $bin 并核对校验值。
-# 优先下载压缩过的（小一半多），地址上没有压缩包时（例如老版本）再下载没压缩的。
+# 优先下载压缩过的，地址上没有压缩包时（例如老版本）再下载没压缩的。
 # 返回 0 表示成功，3 表示下载到了但校验不通过，其他表示下载失败。
 download() {
   local url="$1/v${VERSION}/${name}" last="$2" rc=2
-  rm -f "$bin" "${bin}.gz"
-  if command -v gzip >/dev/null 2>&1; then
+  if [[ -n "$gz" ]]; then
     rc=0
     fetch "${url}.gz" "${bin}.gz" "$last" || rc=$?
     if ((rc == 0)) && ! gzip -dc "${bin}.gz" >"$bin" 2>/dev/null; then
+      rm -f "$bin" "${bin}.gz"
       return 1
     fi
   fi
@@ -134,10 +162,26 @@ download() {
     fetch "$url" "$bin" "$last" || rc=$?
   fi
   ((rc == 0)) || return 1
-  [[ "$(sha256 "$bin")" == "$sha" ]] || return 3
+  if [[ "$(sha256 "$bin")" != "$sha" ]]; then
+    rm -f "$bin" "${bin}.gz"
+    return 3
+  fi
 }
 
 printf '正在下载 DockHop %s（%s）……\n' "$VERSION" "$arch" >&2
+
+# 有两个地址时，先同时各下载 2 秒比一比，快的排在前面（没下载成功的算 0）。
+if ((${#sources[@]} == 2)) && [[ "$getter" == curl ]]; then
+  for i in 0 1; do
+    curl -sL --connect-timeout 2 -m 2 -o /dev/null -w '%{http_code} %{speed_download}\n' \
+      "${sources[i]}/v${VERSION}/${name}${gz}" >"${tmp}/speed${i}" 2>/dev/null &
+  done
+  wait
+  if awk '{ s[FILENAME] = ($1 ~ /^2/) ? $2 + 0 : 0 } END { exit !(s[ARGV[2]] + 0 > s[ARGV[1]] + 0) }' "${tmp}/speed0" "${tmp}/speed1"; then
+    sources=("${sources[1]}" "${sources[0]}")
+  fi
+fi
+
 bad_sum=""
 for i in "${!sources[@]}"; do
   last=$((i == ${#sources[@]} - 1))
@@ -153,10 +197,14 @@ for i in "${!sources[@]}"; do
     [[ -z "$bad_sum" ]] || fail "下载的程序校验不通过，已删除" "可能下载不完整，或镜像站提供的文件被改动过；请重试，或换一个下载地址"
     fail "下载失败：${sources[i]}/v${VERSION}/${name}" "检查网络；都下载不了时，可以设置 DOCKHOP_MIRROR=镜像站地址 后重试"
   fi
-  printf '从 %s %s，改从 %s 下载……\n' "${sources[i]#https://}" "$why" "${sources[i + 1]#https://}" >&2
+  printf '从 %s %s，改从 %s 下载……\n' "$(host "${sources[i]}")" "$why" "$(host "${sources[i + 1]}")" >&2
 done
 
 chmod +x "$bin"
+# 程序等新服务器下载时让终端直接读按键（不显示按了什么）。万一它被强行结束、没来得及
+# 恢复，这里把终端设置恢复原样，免得之后打字不显示。
+tty_state="$(stty -g 2>/dev/null </dev/tty || true)"
 rc=0
 "$bin" "$@" || rc=$?
+[[ -z "$tty_state" ]] || stty "$tty_state" 2>/dev/null </dev/tty || true
 exit "$rc"
