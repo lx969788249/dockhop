@@ -222,10 +222,10 @@ func (r *run) steps(ctx context.Context) error {
 		s.Warn("迁移计划生成失败，新服务器将跳过迁入前检查：%v", err)
 		planPath = ""
 	}
-	s.End(fmt.Sprintf("%d 个镜像 · 迁移包共 %s", images, ui.HumanBytes(size)))
+	s.End(fmt.Sprintf("%d 个镜像 · 迁移包共 %s", images, ui.HumanBytes(size+imageFileBytes(m.ImageFiles))))
 
 	s.Begin(6, totalSteps, "启动下载服务")
-	return r.serve(ctx, ln, link, bundlePath, planPath, size)
+	return r.serve(ctx, ln, link, bundlePath, planPath, m.ImageFiles)
 }
 
 // pack 是第 4、5 步：停机打包数据，打包镜像并写完迁移包。
@@ -409,22 +409,12 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 			OldImage: oldImageOf[it], Changes: changesOf[it], Project: projectOf(col, it), Service: it.c.Config.Labels[labelService],
 			State: stateName(it.c.State.Status, it.c.State.Paused)})
 	}
-	refs := make([]string, 0, len(refSet))
-	for ref := range refSet {
-		refs = append(refs, ref)
-	}
-	sort.Strings(refs)
 	m.Images.Refs = refSet
-	rc, err := dc.SaveImages(ctx, refs)
-	if err != nil {
-		return nil, 0, fail(s, "导出镜像失败", err.Error(), "")
-	}
-	parts, n, err := r.addStream(w, "images", "导出镜像", rc, col.imageBytes)
-	rc.Close()
+	files, n, err := r.exportImages(ctx, link, refSet, col.imageBytes)
 	if err != nil {
 		return nil, 0, fail(s, "导出镜像失败", err.Error(), "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
 	}
-	m.Images.Bytes, m.Images.Parts = n, parts
+	m.Images.Bytes, m.ImageFiles = n, files
 	r.removeTempTags()
 
 	if err := w.AddJSON("manifest.json", m); err != nil {
@@ -440,9 +430,114 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	if err != nil {
 		return nil, 0, fail(s, "写入迁移包失败", err.Error(), "")
 	}
-	r.summary = append(r.summary, fmt.Sprintf("迁移的服务：%s · 迁移包 %s", r.chosen, ui.HumanBytes(st.Size())))
+	r.summary = append(r.summary, fmt.Sprintf("迁移的服务：%s · 迁移包 %s", r.chosen, ui.HumanBytes(st.Size()+imageFileBytes(files))))
 	return m, st.Size(), nil
 }
+
+// exportImages 把每个镜像（同一个镜像 ID 的所有名字一起）单独导出成一个压缩、加密的
+// 文件，放在工作目录的 images/ 下，由下载服务单独提供：新服务器本机已经有、或者能从
+// 镜像仓库按摘要拉到一模一样的镜像时，就不用从这里下载。返回这些文件和导出的总字节数
+// （压缩前）。
+func (r *run) exportImages(ctx context.Context, link crypto.Link, refSet map[string]string, estimate int64) ([]bundle.ImageFile, int64, error) {
+	byID := map[string][]string{}
+	for ref, id := range refSet {
+		byID[id] = append(byID[id], ref)
+	}
+	groups := make([][]string, 0, len(byID))
+	for _, refs := range byID {
+		sort.Strings(refs)
+		groups = append(groups, refs)
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i][0] < groups[j][0] })
+	dir := filepath.Join(r.workdir, "images")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, 0, err
+	}
+	p := r.Screen.StartProgress("导出镜像", estimate, "")
+	var files []bundle.ImageFile
+	var total int64
+	for i, refs := range groups {
+		f := bundle.ImageFile{File: fmt.Sprintf("image-%d", i+1), ID: refSet[refs[0]], Refs: refs}
+		f.Pull = r.pullRef(ctx, f.ID, refs)
+		n, size, err := r.exportImage(ctx, link, refs, filepath.Join(dir, f.File), p)
+		if err != nil {
+			p.Done(err)
+			return nil, 0, err
+		}
+		f.Bytes, f.Size, total = size, n, total+n
+		files = append(files, f)
+	}
+	p.Done(nil)
+	return files, total, nil
+}
+
+// exportImage 导出一个镜像到 path，返回导出的字节数（压缩前）和文件大小。
+func (r *run) exportImage(ctx context.Context, link crypto.Link, refs []string, path string, progress io.Writer) (int64, int64, error) {
+	rc, err := r.Docker.SaveImages(ctx, refs)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rc.Close()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		return 0, 0, err
+	}
+	var n countWriter
+	err = bundle.WriteImageFile(f, link, io.TeeReader(rc, io.MultiWriter(progress, &n)))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	return int64(n), st.Size(), nil
+}
+
+// pullRef 返回能从镜像仓库拉到这个镜像的引用（名字@sha256:摘要），优先用和容器的镜像名
+// 同一个仓库的；镜像是自己构建、导入的（没有仓库摘要）时返回空。按摘要拉到的一定是同一个
+// 镜像，不会因为镜像名后来指向了新版本而拉错。
+func (r *run) pullRef(ctx context.Context, id string, refs []string) string {
+	img, err := r.Docker.InspectImage(ctx, id)
+	if err != nil || len(img.RepoDigests) == 0 {
+		return ""
+	}
+	for _, d := range img.RepoDigests {
+		repo := d[:strings.LastIndex(d, "@")]
+		for _, ref := range refs {
+			if repoOf(ref) == repo {
+				return d
+			}
+		}
+	}
+	return img.RepoDigests[0]
+}
+
+// repoOf 去掉镜像名里的标签或摘要，只留仓库名（registry.example.com:5000/app:1.0 → registry.example.com:5000/app）。
+func repoOf(ref string) string {
+	if i := strings.Index(ref, "@"); i >= 0 {
+		ref = ref[:i]
+	}
+	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
+		ref = ref[:i]
+	}
+	return ref
+}
+
+func imageFileBytes(files []bundle.ImageFile) int64 {
+	var n int64
+	for _, f := range files {
+		n += f.Bytes
+	}
+	return n
+}
+
+type countWriter int64
+
+func (c *countWriter) Write(p []byte) (int, error) { *c += countWriter(len(p)); return len(p), nil }
 
 // largeLayer：容器里没挂载出来的改动超过这么大时，停机前提醒。
 const largeLayer = 100 << 20
@@ -468,7 +563,7 @@ func (r *run) addStream(w *bundle.Writer, prefix, label string, rc io.Reader, to
 }
 
 // serve 是最后一步：提供下载，直到新服务器迁入成功、用户按 Esc 和回车结束或程序被结束。
-func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bundlePath, planPath string, size int64) error {
+func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bundlePath, planPath string, images []bundle.ImageFile) error {
 	s := r.Screen
 	live := &liveLine{s: s}
 	defer live.stop()
@@ -492,6 +587,11 @@ func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bund
 		ln.Close()
 		return fail(s, "启动下载服务失败", err.Error(), "")
 	}
+	files := map[string]string{}
+	for _, f := range images {
+		files[f.File] = filepath.Join(filepath.Dir(bundlePath), "images", f.File)
+	}
+	srv.SetImages(files)
 	r.server = srv
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
@@ -580,6 +680,7 @@ func (l *liveLine) downloading(pos, size int64) {
 		l.prog = l.s.StartProgress("新服务器正在下载", size, "下载停住了：新服务器可能断开了，它会自动从断点继续")
 		l.inDownload = true
 	}
+	l.prog.SetTotal(size) // 新服务器后来补下载镜像时，这一轮的总大小不一样
 	l.prog.Set(pos)
 }
 

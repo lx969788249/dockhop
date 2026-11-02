@@ -85,14 +85,63 @@ func (c *Client) LoadImages(ctx context.Context, r io.Reader) error {
 	return jsonStreamError(rc)
 }
 
-// PullImage 拉取镜像（ref 可以带 @sha256 摘要），没有登录信息，只用于公开镜像。
-func (c *Client) PullImage(ctx context.Context, ref string) error {
+// PullImage 拉取镜像（ref 可以带 @sha256 摘要），没有登录信息，只用于公开镜像。progress
+// 不为 nil 时收到已经下载的字节数，以及下载和解压合起来的进展：拉取卡住时两者都不再增加。
+func (c *Client) PullImage(ctx context.Context, ref string, progress func(downloaded, activity int64)) error {
 	rc, err := c.Stream(ctx, http.MethodPost, "/images/create", url.Values{"fromImage": {ref}}, nil, "")
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
-	return jsonStreamError(rc)
+	return pullStream(rc, progress)
+}
+
+// pullStream 读完拉取镜像时 Docker 逐行输出的 JSON：每一层的下载、解压进度，或者错误。
+func pullStream(r io.Reader, progress func(downloaded, activity int64)) error {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 4<<20)
+	downloaded, extracted := map[string]int64{}, map[string]int64{}
+	for sc.Scan() {
+		var m struct {
+			ID             string `json:"id"`
+			Status         string `json:"status"`
+			ProgressDetail struct {
+				Current int64 `json:"current"`
+			} `json:"progressDetail"`
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if json.Unmarshal(sc.Bytes(), &m) != nil {
+			continue
+		}
+		if m.ErrorDetail.Message != "" {
+			return errors.New(m.ErrorDetail.Message)
+		}
+		if m.Error != "" {
+			return errors.New(m.Error)
+		}
+		switch m.Status {
+		case "Downloading":
+			downloaded[m.ID] = m.ProgressDetail.Current
+		case "Extracting":
+			extracted[m.ID] = m.ProgressDetail.Current
+		default:
+			continue
+		}
+		if progress != nil {
+			var d, e int64
+			for _, n := range downloaded {
+				d += n
+			}
+			for _, n := range extracted {
+				e += n
+			}
+			progress(d, d+e)
+		}
+	}
+	return sc.Err()
 }
 
 // TagImage 给镜像加一个名字（repo:tag）。

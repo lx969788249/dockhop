@@ -54,7 +54,7 @@ func TestDownloadResume(t *testing.T) {
 	c := NewClient(5*time.Second, t.Logf)
 	dst := filepath.Join(dir, "download")
 	var last int64
-	if err := c.Download(context.Background(), link, dst, func(done, total int64) { last = done }); err != nil {
+	if err := c.Download(context.Background(), link, Part{URL: link.BundleURL()}, dst, func(done, total int64) { last = done }); err != nil {
 		t.Fatalf("应自动续传成功：%v", err)
 	}
 	got, _ := os.ReadFile(dst)
@@ -62,7 +62,7 @@ func TestDownloadResume(t *testing.T) {
 		t.Fatalf("续传结果不对：%d 字节，请求 %d 次", len(got), requests.Load())
 	}
 	// 已经下载完整：再下载一次直接结束，不重新下载。
-	if err := c.Download(context.Background(), link, dst, nil); err != nil {
+	if err := c.Download(context.Background(), link, Part{URL: link.BundleURL()}, dst, nil); err != nil {
 		t.Fatal(err)
 	}
 	if st, _ := os.Stat(dst); st.Size() != int64(len(content)) {

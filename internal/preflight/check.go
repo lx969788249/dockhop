@@ -474,7 +474,7 @@ func diskIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, usedVolum
 	if t.Disk == nil {
 		return 0
 	}
-	bundleBytes := plan.Sizes.Bundle
+	bundleBytes := plan.Sizes.Bundle + plan.Sizes.ImageFiles // 按镜像全部从旧服务器下载算
 	var keptVolumes int64
 	for _, v := range plan.Volumes {
 		if d.KeepVolume(v.Name) || !usedVolumes[v.Name] {

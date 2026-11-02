@@ -133,3 +133,18 @@ func TestServiceReplicas(t *testing.T) {
 		t.Errorf("c 依赖：%v", got)
 	}
 }
+
+// up 有 --pull 选项时用 --pull missing（盖过配置里的 pull_policy: always）；老版本没有时不加。
+func TestPullMissing(t *testing.T) {
+	dir := t.TempDir()
+	newer := filepath.Join(dir, "newer")
+	older := filepath.Join(dir, "older")
+	os.WriteFile(newer, []byte("#!/bin/sh\necho '      --pull string   Pull image before running'\n"), 0o755)
+	os.WriteFile(older, []byte("#!/bin/sh\necho '      --no-start   Do not start the services'\n"), 0o755)
+	if got := (&Tool{cmd: []string{newer}}).PullMissing(t.Context()); strings.Join(got, " ") != "--pull missing" {
+		t.Errorf("有 --pull 时：%v", got)
+	}
+	if got := (&Tool{cmd: []string{older}}).PullMissing(t.Context()); got != nil {
+		t.Errorf("没有 --pull 时不应加：%v", got)
+	}
+}

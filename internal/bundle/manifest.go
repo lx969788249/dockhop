@@ -13,10 +13,14 @@
 //	changes/<容器名>/part-*     容器里没挂载出来的改动（tar，路径相对于根目录）
 //	compose/<项目>/dir/part-*      Compose 项目目录（tar，路径相对于项目目录）
 //	compose/<项目>/outside/part-*  项目目录以外被引用的文件（tar，路径相对于根目录）
-//	images/part-*              镜像（docker save 的输出）
 //	manifest.json              清单，最后写入
 //
 // 迁移计划不在包里，由下载服务单独提供（新服务器下载之前先用它做检查）。
+//
+// 镜像也不在包里（格式版本 2 起）：每个镜像单独导出成一个文件（docker save → zstd 压缩
+// → age 加密，见 image.go），由下载服务单独提供。新服务器本机已经有、或者能从镜像仓库
+// 按摘要拉到一模一样的镜像时，就不用从旧服务器下载，省下旧服务器的上行带宽。格式版本 1
+// 的迁移包把所有镜像放在包里的 images/part-* 下，新版本仍然能读。
 package bundle
 
 import "time"
@@ -24,7 +28,7 @@ import "time"
 const (
 	// Format 和 Version 写在清单里，新服务器据此确认能读懂这个迁移包。
 	Format  = "dockhop-bundle"
-	Version = 1
+	Version = 2
 	// PartSize 是分段大小。
 	PartSize = 16 << 20
 )
@@ -42,6 +46,7 @@ type Manifest struct {
 	Volumes    []Volume    `json:"volumes,omitempty"`
 	Binds      []Bind      `json:"binds,omitempty"`
 	Images     Images      `json:"images"`
+	ImageFiles []ImageFile `json:"image_files,omitempty"` // 单独提供的镜像文件（格式版本 2 起）
 }
 
 // Source 是旧服务器的情况。迁入时用来判断哪些设置是旧服务器 Docker 自动填的默认值。
@@ -134,9 +139,20 @@ func (b Bind) AllLinks() []BindLink {
 	return nil
 }
 
-// Images 是迁移包里的镜像。
+// Images 是迁移用到的镜像。Bytes 是导出的总字节数（压缩前）；Parts 是格式版本 1 放在包里
+// 的分段数，版本 2 起镜像单独成文件（见 ImageFile），Parts 为 0。
 type Images struct {
 	Refs  map[string]string `json:"refs"` // 镜像名 → 镜像 ID
 	Bytes int64             `json:"bytes"`
 	Parts int               `json:"parts"`
+}
+
+// ImageFile 是单独提供下载的一个镜像文件：同一个镜像（同一个 ID）的所有名字一起导出。
+type ImageFile struct {
+	File  string   `json:"file"`           // 下载服务上的文件名，例如 image-1
+	ID    string   `json:"id"`             // 旧服务器上的镜像 ID
+	Refs  []string `json:"refs"`           // 容器用的镜像名，导出时一起带上
+	Pull  string   `json:"pull,omitempty"` // 能从镜像仓库拉到同一个镜像的引用（名字@sha256:摘要）；自己构建的镜像没有
+	Bytes int64    `json:"bytes"`          // 文件大小（压缩、加密后）
+	Size  int64    `json:"size"`           // 导出的字节数（压缩前），加载时显示进度用
 }

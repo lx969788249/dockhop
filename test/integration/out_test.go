@@ -268,13 +268,27 @@ func TestOutBundleContents(t *testing.T) {
 		}
 	}
 
-	// 镜像：docker save 的格式。
-	imgs := tarEntries(t, bundle.OpenStream(dst, "images", m.Images.Parts))
+	// 镜像：不在迁移包里，单独成一个文件由下载服务提供，内容是 docker save 的格式；
+	// alpine 是从镜像仓库拉的，带着能按摘要拉到同一个镜像的引用，迁移计划里也有。
+	if len(m.Images.Refs) != 1 || len(m.ImageFiles) != 1 || m.Images.Parts != 0 {
+		t.Fatalf("都用 alpine:3.20，只应单独导出一个镜像文件：%v %+v", m.Images.Refs, m.ImageFiles)
+	}
+	img := m.ImageFiles[0]
+	if !strings.HasPrefix(img.Pull, "alpine@sha256:") || len(pl.Images) != 1 || pl.Images[0].File != img.File || pl.Images[0].Pull != img.Pull {
+		t.Errorf("镜像应带着按摘要拉取的引用，迁移计划里也应有：%+v %+v", img, pl.Images)
+	}
+	resp, err = http.Get(link.ImageURL(img.File))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err := bundle.OpenImageFile(resp.Body, link)
+	if err != nil {
+		t.Fatalf("镜像文件解不开：%v", err)
+	}
+	imgs := tarEntries(t, rc)
+	resp.Body.Close()
 	if _, ok := imgs["manifest.json"]; !ok {
 		t.Error("镜像导出不完整")
-	}
-	if len(m.Images.Refs) != 1 {
-		t.Errorf("都用 alpine:3.20，只应导出一个镜像：%v", m.Images.Refs)
 	}
 
 	// 迁移计划：端口、固定 IP、项目都在。

@@ -9,8 +9,9 @@ import (
 
 // buildPlan 生成迁移计划：新服务器下载之前据此检查自己能不能迁入。
 func buildPlan(m *bundle.Manifest, col *collected, bundleSize int64) *bundle.Plan {
-	p := &bundle.Plan{Version: 1, Source: m.Source}
+	p := &bundle.Plan{Version: 2, Source: m.Source, Images: m.ImageFiles}
 	p.Sizes.Bundle = bundleSize
+	p.Sizes.ImageFiles = imageFileBytes(m.ImageFiles)
 	p.Sizes.Images = m.Images.Bytes
 	for _, v := range m.Volumes {
 		p.Sizes.Volumes += v.Bytes

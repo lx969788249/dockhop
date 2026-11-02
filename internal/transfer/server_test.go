@@ -155,3 +155,75 @@ func TestIsPublic(t *testing.T) {
 		}
 	}
 }
+
+// 镜像文件和迁移包一样可以下载、续传；新服务器带上这一轮的总大小时，旧服务器的进度是
+// 合起来的一条，迁移包下完才算下载完成。没登记的文件名拿不到任何东西。
+func TestServerImagesAndTotalProgress(t *testing.T) {
+	dir := t.TempDir()
+	bundleData, imageData := make([]byte, 1<<20), make([]byte, 512<<10)
+	rand.Read(bundleData)
+	rand.Read(imageData)
+	os.WriteFile(filepath.Join(dir, "bundle"), bundleData, 0o600)
+	os.WriteFile(filepath.Join(dir, "image-1"), imageData, 0o600)
+	ln, port, err := Listen(30000 + int(time.Now().UnixNano()%2000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, _ := crypto.NewLink("127.0.0.1", port)
+	rec := &recorder{}
+	s, err := NewServer(ln, link, filepath.Join(dir, "bundle"), "", rec.add, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetImages(map[string]string{"image-1": filepath.Join(dir, "image-1")})
+	go s.Serve()
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+
+	total := int64(len(imageData) + len(bundleData))
+	fetch := func(url string, before int64, rangeHeader string) []byte {
+		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		req.Header.Set(BeforeHeader, fmt.Sprint(before))
+		req.Header.Set(TotalHeader, fmt.Sprint(total))
+		if rangeHeader != "" {
+			req.Header.Set("Range", rangeHeader)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return b
+	}
+	first := fetch(link.ImageURL("image-1"), 0, "bytes=0-1023")
+	rest := fetch(link.ImageURL("image-1"), 0, "bytes=1024-")
+	if !bytes.Equal(append(first, rest...), imageData) {
+		t.Fatal("镜像文件续传后的内容不一致")
+	}
+	if rec.has(DownloadComplete) {
+		t.Fatal("迁移包还没下载，不应报告下载完成")
+	}
+	if b := fetch(link.BundleURL(), int64(len(imageData)), ""); !bytes.Equal(b, bundleData) {
+		t.Fatal("迁移包内容不一致")
+	}
+	rec.mu.Lock()
+	var last Event
+	for _, e := range rec.events {
+		if e.Kind == DownloadProgress {
+			if e.Size != total || e.Position > total {
+				t.Errorf("进度应按这一轮的总大小算：%+v", e)
+			}
+			last = e
+		}
+	}
+	rec.mu.Unlock()
+	if last.Position != total || !rec.has(DownloadComplete) {
+		t.Fatalf("全部下完时进度应到头并报告下载完成：%+v", last)
+	}
+	for _, name := range []string{"image-2", "bundle", "plan"} {
+		resp, _ := get(t, link.Base()+"image/"+name, "")
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("没登记的镜像文件 %q 应返回 404：%d", name, resp.StatusCode)
+		}
+	}
+}

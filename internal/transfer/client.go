@@ -123,12 +123,20 @@ func (c *Client) bundleExists(ctx context.Context, link crypto.Link) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// Download 把迁移包下载到 path。path 已经有一部分时从断点继续；中途断开会自动
-// 续传，最多 Retries 次。progress 收到已经下载的总字节数和总大小。
-func (c *Client) Download(ctx context.Context, link crypto.Link, path string, progress func(done, total int64)) error {
+// Part 是要下载的一个文件，以及它在这一轮下载里的位置：旧服务器据此显示总的下载进度。
+type Part struct {
+	URL    string // link.BundleURL() 或 link.ImageURL(文件名)
+	Before int64  // 这一轮里排在它前面的文件合计多少字节
+	Total  int64  // 这一轮一共要下载多少字节；0 表示只看这一个文件
+}
+
+// Download 把旧服务器上的一个文件（迁移包或镜像文件）下载到 path。path 已经有一部分时
+// 从断点继续；中途断开会自动续传，最多 Retries 次。progress 收到这个文件已经下载的字节数
+// 和它的大小。
+func (c *Client) Download(ctx context.Context, link crypto.Link, part Part, path string, progress func(done, total int64)) error {
 	failures := 0
 	for {
-		done, total, err := c.downloadOnce(ctx, link, path, progress)
+		done, total, err := c.downloadOnce(ctx, link, part, path, progress)
 		if err == nil && done == total {
 			return nil
 		}
@@ -155,7 +163,7 @@ func (c *Client) Download(ctx context.Context, link crypto.Link, path string, pr
 	}
 }
 
-func (c *Client) downloadOnce(ctx context.Context, link crypto.Link, path string, progress func(done, total int64)) (int64, int64, error) {
+func (c *Client) downloadOnce(ctx context.Context, link crypto.Link, part Part, path string, progress func(done, total int64)) (int64, int64, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return 0, 0, err
@@ -165,9 +173,13 @@ func (c *Client) downloadOnce(ctx context.Context, link crypto.Link, path string
 	if err != nil {
 		return 0, 0, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link.BundleURL(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, part.URL, nil)
 	if err != nil {
 		return have, 0, err
+	}
+	if part.Total > 0 {
+		req.Header.Set(BeforeHeader, strconv.FormatInt(part.Before, 10))
+		req.Header.Set(TotalHeader, strconv.FormatInt(part.Total, 10))
 	}
 	if have > 0 {
 		req.Header.Set("Range", "bytes="+strconv.FormatInt(have, 10)+"-")
@@ -206,7 +218,7 @@ func (c *Client) downloadOnce(ctx context.Context, link crypto.Link, path string
 		if err := f.Truncate(0); err != nil {
 			return 0, 0, err
 		}
-		return 0, 0, errors.New("本地已有的下载文件和旧服务器上的迁移包对不上，重新下载")
+		return 0, 0, errors.New("本地已有的下载文件和旧服务器上的对不上，重新下载")
 	default:
 		return have, 0, statusError(link, resp.StatusCode)
 	}

@@ -66,7 +66,7 @@ type run struct {
 	workdir    string // 这次迁入的下载和解压目录
 	bundlePath string
 	dataDir    string
-	downloaded bool // 迁移包是这次下载的（不是 --file 给的）
+	downloaded bool // 已经开始下载
 
 	plan        *bundle.Plan
 	m           *bundle.Manifest
@@ -75,6 +75,7 @@ type run struct {
 	projects    []bundle.Project
 	anonVolumes map[string]bundle.Volume // 旧的匿名卷编号 → 迁移包里的数据
 	imageAs     map[string]string        // 镜像名 → 实际使用的镜像名（digest 改用迁移包里的镜像时）
+	images      map[string]imageSource   // 镜像文件 → 镜像从哪里来（见 images.go）；nil 表示还没决定
 	helperImage string                   // 创建临时容器用的镜像（名字）
 
 	j       *Journal
@@ -168,6 +169,9 @@ func (r *run) run(ctx context.Context) error {
 	summary, err = r.check(ctx)
 	if err != nil {
 		return err
+	}
+	if r.plan != nil {
+		r.decideImages(ctx, r.plan.Images)
 	}
 	s.End(summary)
 	s.Begin(3, r.steps, "下载迁移包")
@@ -299,35 +303,24 @@ func (r *run) prepareWorkdir(token string) error {
 }
 
 func (r *run) download(ctx context.Context) error {
-	s := r.Screen
 	if err := r.prepareWorkdir(""); err != nil {
 		return err
 	}
 	r.bundlePath = filepath.Join(r.workdir, "bundle")
 	r.downloaded = true
-	total := int64(0)
+	// 先下载要从旧服务器拿的镜像，最后下载迁移包：迁移包一下完，旧服务器就显示“正在迁入”。
+	var parts []fetchPart
+	var bundleSize int64
 	if r.plan != nil {
-		total = r.plan.Sizes.Bundle
+		for _, f := range r.plan.Images {
+			if r.fromOldServer(f) {
+				parts = append(parts, fetchPart{url: r.opts.Link.ImageURL(f.File), path: r.imagePath(f), size: f.Bytes})
+			}
+		}
+		bundleSize = r.plan.Sizes.Bundle
 	}
-	p := s.StartProgress("下载迁移包", total, "下载停住了：网络可能断开了，会自动从断点继续")
-	err := r.client().Download(ctx, r.opts.Link, r.bundlePath, func(done, all int64) {
-		if all > 0 {
-			p.SetTotal(all)
-		}
-		p.Set(done)
-	})
-	p.Done(err)
-	if err != nil {
-		var ce *transfer.ConnError
-		if errors.As(err, &ce) {
-			return fail(s, ce.Reason, "", ce.Hint)
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fail(s, "下载迁移包失败："+err.Error(), "", "检查两台服务器之间的网络后重新运行，会从断点继续")
-	}
-	return nil
+	parts = append(parts, fetchPart{url: r.opts.Link.BundleURL(), path: r.bundlePath, size: bundleSize})
+	return r.fetch(ctx, "下载迁移包", parts)
 }
 
 // unpack 解密、解开迁移包，并在改动任何东西之前检查里面的每一份数据。返回这一步的摘要。
@@ -543,15 +536,20 @@ func (r *run) checkProject(ctx context.Context, p bundle.Project) error {
 
 func (r *run) loadImages(ctx context.Context) error {
 	s := r.Screen
-	rc := bundle.OpenStream(r.dataDir, "images", r.m.Images.Parts)
-	p := s.StartProgress("加载镜像", r.m.Images.Bytes, "镜像较大时需要几分钟")
-	err := r.Docker.LoadImages(ctx, io.TeeReader(rc, p))
-	rc.Close()
-	p.Done(err)
-	if err != nil {
-		return fail(s, "加载镜像失败："+err.Error(), "", "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
+	if r.m.Images.Parts > 0 {
+		// 格式版本 1 的迁移包：所有镜像都在包里。
+		rc := bundle.OpenStream(r.dataDir, "images", r.m.Images.Parts)
+		p := s.StartProgress("加载镜像", r.m.Images.Bytes, "镜像较大时需要几分钟")
+		err := r.Docker.LoadImages(ctx, io.TeeReader(rc, p))
+		rc.Close()
+		p.Done(err)
+		if err != nil {
+			return fail(s, "加载镜像失败："+err.Error(), "", "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
+		}
+		_ = os.RemoveAll(filepath.Join(r.dataDir, "images")) // 用完就删，省磁盘
+	} else if err := r.loadImageFiles(ctx); err != nil {
+		return err
 	}
-	_ = os.RemoveAll(filepath.Join(r.dataDir, "images")) // 用完就删，省磁盘
 	refs := make([]string, 0, len(r.m.Images.Refs))
 	for ref := range r.m.Images.Refs {
 		refs = append(refs, ref)
@@ -585,7 +583,7 @@ func (r *run) resolveImage(ctx context.Context, ref string) (string, error) {
 	if !r.d.UseBundleImage(ref) {
 		s.Note("按摘要补齐镜像清单 · " + ref)
 		pctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-		err := r.Docker.PullImage(pctx, ref)
+		err := r.Docker.PullImage(pctx, ref, nil)
 		cancel()
 		if err == nil {
 			return ref, nil
@@ -1424,7 +1422,7 @@ func (r *run) startProject(ctx context.Context, p bundle.Project) error {
 	// 只在个数和配置文件里写的不一样时才加 --scale：有的 Compose 版本（例如 2.17）会把它
 	// 算进记在容器上的配置摘要，之后用户自己 docker compose up 时就会重建容器。
 	services := uniqueServices(members)
-	args := []string{"up", "--no-start"}
+	args := append([]string{"up", "--no-start"}, r.tool.PullMissing(ctx)...)
 	configured, err := r.tool.Services(ctx, cp)
 	if err != nil {
 		r.Log.Printf("读不出 Compose 项目 %s 配置里的副本个数：%v", p.Name, err)

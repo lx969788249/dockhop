@@ -41,6 +41,17 @@ func Detect(ctx context.Context) (*Tool, error) {
 // Legacy 表示是老的 Python 版 docker-compose（1.x），它不支持部分新功能。
 func (t *Tool) Legacy() bool { return strings.HasPrefix(t.Version, "1.") }
 
+// PullMissing 是 up 只在本机没有镜像时才去拉的选项。迁入时镜像已经就位（和旧服务器上的
+// 一模一样），配置里写了 pull_policy: always 的服务也不能被换成仓库里的新版本，连不上镜像
+// 仓库时更不能因此失败。这个选项会盖过配置里的 pull_policy；Compose 太老、没有它时返回空。
+func (t *Tool) PullMissing(ctx context.Context) []string {
+	out, err := run(ctx, "", append(append([]string{}, t.cmd...), "up", "--help"))
+	if err != nil || !strings.Contains(out, "--pull") {
+		return nil
+	}
+	return []string{"--pull", "missing"}
+}
+
 // String 返回命令名，用于日志和提示。
 func (t *Tool) String() string { return strings.Join(t.cmd, " ") + " " + t.Version }
 

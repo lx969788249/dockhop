@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,12 +48,14 @@ type Event struct {
 	Remote   string
 }
 
-// Server 是旧服务器上的下载服务：只提供同一个随机路径下的迁移包和迁移计划，
+// Server 是旧服务器上的下载服务：只提供同一个随机路径下的迁移包、镜像文件和迁移计划，
 // 并接收新服务器发来的迁入结果。支持断点续传。
 type Server struct {
 	link       crypto.Link
+	prefix     string
 	bundlePath string
 	planPath   string
+	images     map[string]string // 镜像文件名 → 路径
 	size       int64
 	notify     func(Event)
 	logf       func(string, ...any)
@@ -63,6 +66,13 @@ type Server struct {
 	position int64
 	complete bool
 }
+
+// 新服务器下载时带上这两个请求头：这一轮里排在这个文件前面的文件合计多少字节、这一轮
+// 一共要下载多少字节。旧服务器据此显示一条总的下载进度，而不是每个文件从 0 重新开始。
+const (
+	BeforeHeader = "X-DockHop-Before"
+	TotalHeader  = "X-DockHop-Total"
+)
 
 // Listen 从 port 开始找一个空闲端口监听（同时监听 IPv4 和 IPv6），最多往后找 50 个。
 func Listen(port int) (net.Listener, int, error) {
@@ -89,10 +99,11 @@ func NewServer(ln net.Listener, link crypto.Link, bundlePath, planPath string, n
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	s := &Server{link: link, bundlePath: bundlePath, planPath: planPath, size: st.Size(), notify: notify, logf: logf, ln: ln}
 	prefix := "/" + link.Token + "/"
+	s := &Server{link: link, prefix: prefix, bundlePath: bundlePath, planPath: planPath, size: st.Size(), notify: notify, logf: logf, ln: ln}
 	mux := http.NewServeMux()
 	mux.HandleFunc(prefix+"bundle", s.serveBundle)
+	mux.HandleFunc(prefix+"image/", s.serveImage)
 	mux.HandleFunc(prefix+"plan", s.servePlan)
 	mux.HandleFunc(prefix+"status", s.receiveStatus)
 	s.srv = &http.Server{Handler: s.logged(mux), ReadHeaderTimeout: 30 * time.Second}
@@ -123,38 +134,70 @@ func (s *Server) logged(h http.Handler) http.Handler {
 	})
 }
 
+// SetImages 设置可以下载的镜像文件（文件名 → 路径），必须在 Serve 之前调用。
+func (s *Server) SetImages(files map[string]string) { s.images = files }
+
 func (s *Server) serveBundle(w http.ResponseWriter, r *http.Request) {
+	s.serveFile(w, r, s.bundlePath, true)
+}
+
+func (s *Server) serveImage(w http.ResponseWriter, r *http.Request) {
+	path, ok := s.images[strings.TrimPrefix(r.URL.Path, s.prefix+"image/")]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	s.serveFile(w, r, path, false)
+}
+
+func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, path string, bundle bool) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "", http.StatusMethodNotAllowed)
 		return
 	}
-	f, err := os.Open(s.bundlePath)
+	f, err := os.Open(path)
 	if err != nil {
 		http.Error(w, "", http.StatusInternalServerError)
 		return
 	}
 	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		http.Error(w, "", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/octet-stream")
 	// 记录下载到的位置：从请求的起点开始，加上已经发出的字节。
 	start := rangeStart(r.Header.Get("Range"))
-	cw := &countingWriter{ResponseWriter: w, onWrite: func(n int64) { s.advance(start+n, r.RemoteAddr) }}
+	before, _ := strconv.ParseInt(r.Header.Get(BeforeHeader), 10, 64)
+	total, _ := strconv.ParseInt(r.Header.Get(TotalHeader), 10, 64)
+	cw := &countingWriter{ResponseWriter: w, onWrite: func(n int64) {
+		s.advance(bundle, start+n, st.Size(), before, total, r.RemoteAddr)
+	}}
 	http.ServeContent(cw, r, "bundle", time.Time{}, f)
 }
 
-func (s *Server) advance(pos int64, remote string) {
-	s.mu.Lock()
-	if pos > s.position {
-		s.position = pos
+// advance 记录下载到了文件的 pos 处，通知调用方总的下载进度；迁移包下载完时通知下载完成。
+func (s *Server) advance(bundle bool, pos, size, before, total int64, remote string) {
+	done := false
+	if bundle {
+		s.mu.Lock()
+		if pos > s.position {
+			s.position = pos
+		}
+		pos = s.position
+		if pos >= s.size && !s.complete {
+			s.complete, done = true, true
+		}
+		s.mu.Unlock()
 	}
-	p, done := s.position, false
-	if p >= s.size && !s.complete {
-		s.complete, done = true, true
+	if total > 0 {
+		pos, size = before+pos, total
 	}
-	s.mu.Unlock()
-	s.notify(Event{Kind: DownloadProgress, Position: p, Size: s.size, Remote: remote})
+	s.notify(Event{Kind: DownloadProgress, Position: pos, Size: size, Remote: remote})
 	if done {
-		s.notify(Event{Kind: DownloadComplete, Position: p, Size: s.size, Remote: remote})
+		s.notify(Event{Kind: DownloadComplete, Position: pos, Size: size, Remote: remote})
 	}
 }
 

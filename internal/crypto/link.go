@@ -98,6 +98,9 @@ func (l Link) BundleURL() string { return l.Base() + "bundle" }
 func (l Link) PlanURL() string   { return l.Base() + "plan" }
 func (l Link) StatusURL() string { return l.Base() + "status" }
 
+// ImageURL 是单独提供的一个镜像文件的下载地址。
+func (l Link) ImageURL(name string) string { return l.Base() + "image/" + name }
+
 // ParseLink 解析用户粘贴的链接，出错时用大白话说明哪里不对。
 func ParseLink(s string) (Link, error) {
 	s = strings.TrimSpace(s)

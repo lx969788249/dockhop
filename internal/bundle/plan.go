@@ -19,14 +19,16 @@ type Plan struct {
 	Volumes    []PlanVolume    `json:"volumes,omitempty"`
 	Binds      []PlanBind      `json:"binds,omitempty"`
 	Networks   []PlanNetwork   `json:"networks,omitempty"`
+	Images     []ImageFile     `json:"images,omitempty"` // 单独提供的镜像文件：新服务器下载之前决定每个镜像从哪里来
 }
 
 // PlanSizes 是各部分解开后的大小（字节），新服务器据此检查磁盘空间。
 type PlanSizes struct {
-	Bundle  int64 `json:"bundle"` // 迁移包文件
-	Images  int64 `json:"images"`
-	Volumes int64 `json:"volumes"`
-	Binds   int64 `json:"binds"`
+	Bundle     int64 `json:"bundle"`                // 迁移包文件
+	ImageFiles int64 `json:"image_files,omitempty"` // 单独提供的镜像文件合计
+	Images     int64 `json:"images"`
+	Volumes    int64 `json:"volumes"`
+	Binds      int64 `json:"binds"`
 }
 
 // PlanContainer 是预检需要的容器信息。
