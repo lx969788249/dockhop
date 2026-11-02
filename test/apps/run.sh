@@ -365,9 +365,9 @@ run_unreachable() {
 
   log "[unreachable] 放行后同一个链接可以正常使用"
   docker exec "$old" iptables -D INPUT -p tcp --dport "$BACKUP_PORT" -j REJECT --reject-with tcp-reset
-  docker exec -e DH_LINK="$link" "$new" bash -c 'cd /root && dockhop check "$DH_LINK" </dev/null' >"${tmp}/check.log" 2>&1
-  grep -Fq '✅ 迁入前检查通过' "${tmp}/check.log"
-  echo "  ✓ 迁入前检查通过"
+  run_in "$link" "${tmp}/ok.log"
+  grep -Fq '✅ 迁入完成' "${tmp}/ok.log"
+  echo "  ✓ 放行后迁入完成"
 
   stop_out
   remove_hosts
