@@ -394,3 +394,7 @@ test/apps/run.sh wordpress                  # 在两台模拟服务器之间迁�
 ## 📈 Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=lx969788249/dockhop&type=Date)](https://star-history.com/#lx969788249/dockhop&Date)
+
+## 📄 许可证
+
+DockHop 以 [GPL-3.0](LICENSE) 协议开源：可以自由使用、修改和分发；分发修改后的版本时，也要以 GPL-3.0 公开源代码。
