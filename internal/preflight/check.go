@@ -268,17 +268,10 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 	}
 
 	// ---------- 挂载目录不能盖住 DockHop 自己的文件 ----------
-	if o.Home != "" {
-		for _, b := range plan.Binds {
-			for _, p := range append([]string{b.Path}, b.AllLinks()...) {
-				if p == "" || spec.IsSystemPath(p) {
-					continue
-				}
-				if spec.PathsOverlap(normalize(p), normalize(o.Home)) {
-					addIssue(Issue{Level: Stop, Kind: "bind_home",
-						Title: fmt.Sprintf("挂载目录 %s 和 DockHop 存放迁移文件、回滚资料的目录 %s 重叠，迁入会把它们覆盖", p, o.Home),
-						Hint:  "设置 DOCKHOP_HOME=其他目录（例如 /var/tmp/dockhop）后重新运行"})
-				}
+	for _, b := range plan.Binds {
+		for _, p := range append([]string{b.Path}, b.AllLinks()...) {
+			if is := HomeClash(p, o.Home); is != nil {
+				addIssue(*is)
 			}
 		}
 	}
@@ -866,3 +859,14 @@ func normalize(p string) string {
 
 // Normalize 供迁入时再次核对路径。
 func Normalize(p string) string { return normalize(p) }
+
+// HomeClash 检查迁入的目录 p 会不会盖住 DockHop 存放迁移文件、回滚资料的目录 home。
+// 迁入前检查按迁移计划查一遍，解开迁移包后按实际要写的目录再查一遍，用的是这同一条规则。
+func HomeClash(p, home string) *Issue {
+	if p == "" || home == "" || spec.IsSystemPath(p) || !spec.PathsOverlap(normalize(p), normalize(home)) {
+		return nil
+	}
+	return &Issue{Level: Stop, Kind: "bind_home",
+		Title: fmt.Sprintf("挂载目录 %s 和 DockHop 存放迁移文件、回滚资料的目录 %s 重叠，迁入会把它们覆盖", p, home),
+		Hint:  "设置 DOCKHOP_HOME=其他目录（例如 /var/tmp/dockhop）后重新运行"}
+}

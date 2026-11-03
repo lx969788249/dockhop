@@ -354,12 +354,7 @@ func (r *run) unpack(ctx context.Context) (string, error) {
 		case errors.Is(err, crypto.ErrWrongKey):
 			return "", fail(s, err.Error(), "", "")
 		case errors.Is(err, crypto.ErrCorrupted), errors.Is(err, bundle.ErrUnsafe):
-			hint := "在旧服务器重新运行迁出"
-			if r.downloaded {
-				_ = os.Remove(r.bundlePath)
-				hint = "已删除下载的文件，重新运行即可重新下载；如果再次出现，请在旧服务器重新运行迁出"
-			}
-			return "", fail(s, err.Error(), "", hint)
+			return "", r.badBundle(err)
 		default:
 			return "", fail(s, "解开迁移包失败："+err.Error(), "", "执行 df -h 检查磁盘空间")
 		}
@@ -370,9 +365,50 @@ func (r *run) unpack(ctx context.Context) (string, error) {
 	}
 	r.m = m
 	if err := r.scan(); err != nil {
-		return "", fail(s, err.Error(), "", "在旧服务器重新运行迁出")
+		return "", r.badBundle(err)
+	}
+	if is := r.homeClash(); is != nil {
+		r.dropDownload()
+		return "", fail(s, is.Title, "", is.Hint)
 	}
 	return fmt.Sprintf("%s · 校验通过", ui.HumanBytes(st.Size())), nil
+}
+
+// badBundle 报告迁移包里的内容有问题（解不开，或者有不合规的内容）。下载的文件重新运行也用不上，删掉。
+// 解密时每一段都经过认证：能解开、只是内容不合规的，就是旧服务器打包的内容；解密发现被改坏的，
+// 迁移计划记了 SHA-256 并且核对过，说明旧服务器上的文件本身就坏了。这些重新下载还是一样，只能
+// 在旧服务器重新迁出。只有旧版本的计划没有记 SHA-256 时，被改坏才可能是下载时出的错，先重新下载。
+func (r *run) badBundle(err error) error {
+	r.dropDownload()
+	hint := "在旧服务器重新运行迁出"
+	if r.downloaded && errors.Is(err, crypto.ErrCorrupted) && r.plan.BundleSHA256 == "" {
+		hint = "已删除下载的文件，重新运行即可重新下载；如果再次出现，请在旧服务器重新运行迁出"
+	}
+	return fail(r.Screen, err.Error(), "", hint)
+}
+
+// dropDownload 删掉下载的迁移包：解开后发现重新运行也用不上它。
+func (r *run) dropDownload() {
+	if r.downloaded {
+		_ = os.Remove(r.bundlePath)
+	}
+}
+
+// homeClash 按迁移包里实际要写的目录，再确认一遍不会盖住 DockHop 自己的目录（和迁入前检查同一条规则）。
+// 这是新服务器上的设置问题；换了 DOCKHOP_HOME，下载的文件也会放到别处，这里下载的同样用不上。
+func (r *run) homeClash() *preflight.Issue {
+	for _, b := range r.m.Binds {
+		paths := []string{b.Path}
+		for _, l := range b.AllLinks() {
+			paths = append(paths, l.Link)
+		}
+		for _, p := range paths {
+			if is := preflight.HomeClash(p, r.Home); is != nil {
+				return is
+			}
+		}
+	}
+	return nil
 }
 
 // missingIn 表示报错 msg 提到了 dir 下面一个不存在的路径。
@@ -418,7 +454,7 @@ func fileSHA256(path string) (string, error) {
 }
 
 // scan 检查迁移包里所有的卷、目录和 Compose 文件（路径是否越界、有没有通过软链接
-// 写到别处），以及挂载目录会不会盖住 DockHop 自己的文件。
+// 写到别处）。
 func (r *run) scan() error {
 	check := func(prefix string, parts int, what string, roots ...string) error {
 		rc := bundle.OpenStream(r.dataDir, prefix, parts)
@@ -459,16 +495,9 @@ func (r *run) scan() error {
 		if err := check("binds/"+b.ID, b.Parts, "目录 "+b.Path+" ", strings.TrimPrefix(b.Path, "/")); err != nil {
 			return err
 		}
-		paths := []string{b.Path}
 		for _, l := range b.AllLinks() {
 			if !filepath.IsAbs(l.Link) || filepath.Clean(l.Link) != l.Link || l.Link == "/" || !within(l.Target, b.Path) {
 				return fmt.Errorf("迁移包里目录 %s 的软链接不对：%q → %q", b.Path, l.Link, l.Target)
-			}
-			paths = append(paths, l.Link)
-		}
-		for _, p := range paths {
-			if p != "" && !spec.IsSystemPath(p) && spec.PathsOverlap(preflight.Normalize(p), preflight.Normalize(r.Home)) {
-				return fmt.Errorf("挂载目录 %s 和 DockHop 存放迁移文件、回滚资料的目录 %s 重叠，迁入会把它们覆盖。请设置 DOCKHOP_HOME=其他目录后重新运行", p, r.Home)
 			}
 		}
 	}

@@ -6,6 +6,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -374,7 +376,8 @@ func TestInRejectsUnsafeBundle(t *testing.T) {
 	removeAll(p + "_web")
 	try("docker", "volume", "rm", p+"_vol")
 
-	// 用一个下载服务把它发给新服务器。没有迁移计划：下载前的检查会跳过，解开时照样要拒绝。
+	// 用一个下载服务把它发给新服务器。迁移计划和迁移包对得上（大小和 SHA-256 都是旧服务器自己算的），
+	// 下载前的检查和下载后的核对都会通过，只有解开时的检查能拦住它。
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -398,14 +401,24 @@ func TestInRejectsUnsafeBundle(t *testing.T) {
 	parts, n, _ := w.AddStream("volumes/"+p+"_vol", &tb)
 	img, _ := exec.Command("docker", "save", "alpine:3.20").Output()
 	iparts, in, _ := w.AddStream("images", bytes.NewReader(img))
-	m := bundle.Manifest{Format: bundle.Format, Version: bundle.Version, Source: bundle.Source{Arch: "x86_64"},
+	src := bundle.Source{Arch: sh(t, "docker", "info", "-f", "{{.Architecture}}")}
+	m := bundle.Manifest{Format: bundle.Format, Version: bundle.Version, Source: src,
 		Containers: []bundle.Container{{Name: p + "_web", Image: "alpine:3.20", State: "created"}},
 		Volumes:    []bundle.Volume{{Name: p + "_vol", Driver: "local", Bytes: n, Parts: parts}},
 		Images:     bundle.Images{Refs: map[string]string{"alpine:3.20": ""}, Bytes: in, Parts: iparts}}
 	w.AddJSON("manifest.json", m)
 	w.Close()
 	out.Close()
-	srv, err := transfer.NewServer(ln, link, path, "", nil, nil)
+	b, _ := os.ReadFile(path)
+	sum := sha256.Sum256(b)
+	planPath := filepath.Join(t.TempDir(), "plan")
+	pf, _ := os.Create(planPath)
+	bundle.EncryptPlan(pf, link, &bundle.Plan{Version: 2, Source: src, BundleSHA256: hex.EncodeToString(sum[:]),
+		Sizes:      bundle.PlanSizes{Bundle: int64(len(b)), Images: in, Volumes: n},
+		Containers: []bundle.PlanContainer{{Name: p + "_web", State: "created", Image: "alpine:3.20", NetworkMode: "bridge", Volumes: []string{p + "_vol"}}},
+		Volumes:    []bundle.PlanVolume{{Name: p + "_vol", Driver: "local", Bytes: n}}})
+	pf.Close()
+	srv, err := transfer.NewServer(ln, link, path, planPath, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,6 +439,9 @@ func TestInRejectsUnsafeBundle(t *testing.T) {
 	}
 	if left, _ := filepath.Glob(filepath.Join(home, "work", "*", "data")); len(left) > 0 {
 		t.Errorf("失败时应删除解密后的数据：%v", left)
+	}
+	if left, _ := filepath.Glob(filepath.Join(home, "work", "*", "bundle")); len(left) > 0 {
+		t.Errorf("迁移包本身有问题，重新运行也用不上，应删掉下载的文件：%v", left)
 	}
 }
 

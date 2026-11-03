@@ -50,7 +50,7 @@ type ConnError struct {
 func (e *ConnError) Error() string { return e.Reason }
 func (e *ConnError) Unwrap() error { return e.Err }
 
-// ErrNoPlan 表示旧服务器没有提供迁移计划（生成失败），只能跳过迁入前检查。
+// ErrNoPlan 表示旧服务器有迁移包，但没有提供迁移计划（v1.1.6 之前的版本生成计划失败时会这样）。
 var ErrNoPlan = errors.New("旧服务器没有提供迁移计划")
 
 // explain 把连接错误换成大白话。
