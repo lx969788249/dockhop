@@ -200,7 +200,7 @@ func runOut(env *Env, opts OutOptions) error {
 		return err
 	}
 	if err := backup.RecoverInterrupted(env.Context, t.docker, t.home, t.screen, t.prompt); err != nil {
-		t.finish(false)
+		t.finish(err)
 		if ui.Canceled(err) {
 			return err
 		}
@@ -211,7 +211,7 @@ func runOut(env *Env, opts OutOptions) error {
 		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
 		Home: t.home, Version: env.Version, Getenv: env.Getenv,
 	}, backup.Options{Include: opts.Include, StopShared: opts.StopShared, Port: opts.Port, Host: opts.Host})
-	t.finish(err == nil)
+	t.finish(err)
 	if errors.Is(err, backup.ErrReported) {
 		return errReported
 	}
@@ -262,7 +262,7 @@ func runIn(env *Env, opts InOptions) error {
 		Home: t.home, Version: env.Version, Getenv: env.Getenv,
 		Succeeded: func() { wait = countMigration(env) },
 	}, restore.Options{Link: link, Yes: opts.Yes, Existing: opts.Existing, KeepSucceeded: opts.KeepSucceeded})
-	t.finish(err == nil)
+	t.finish(err)
 	wait()
 	if errors.Is(err, restore.ErrReported) {
 		return errReported

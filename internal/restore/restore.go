@@ -119,6 +119,7 @@ func Run(ctx context.Context, d Deps, o Options) error {
 	}
 	defer lock.Unlock()
 	helper.Clean(ctx, d.Docker, lockPath(d.Home))
+	r.dropStale()
 	err = r.run(ctx)
 	if err != nil && r.j != nil && !r.committed {
 		r.rollback(context.WithoutCancel(ctx))
@@ -128,7 +129,23 @@ func Run(ctx context.Context, d Deps, o Options) error {
 	}
 	r.j.close()
 	r.cleanFiles(err == nil)
+	r.cleanHelpers(context.Background())
+	removeHelper(r.Home)
 	return r.report(ctx, err)
+}
+
+// dropStale 删掉以前的链接留下的下载和记录。失败时保留它们，是为了用同一个链接重新迁入时
+// 不用重新下载、跳过已经迁入的；一个链接对应旧服务器上的一次迁出，换了新链接，旧的就用不上了。
+func (r *run) dropStale() {
+	keep := "in-" + r.opts.Link.Token
+	for _, dir := range []string{filepath.Join(r.Home, "work"), filepath.Join(r.Home, "state")} {
+		entries, _ := os.ReadDir(dir)
+		for _, e := range entries {
+			if name := strings.TrimSuffix(e.Name(), ".json"); strings.HasPrefix(name, "in-") && name != keep {
+				_ = os.RemoveAll(filepath.Join(dir, e.Name()))
+			}
+		}
+	}
 }
 
 func (r *run) testFail(point string) bool {
@@ -1723,7 +1740,6 @@ func (r *run) cleanFiles(success bool) {
 			r.Screen.Warn("临时文件没能删除，请手动删除：%s", r.workdir)
 		}
 	}
-	r.cleanHelpers(context.Background())
 }
 
 func (r *run) report(ctx context.Context, err error) error {
@@ -1821,7 +1837,7 @@ func (r *run) report(ctx context.Context, err error) error {
 	lines = append(lines, r.d.Summary()...)
 	if !success && r.downloaded {
 		if _, err := os.Stat(r.bundlePath); err == nil {
-			lines = append(lines, "下载的迁移包（加密）保留在 "+r.bundlePath+"，重新运行时不用重新下载")
+			lines = append(lines, "下载的迁移包（加密）保留在 "+r.workdir+"：用同一个链接重新迁入时不用重新下载，不迁了可以删掉这个目录")
 		}
 	}
 	rep.Lines = lines

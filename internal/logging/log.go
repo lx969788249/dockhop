@@ -1,7 +1,8 @@
 // Package logging 负责运行日志和诊断文件。
 //
 // 屏幕只显示步骤、进度、警告和结果；每一步的细节、执行的操作和返回的错误都
-// 写进日志。成功后日志自动删除，失败时保留并在结果里给出位置，方便用户反馈。
+// 写进日志。成功、或者什么都没做就取消时日志自动删除，失败时保留并在结果里给出
+// 位置，方便用户反馈。
 // 写入前统一隐藏密钥和密码。
 package logging
 
@@ -77,8 +78,21 @@ func (l *Logger) Block(text string) {
 	}
 }
 
-// Finish 结束日志：成功且没有要求保留时删除日志文件，返回日志是否还在。
-func (l *Logger) Finish(success, keep bool) bool {
+// Outcome 是任务的结局，决定日志留不留。
+type Outcome int
+
+const (
+	// Failed 失败了：日志留着，方便反馈问题。
+	Failed Outcome = iota
+	// Cancelled 什么都没做就取消了：这份日志没有用。
+	Cancelled
+	// Succeeded 成功了：这份日志，和同一种任务以前失败时留下的日志，都用不上了。
+	Succeeded
+)
+
+// Finish 结束日志，按结局删掉用不上的（keep 时都留着，测试用），目录空了就顺手删掉。
+// 返回这份日志是否还在。
+func (l *Logger) Finish(o Outcome, keep bool) bool {
 	if l == nil || l.f == nil {
 		return false
 	}
@@ -86,10 +100,21 @@ func (l *Logger) Finish(success, keep bool) bool {
 	defer l.mu.Unlock()
 	_ = l.f.Close()
 	l.f = nil
-	if success && !keep {
-		_ = os.Remove(l.path)
-		_ = os.Remove(filepath.Dir(l.path)) // 目录空了就顺手删掉
-		return false
+	if keep || o == Failed {
+		return true
 	}
-	return true
+	_ = os.Remove(l.path)
+	if o == Succeeded {
+		// 文件名按时间排序：只删更早的。更晚的属于同时开始的另一个任务（例如没拿到锁的）。
+		name := filepath.Base(l.path)
+		kind, _, _ := strings.Cut(name, "-")
+		old, _ := filepath.Glob(filepath.Join(filepath.Dir(l.path), kind+"-*.log"))
+		for _, p := range old {
+			if filepath.Base(p) < name {
+				_ = os.Remove(p)
+			}
+		}
+	}
+	_ = os.Remove(filepath.Dir(l.path))
+	return false
 }

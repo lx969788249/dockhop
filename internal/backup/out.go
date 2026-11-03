@@ -87,10 +87,20 @@ func Run(ctx context.Context, d Deps, o Options) error {
 	}
 	defer lock.Unlock()
 	helper.Clean(ctx, d.Docker, lockPath(d.Home))
+	dropStale(d.Home)
 
 	err = r.steps(ctx)
 	r.cleanup()
 	return r.report(ctx, err)
+}
+
+// dropStale 删掉以前的迁出被强制结束时留下的工作目录（迁移包和镜像文件）。正常结束时 cleanup
+// 会删掉；同一个目录里同时只能有一个迁出，拿到锁之后还在的都是遗留的。
+func dropStale(home string) {
+	old, _ := filepath.Glob(filepath.Join(home, "work", "out-*"))
+	for _, dir := range old {
+		_ = os.RemoveAll(dir)
+	}
 }
 
 func (r *run) steps(ctx context.Context) error {

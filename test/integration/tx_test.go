@@ -914,6 +914,8 @@ func TestInProjectInsideMount(t *testing.T) {
 	}
 	m.waitOutSuccess(t)
 	noLeftovers(t, home)
+	onlyLogs(t, home)
+	onlyLogs(t, m.home)
 }
 
 // 项目 aapp 把项目 zproxy 建的网络当外部网络用（反向代理常见写法），而 aapp 的名字排在前面：

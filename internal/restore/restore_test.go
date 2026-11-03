@@ -489,7 +489,7 @@ func TestRefusesWithoutPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer log.Finish(false, true)
+	defer log.Finish(logging.Failed, true)
 	var out bytes.Buffer
 	r := &run{Deps: Deps{Screen: ui.New(&out, false, nil), Log: log, Getenv: func(string) string { return "" }}, opts: Options{Link: link}}
 	if err := r.fetchPlan(context.Background()); err == nil || r.plan != nil || !strings.Contains(out.String(), "没有提供迁移计划") {
@@ -564,5 +564,26 @@ func TestHomeClash(t *testing.T) {
 	r.m.Binds[0].Links = []bundle.BindLink{{Link: filepath.Join(home, "cfg"), Target: app}}
 	if is := r.homeClash(); is == nil || !strings.Contains(is.Title, filepath.Join(home, "cfg")) || !strings.Contains(is.Hint, "DOCKHOP_HOME") {
 		t.Fatalf("软链接在 DockHop 的目录里时应拦下：%+v", is)
+	}
+}
+
+// 换了新链接时，以前的链接留下的下载和记录用不上了，删掉；这个链接自己的（重试用）和迁出的不动。
+func TestDropStale(t *testing.T) {
+	home := t.TempDir()
+	link, _ := crypto.NewLink("127.0.0.1", 1)
+	cur := "in-" + link.Token
+	for _, p := range []string{"work/in-old/bundle", "work/" + cur + "/bundle", "work/out-abc/bundle",
+		"state/in-old.json", "state/" + cur + ".json", "state/out-stopped.json"} {
+		full := filepath.Join(home, p)
+		os.MkdirAll(filepath.Dir(full), 0o700)
+		os.WriteFile(full, []byte("x"), 0o600)
+	}
+	r := &run{Deps: Deps{Home: home}, opts: Options{Link: link}}
+	r.dropStale()
+	for p, keep := range map[string]bool{"work/in-old": false, "state/in-old.json": false, "work/" + cur: true,
+		"state/" + cur + ".json": true, "work/out-abc": true, "state/out-stopped.json": true} {
+		if _, err := os.Stat(filepath.Join(home, p)); (err == nil) != keep {
+			t.Errorf("%s：留着=%v，应为 %v", p, err == nil, keep)
+		}
 	}
 }

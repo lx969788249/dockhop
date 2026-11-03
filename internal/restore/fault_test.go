@@ -325,7 +325,7 @@ func TestStartupFailureHidesEnvSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer log.Finish(false, true)
+	defer log.Finish(logging.Failed, true)
 	var out bytes.Buffer
 	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: rd, Home: root, Getenv: func(string) string { return "" }},
 		dataDir: data, rbDir: filepath.Join(root, "rollback"), undo: &undo{}, anonVolumes: map[string]bundle.Volume{},

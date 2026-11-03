@@ -30,6 +30,7 @@ func nextPort() int { return freePort() + 20 + int(portSeq.Add(1)) }
 type migration struct {
 	out  *proc
 	link string
+	home string // 旧服务器上的 DOCKHOP_HOME
 }
 
 func startOut(t *testing.T, args ...string) *migration {
@@ -37,7 +38,7 @@ func startOut(t *testing.T, args ...string) *migration {
 	home := t.TempDir()
 	all := append([]string{"out", "--stop-shared", "--host", "127.0.0.1", "--port", fmt.Sprint(nextPort())}, args...)
 	p := start(t, []string{"DOCKHOP_HOME=" + home, "DOCKHOP_TEST_KEEP_LOG=1"}, all...)
-	m := &migration{out: p, link: p.waitFor(t, linkPattern, 10*time.Minute)}
+	m := &migration{out: p, link: p.waitFor(t, linkPattern, 10*time.Minute), home: home}
 	t.Cleanup(func() {
 		_ = p.cmd.Process.Signal(os.Interrupt)
 		select {
@@ -170,6 +171,27 @@ func noLeftovers(t *testing.T, home string) {
 	}
 	if backups := try("docker", "ps", "-a", "--filter", "name=dockhop-backup", "--format", "{{.Names}}"); backups != "" {
 		t.Errorf("改名备份的旧容器没有删除：%s", backups)
+	}
+	// DockHop 自己的目录：复制给临时容器的程序、锁文件用完就删，空目录不留。失败时留着的
+	// 只有日志、重试用的下载和记录。
+	entries, _ := os.ReadDir(home)
+	for _, e := range entries {
+		inside, _ := os.ReadDir(filepath.Join(home, e.Name()))
+		if e.Name() == "bin" || e.Name() == "locks" || len(inside) == 0 {
+			t.Errorf("DockHop 的目录里不应留下 %s：%v", e.Name(), inside)
+		}
+	}
+}
+
+// onlyLogs 确认迁移成功后 DockHop 的目录里只剩日志（测试时要求保留日志，平时连日志也删掉，
+// 整个目录都不留）。
+func onlyLogs(t *testing.T, home string) {
+	t.Helper()
+	entries, _ := os.ReadDir(home)
+	for _, e := range entries {
+		if e.Name() != "logs" {
+			t.Errorf("迁移成功后 %s 里不应留下 %s", home, e.Name())
+		}
 	}
 }
 

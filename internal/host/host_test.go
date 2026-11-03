@@ -1,6 +1,7 @@
 package host
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -82,6 +83,36 @@ func TestHeldWhenUnknown(t *testing.T) {
 	if !Held(locked) {
 		t.Error("打不开锁文件时应当作有人拿着")
 	}
+}
+
+// 锁文件只在拿着锁的时候存在，放掉后别人能拿到。在上一个拿着它的任务删掉之前打开的那个文件
+// 已经不是锁文件了，拿到它的锁不算数。
+func TestLockFileOnlyWhileHeld(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "locks", "in.lock")
+	l, err := TryLock(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := TryLock(p); !errors.Is(err, ErrLocked) || !Held(p) {
+		t.Fatalf("拿着时别人应拿不到：%v", err)
+	}
+	old, err := os.Open(p) // 在删掉之前打开
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	l.Unlock()
+	if _, err := os.Stat(p); !os.IsNotExist(err) || Held(p) {
+		t.Fatalf("放掉后锁文件应删掉：%v", err)
+	}
+	if sameFile(old, p) {
+		t.Error("删掉之前打开的不应算作锁文件")
+	}
+	l2, err := TryLock(p)
+	if err != nil || !sameFile(l2.f, p) {
+		t.Fatalf("放掉后应能再拿到：%v", err)
+	}
+	l2.Unlock()
 }
 
 func TestWriteFileDurable(t *testing.T) {

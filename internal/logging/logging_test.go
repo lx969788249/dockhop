@@ -68,7 +68,7 @@ func TestLoggerLifecycle(t *testing.T) {
 	if strings.Contains(string(b), "topsecret-value") || !strings.HasSuffix(last[0], "链接密钥 ***") || !strings.HasSuffix(last[1], "第二行") {
 		t.Fatalf("密钥应隐藏、多行内容应各占一行：%q", last)
 	}
-	if !l.Finish(false, false) {
+	if !l.Finish(Failed, false) {
 		t.Fatal("失败时应保留日志")
 	}
 	if _, err := os.Stat(l.Path()); err != nil {
@@ -76,20 +76,55 @@ func TestLoggerLifecycle(t *testing.T) {
 	}
 
 	l2, _ := Open(dir, "out", nil)
-	if l2.Finish(true, false) {
+	if l2.Finish(Succeeded, false) {
 		t.Fatal("成功时应删除日志")
 	}
 	if _, err := os.Stat(l2.Path()); !os.IsNotExist(err) {
 		t.Fatal("成功时日志文件应被删除")
 	}
 	l3, _ := Open(dir, "out", nil)
-	if !l3.Finish(true, true) {
+	if !l3.Finish(Succeeded, true) {
 		t.Fatal("要求保留时成功也应保留")
 	}
 
 	var nilLogger *Logger
 	nilLogger.Printf("不会崩溃")
-	if nilLogger.Path() != "" || nilLogger.Finish(true, false) {
+	if nilLogger.Path() != "" || nilLogger.Finish(Succeeded, false) {
 		t.Fatal("nil Logger 应该什么也不做")
+	}
+}
+
+// 什么都没做就取消：只删这一份。成功：连同一种任务以前失败留下的也删掉，别的任务的、更晚的
+// （同时开始的另一个任务）不动；什么都不剩时目录也删掉。
+func TestFinishDropsOldLogs(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+	os.MkdirAll(dir, 0o700)
+	for _, name := range []string{"in-20260101-000000-1.log", "out-20260101-000000-2.log", "in-29991231-000000-3.log"} {
+		os.WriteFile(filepath.Join(dir, name), []byte("旧日志"), 0o600)
+	}
+	left := func() []string {
+		entries, _ := os.ReadDir(dir)
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return names
+	}
+	l, _ := Open(dir, "in", nil)
+	if l.Finish(Cancelled, false) || len(left()) != 3 {
+		t.Fatalf("取消时只删这一份：%v", left())
+	}
+	l, _ = Open(dir, "in", nil)
+	l.Finish(Succeeded, false)
+	if got := strings.Join(left(), " "); got != "in-29991231-000000-3.log out-20260101-000000-2.log" {
+		t.Fatalf("成功时应删掉同一种任务更早的日志：%s", got)
+	}
+	for _, name := range left() {
+		os.Remove(filepath.Join(dir, name))
+	}
+	l, _ = Open(dir, "out", nil)
+	l.Finish(Succeeded, false)
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("什么都不剩时目录也应删掉：%v", err)
 	}
 }

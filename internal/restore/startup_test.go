@@ -171,7 +171,7 @@ func fakeContainer(t *testing.T, logs string, states ...string) (*docker.Client,
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { log.Finish(false, true) })
+	t.Cleanup(func() { log.Finish(logging.Failed, true) })
 	var out bytes.Buffer
 	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: &logging.Redactor{},
 		Getenv: func(k string) string {

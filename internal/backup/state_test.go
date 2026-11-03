@@ -213,3 +213,20 @@ func TestRecoverInterruptedKeepsBrokenRecord(t *testing.T) {
 		t.Errorf("不应启动任何容器：%v", started())
 	}
 }
+
+// 迁出拿到锁之后，以前被强制结束时留下的工作目录都是遗留的，删掉；迁入的不动。
+func TestDropStaleOutWork(t *testing.T) {
+	home := t.TempDir()
+	for _, p := range []string{"work/out-old/bundle", "work/in-x/bundle"} {
+		full := filepath.Join(home, p)
+		os.MkdirAll(filepath.Dir(full), 0o700)
+		os.WriteFile(full, []byte("x"), 0o600)
+	}
+	dropStale(home)
+	if _, err := os.Stat(filepath.Join(home, "work", "out-old")); !os.IsNotExist(err) {
+		t.Errorf("遗留的迁出工作目录应删掉：%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "work", "in-x", "bundle")); err != nil {
+		t.Errorf("迁入的不应动：%v", err)
+	}
+}

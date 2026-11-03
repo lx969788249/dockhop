@@ -116,14 +116,17 @@ func (v *volumeIO) replace(ctx context.Context, volume string, r io.Reader) erro
 	return v.write(ctx, volume, r)
 }
 
+// helperPath 是复制给临时容器挂载的 DockHop 程序（见 prepareHelper）。
+func helperPath(home string) string { return filepath.Join(home, "bin", "dockhop-helper") }
+
 // prepareHelper 把 DockHop 程序复制到自己的目录里，供临时容器挂载：通过一行命令
-// 运行时，程序在 /tmp 下，有的系统 /tmp 不允许执行程序。
+// 运行时，程序在 /tmp 下，有的系统 /tmp 不允许执行程序。迁入结束时删掉（removeHelper）。
 func prepareHelper(home string) (string, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return "", err
 	}
-	dst := filepath.Join(home, "bin", "dockhop-helper")
+	dst := helperPath(home)
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return "", err
 	}
@@ -141,8 +144,18 @@ func prepareHelper(home string) (string, error) {
 	if cerr := out.Close(); err == nil {
 		err = cerr
 	}
+	if err == nil {
+		err = os.Rename(tmp, dst)
+	}
 	if err != nil {
+		_ = os.Remove(tmp)
 		return "", err
 	}
-	return dst, os.Rename(tmp, dst)
+	return dst, nil
+}
+
+// removeHelper 删掉复制出来的程序：它只在迁入过程中给临时容器用（临时容器要先删掉），
+// 下次需要时再复制。
+func removeHelper(home string) {
+	_ = os.Remove(helperPath(home))
 }

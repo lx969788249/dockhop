@@ -41,7 +41,7 @@ func startTask(env *Env, kind string) (*task, error) {
 	if err != nil {
 		reason, hint := explainDockerError(err)
 		t.screen.Problem(reason, hint)
-		t.finish(false)
+		t.finish(errReported)
 		return nil, errReported
 	}
 	t.docker = dc
@@ -54,9 +54,28 @@ func startTask(env *Env, kind string) (*task, error) {
 	return t, nil
 }
 
-// finish 结束日志：成功删除，失败保留（测试时 DOCKHOP_TEST_KEEP_LOG=1 成功也保留）。
-func (t *task) finish(success bool) {
-	t.log.Finish(success, t.env.Getenv("DOCKHOP_TEST_KEEP_LOG") == "1")
+// finish 结束任务：按结局处理日志（见 logging.Outcome；测试时 DOCKHOP_TEST_KEEP_LOG=1 都保留），
+// 再删掉 DockHop 目录里空了的子目录，目录整个空了就把它也删掉。迁移成功、只是看看之后，
+// 服务器上不留东西；失败时留下的日志、下载照旧留着。
+func (t *task) finish(err error) {
+	outcome := logging.Failed
+	switch {
+	case err == nil:
+		outcome = logging.Succeeded
+	case errors.Is(err, ui.ErrCancelled): // 还没改动就取消了
+		outcome = logging.Cancelled
+	}
+	t.log.Finish(outcome, t.env.Getenv("DOCKHOP_TEST_KEEP_LOG") == "1")
+	tidyHome(t.home)
+}
+
+// tidyHome 删掉 home 里空了的子目录（DockHop 自己建的这几个），home 空了也删掉。只删空目录，
+// 有内容的不动。
+func tidyHome(home string) {
+	for _, sub := range []string{"logs", "work", "state", "rollback", "bin", "locks"} {
+		_ = os.Remove(filepath.Join(home, sub))
+	}
+	_ = os.Remove(home)
 }
 
 func explainDockerError(err error) (string, string) {
