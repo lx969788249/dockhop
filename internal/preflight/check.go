@@ -481,8 +481,10 @@ func diskIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, usedVolum
 			keptVolumes += v.Bytes
 		}
 	}
-	extracted := plan.Sizes.Images + plan.Sizes.Volumes + plan.Sizes.Binds
-	dockerNeed := plan.Sizes.Images + plan.Sizes.Volumes - keptVolumes
+	// 解开后的数据：镜像（格式版本 1 在包里）、数据卷、目录、Compose 项目的文件、容器里的改动。
+	// 写进 Docker 的：镜像、数据卷、容器里的改动（写进新容器）。
+	extracted := plan.Sizes.Images + plan.Sizes.Volumes + plan.Sizes.Binds + plan.Sizes.Projects + plan.Sizes.Changes
+	dockerNeed := plan.Sizes.Images + plan.Sizes.Volumes + plan.Sizes.Changes - keptVolumes
 	base, berr := t.Disk(o.BaseDir)
 	root, rerr := t.Disk(t.DockerRoot)
 	need := bundleBytes + extracted

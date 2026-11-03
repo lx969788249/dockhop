@@ -170,7 +170,7 @@ func (r *run) buildGroups(writers []writer) {
 			}
 		}
 	}
-	vols, bindPaths := r.dataTargets()
+	vols, targets := r.writeSet()
 	for _, w := range writers {
 		k := "w:" + w.summary.Name()
 		uf.find(k)
@@ -179,9 +179,9 @@ func (r *run) buildGroups(writers []writer) {
 			case m.Type == "volume" && vols[m.Name]:
 				uf.union(k, "v:"+m.Name)
 			case m.Type == "bind":
-				for _, b := range bindPaths {
-					if overlap(m.Source, b) {
-						uf.union(k, "b:"+b)
+				for _, t := range targets {
+					if overlap(m.Source, t.path) {
+						uf.union(k, t.key)
 					}
 				}
 			}

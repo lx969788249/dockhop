@@ -80,7 +80,8 @@ type projectInfo struct {
 	drift    []string // 现在的文件和运行中的容器对不上的服务
 	dirBytes int64
 	outBytes int64
-	inBind   bool // 项目目录本身在某个挂载目录里，随挂载目录迁移
+	inBind   bool     // 项目目录本身在某个挂载目录里，随挂载目录迁移
+	check    []string // inBind 时另外打包的配置文件，迁入前检查用（见 compose.CheckFiles）
 }
 
 type collected struct {
@@ -255,7 +256,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		b.dir = st.IsDir()
 		b.id = fmt.Sprintf("b%03d", len(out.binds)+1)
 		screen.Note("统计目录大小 · " + ui.ShortPath(b.path))
-		b.bytes, _ = treeSize(b.path, nil, 0)
+		b.bytes, _ = treeSize(ctx, b.path, nil, 0)
 		out.binds = append(out.binds, b)
 	}
 
@@ -273,16 +274,19 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		}
 		if !p.inBind {
 			screen.Note("统计项目目录 · " + ui.ShortPath(u.workingDir))
-			p.dirBytes, p.skipped = treeSize(u.workingDir, p.excludes, bigFileLimit)
+			p.dirBytes, p.skipped = treeSize(ctx, u.workingDir, p.excludes, bigFileLimit)
 		}
 		cp := compose.Project{Name: u.project, WorkingDir: u.workingDir, Files: u.files}
+		if p.inBind {
+			p.check = compose.CheckFiles(cp)
+		}
 		files, unknown := compose.DeclaredFiles(cp)
 		for _, r := range files {
 			if spec.IsSystemPath(r) {
 				continue
 			}
 			p.outside = append(p.outside, r)
-			size, _ := treeSize(r, nil, 0)
+			size, _ := treeSize(ctx, r, nil, 0)
 			p.outBytes += size
 		}
 		if len(unknown) > 0 {
@@ -315,7 +319,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		stopping[it] = true
 	}
 	share := func(it *item) error {
-		if spec.IsSwarmTask(it.c.Config.Labels) {
+		if spec.StopRiskOf(it.c) == spec.StopReplaced {
 			// Swarm 会马上重新创建停掉的容器，停不住。
 			svc := it.c.Config.Labels[labelSwarmService]
 			return fail(screen, fmt.Sprintf("容器 %s 属于 Swarm 服务 %s，和选中的容器共用数据，但它一停就会被 Swarm 重新启动，打包的数据没法保证一致，已取消（什么都没有改动）", it.name(), svc),
@@ -382,10 +386,13 @@ func sharesData(it *item, vols map[string]*volumeInfo, binds []*bindInfo) bool {
 
 // treeSize 统计目录或文件的大小。excludes 里的路径不统计；bigLimit 大于 0 时，
 // 超过它的文件不统计并返回它们的路径。
-func treeSize(root string, excludes []string, bigLimit int64) (int64, []string) {
+func treeSize(ctx context.Context, root string, excludes []string, bigLimit int64) (int64, []string) {
 	var total int64
 	var skipped []string
 	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return filepath.SkipAll // 按了 Ctrl+C：不用统计完，调用的地方接着会发现
+		}
 		if err != nil {
 			return nil
 		}

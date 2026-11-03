@@ -68,6 +68,16 @@ func TestEvaluateClean(t *testing.T) {
 	}
 }
 
+// Compose 项目的文件和容器里的改动也会解开、写入，要算进需要的磁盘空间。
+func TestDiskCountsProjectsAndChanges(t *testing.T) {
+	p := testPlan()
+	p.Sizes.Projects, p.Sizes.Changes = 30<<20, 40<<20
+	r := Evaluate(p, testTarget(), &Decisions{}, Options{})
+	if r.NeedBytes != (100+200+50)<<20+200<<20+(30+40)<<20 {
+		t.Errorf("需要的空间：%d", r.NeedBytes)
+	}
+}
+
 func TestEvaluatePorts(t *testing.T) {
 	tg := testTarget()
 	tg.Listeners = []host.Listener{{Proto: "tcp", Addr: "0.0.0.0", Port: 80}, {Proto: "tcp", Addr: "0.0.0.0", Port: 81}, {Proto: "tcp", Addr: "::", Port: 22}}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -190,5 +191,25 @@ func TestRecoverInterruptedStates(t *testing.T) {
 				t.Errorf("记录保留：%v，应该：%v（错误：%v）", kept, c.keepRecord, err)
 			}
 		})
+	}
+}
+
+// 停机记录读不懂时（例如更早的版本写到一半断了电）不能删掉：上次停下的容器可能还停着，删了
+// 就没人管了。保留记录，说明怎么处理。
+func TestRecoverInterruptedKeepsBrokenRecord(t *testing.T) {
+	home := t.TempDir()
+	os.MkdirAll(filepath.Dir(statePath(home)), 0o700)
+	os.WriteFile(statePath(home), []byte(`{"pid": 12, "containers": [{"na`), 0o600)
+	dc, started := fakeDocker(t)
+	var out bytes.Buffer
+	err := RecoverInterrupted(context.Background(), dc, home, ui.New(&out, false, nil), ui.NewPrompter(nil, &out))
+	if err == nil || !strings.Contains(err.Error(), "docker ps -a") {
+		t.Fatalf("应停下并说明怎么处理：%v", err)
+	}
+	if _, serr := os.Stat(statePath(home)); serr != nil {
+		t.Error("读不懂的停机记录应保留")
+	}
+	if len(started()) != 0 {
+		t.Errorf("不应启动任何容器：%v", started())
 	}
 }

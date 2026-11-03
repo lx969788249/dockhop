@@ -40,9 +40,12 @@ func (r *run) waitReady(ctx context.Context, it *citem) error {
 	limit, grace, what := minHealthWait, r.startupGrace(), "确认运行"
 	if hasCheck {
 		limit, what = healthTimeout(minHealthWait, hc.StartPeriod, hc.Interval, hc.Timeout, hc.Retries), "健康检查"
-		r.Log.Printf("等容器 %s 就绪：健康检查%s，最多等 %s", name, checkRule(hc.StartPeriod, hc.Interval, hc.Retries), ui.Elapsed(limit))
+	}
+	limit += it.extra
+	if hasCheck {
+		r.Log.Printf("等容器 %s 就绪：健康检查%s，最多等 %s", name, checkRule(hc.StartPeriod, hc.Interval, hc.Timeout, hc.Retries), ui.Elapsed(limit))
 	} else {
-		r.Log.Printf("等容器 %s 就绪：没有健康检查，确认它稳定运行 %s", name, ui.Elapsed(grace))
+		r.Log.Printf("等容器 %s 就绪：没有健康检查，确认它稳定运行 %s，最多等 %s", name, ui.Elapsed(grace), ui.Elapsed(limit))
 	}
 	w := &watch{r: r, name: name, restarts: -1}
 	for {
@@ -76,10 +79,18 @@ func (r *run) waitReady(ctx context.Context, it *citem) error {
 	}
 }
 
-// healthTimeout 是健康检查最长等多久：到 Docker 按容器自己的设置判它“不健康”（启动宽限期过后
-// 连续 retries 次没通过）的时候，再多等 30 秒；至少 base，最多一小时。没设置的按 Docker 的默认值：
-// 每 30 秒一次、每次最多 30 秒、连续 3 次。
+// healthTimeout 是健康检查最长等多久：到 Docker 按容器自己的设置判它“不健康”的时候，再多等
+// 30 秒；至少 base，最多一小时。Docker 在启动宽限期过后，连续 retries 次检查没通过才判不健康；
+// 每次检查最多花 timeout，检查完再隔 interval 才做下一次，所以最晚要
+// 启动宽限期 + retries ×（interval + timeout）。没设置的按 Docker 的默认值：每 30 秒一次、
+// 每次最多 30 秒、连续 3 次。
 func healthTimeout(base time.Duration, startPeriod, interval, timeout int64, retries int) time.Duration {
+	interval, timeout, retries = healthDefaults(interval, timeout, retries)
+	need := time.Duration(startPeriod+int64(retries)*(interval+timeout)) + 30*time.Second
+	return min(max(need, base), time.Hour)
+}
+
+func healthDefaults(interval, timeout int64, retries int) (int64, int64, int) {
 	if interval <= 0 {
 		interval = int64(30 * time.Second)
 	}
@@ -89,19 +100,14 @@ func healthTimeout(base time.Duration, startPeriod, interval, timeout int64, ret
 	if retries <= 0 {
 		retries = 3
 	}
-	need := time.Duration(startPeriod+interval*int64(retries)+timeout) + 30*time.Second
-	return min(max(need, base), time.Hour)
+	return interval, timeout, retries
 }
 
 // checkRule 用大白话写出健康检查的设置。
-func checkRule(startPeriod, interval int64, retries int) string {
-	if interval <= 0 {
-		interval = int64(30 * time.Second)
-	}
-	if retries <= 0 {
-		retries = 3
-	}
-	s := fmt.Sprintf("每 %s查一次，连续 %d 次没通过算不健康", ui.Elapsed(time.Duration(interval)), retries)
+func checkRule(startPeriod, interval, timeout int64, retries int) string {
+	interval, timeout, retries = healthDefaults(interval, timeout, retries)
+	s := fmt.Sprintf("每 %s查一次（每次最多 %s），连续 %d 次没通过算不健康",
+		ui.Elapsed(time.Duration(interval)), ui.Elapsed(time.Duration(timeout)), retries)
 	if startPeriod > 0 {
 		s = "启动后 " + ui.Elapsed(time.Duration(startPeriod)) + "内不算，之后" + s
 	}

@@ -76,3 +76,31 @@ func TestClean(t *testing.T) {
 		}
 	}
 }
+
+// 标签上的锁是相对路径时（老版本的 DOCKHOP_HOME 写的相对路径），从这里认不出是哪个文件，
+// 也就判断不了那个任务还在不在：不删。
+func TestCleanKeepsUnknownOwner(t *testing.T) {
+	var removed []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/version":
+			fmt.Fprint(w, `{"Version":"29.0.0","ApiVersion":"1.44"}`)
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			fmt.Fprint(w, `[{"Id":"rel","Names":["/dockhop-helper-x-1"],"Labels":{"dockhop.helper":"home/locks/out.lock"}}]`)
+		case r.Method == http.MethodDelete:
+			removed = append(removed, r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	Clean(context.Background(), dc, filepath.Join(t.TempDir(), "locks", "in.lock"))
+	if len(removed) > 0 {
+		t.Errorf("认不出是谁的临时容器不应删：%v", removed)
+	}
+}

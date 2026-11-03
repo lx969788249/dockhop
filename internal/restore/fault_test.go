@@ -177,13 +177,18 @@ func TestLoadImagesChoosesHelper(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			pulled := false
 			dc, _ := faultyDocker(t, func(w http.ResponseWriter, q *http.Request) bool {
 				switch {
 				case q.Method == "POST" && strings.HasSuffix(q.URL.Path, "/images/load"):
 					io.Copy(io.Discard, q.Body)
 					w.Write([]byte(`{"stream":"Loaded image"}`))
 				case q.Method == "POST" && strings.HasSuffix(q.URL.Path, "/images/create"):
+					pulled = c.pullOK
 					return c.pullOK
+				case q.Method == "GET" && strings.Contains(q.URL.Path, "@sha256:") && !pulled:
+					// 加载的镜像没有仓库清单，按摘要找不到；拉下来以后才有。
+					http.Error(w, `{"message":"No such image"}`, http.StatusNotFound)
 				case q.Method == "GET" && strings.HasSuffix(q.URL.Path, "/json"):
 					w.Write([]byte(`{"Id":"sha256:` + strings.Repeat("b", 64) + `"}`))
 				case q.Method == "POST" && strings.HasSuffix(q.URL.Path, "/tag"):
@@ -199,7 +204,7 @@ func TestLoadImagesChoosesHelper(t *testing.T) {
 			}
 			var out bytes.Buffer
 			r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, dataDir: t.TempDir(), imageAs: map[string]string{},
-				m: &bundle.Manifest{Images: bundle.Images{Refs: refs}}}
+				m: &bundle.Manifest{Images: bundle.Images{Refs: refs}}, j: testJournal(t)}
 			if err := r.loadImages(context.Background()); err != nil {
 				t.Fatalf("%v\n%s", err, out.String())
 			}
@@ -325,10 +330,9 @@ func TestStartupFailureHidesEnvSecrets(t *testing.T) {
 	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: rd, Home: root, Getenv: func(string) string { return "" }},
 		dataDir: data, rbDir: filepath.Join(root, "rollback"), undo: &undo{}, anonVolumes: map[string]bundle.Volume{},
 		m: &bundle.Manifest{Containers: []bundle.Container{{Name: "web", Image: "alpine", State: "running"}}}}
-	if err := r.prepare(context.Background()); err != nil {
+	if err := r.decide(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	defer r.j.close()
 	readyErr := r.waitReady(context.Background(), &citem{m: bundle.Container{Name: "web"}, newID: "new-web"})
 	if readyErr == nil || !strings.Contains(readyErr.Error(), "cannot connect using") {
 		t.Fatalf("报错里应带着容器最后的输出：%v", readyErr)
@@ -453,9 +457,9 @@ func TestRollbackOldComposeNamespace(t *testing.T) {
 	}
 }
 
-// prepareWith 用要写入目录 shared 的容器 new-app（和一个不用数据的 kept）调用 prepare。新服务器
-// 上的已有容器由 handle 回答（shared 是那个目录的完整路径）。返回屏幕上的输出（prepare 失败时
-// 有原因）和停过的容器。
+// prepareWith 用要写入目录 shared 的容器 new-app（和一个不用数据的 kept）按迁入的顺序调用
+// decide、begin、prepare。新服务器上的已有容器由 handle 回答（shared 是那个目录的完整路径）。
+// 返回屏幕上的输出（失败时有原因）和停过的容器。
 func prepareWith(t *testing.T, d preflight.Decisions, handle func(w http.ResponseWriter, p, shared string) bool) (string, []string) {
 	t.Helper()
 	home := t.TempDir()
@@ -481,7 +485,13 @@ func prepareWith(t *testing.T, d preflight.Decisions, handle func(w http.Respons
 		m:       &bundle.Manifest{Containers: []bundle.Container{{Name: "kept"}, {Name: "new-app"}}, Binds: []bundle.Bind{{Path: shared}}},
 		dataDir: data, rbDir: filepath.Join(home, "rollback", "current"), anonVolumes: map[string]bundle.Volume{},
 		undo: &undo{dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
-	err := r.prepare(context.Background())
+	err := r.decide(context.Background())
+	if err == nil {
+		err = r.begin()
+	}
+	if err == nil {
+		err = r.prepare(context.Background())
+	}
 	if r.j != nil {
 		r.j.close()
 	}
@@ -489,6 +499,32 @@ func prepareWith(t *testing.T, d preflight.Decisions, handle func(w http.Respons
 		return "", stopped
 	}
 	return out.String(), stopped
+}
+
+// 和迁入的数据共用的已有容器要先停下：用 --rm 启动的一停就被 Docker 删掉，Swarm 的任务停了会
+// 被换成新的，都恢复不了。要在改动任何东西之前停下，也不能去停它。
+func TestDecideRefusesUnstoppableWriters(t *testing.T) {
+	for _, c := range []struct{ name, extra, want string }{
+		{"--rm", `"HostConfig":{"AutoRemove":true},"Config":{"Labels":{}}`, "是用 --rm 启动的"},
+		{"Swarm", `"HostConfig":{},"Config":{"Labels":{"com.docker.swarm.service.id":"x","com.docker.swarm.service.name":"web"}}`,
+			"属于 Swarm 服务 web"},
+	} {
+		failed, stopped := prepareWith(t, preflight.Decisions{}, func(w http.ResponseWriter, p, shared string) bool {
+			switch p {
+			case "/containers/json":
+				io.WriteString(w, `[{"Id":"other-id","Names":["/other"],"State":"running"}]`)
+			case "/containers/other-id/json":
+				io.WriteString(w, `{"Id":"other-id","Name":"/other","State":{"Status":"running","Running":true},`+c.extra+
+					`,"Mounts":[{"Type":"bind","Source":"`+shared+`"}]}`)
+			default:
+				return false
+			}
+			return true
+		})
+		if !strings.Contains(failed, c.want) || !strings.Contains(failed, "还没有改动任何东西") || len(stopped) > 0 {
+			t.Errorf("%s：应在改动之前停下：%q，停过 %v", c.name, failed, stopped)
+		}
+	}
 }
 
 // 选择保留的已有容器（停着的也算）和要迁入的容器共用目录：不能覆盖它的数据，改动之前停下。
@@ -635,5 +671,99 @@ func TestRestoreKeepsRunningExportHelper(t *testing.T) {
 		Getenv: func(string) string { return "" }}, Options{Link: link})
 	if len(deleted) > 0 {
 		t.Errorf("删除了 %v", deleted)
+	}
+}
+
+// testJournal 是测试用的事务日志，测试结束时关闭。
+func testJournal(t *testing.T) *Journal {
+	t.Helper()
+	j, err := openJournal(filepath.Join(t.TempDir(), "rollback"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(j.close)
+	return j
+}
+
+// 回滚把改名备份的旧容器改回原名后、接回网络前被中断：再回滚一次时它已经叫回原名了，
+// 也要把网络（和固定 IP）接回去。记下了还没改名的，网络本来就在，不用重复接。
+func TestUndoRenameResumes(t *testing.T) {
+	for _, connected := range []bool{false, true} {
+		var connects []string
+		dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+			p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+			switch {
+			case p == "/containers/web.dockhop-backup-x/json":
+				http.Error(w, `{"message":"No such container"}`, 404)
+			case p == "/containers/web/json", p == "/containers/old-web/json":
+				nets := `{}`
+				if connected {
+					nets = `{"front":{}}`
+				}
+				io.WriteString(w, `{"Id":"old-web","Name":"/web","NetworkSettings":{"Networks":`+nets+`}}`)
+			case strings.HasSuffix(p, "/connect"):
+				b, _ := io.ReadAll(req.Body)
+				connects = append(connects, p+" "+string(b))
+				w.WriteHeader(200)
+			default:
+				return false
+			}
+			return true
+		})
+		var out bytes.Buffer
+		u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+		problems := u.rollback(context.Background(), []Entry{{Op: opRename, Name: "web", ID: "old-web", Backup: "web.dockhop-backup-x",
+			Networks: json.RawMessage(`{"front":{"IPAMConfig":{"IPv4Address":"172.30.9.10"},"Aliases":["web"]}}`)}})
+		if len(problems) > 0 {
+			t.Fatalf("回滚有问题：%v", problems)
+		}
+		switch {
+		case connected && len(connects) > 0:
+			t.Errorf("已经接着的网络不用重复接：%v", connects)
+		case !connected && (len(connects) != 1 || !strings.Contains(connects[0], "172.30.9.10")):
+			t.Errorf("应把网络和固定 IP 接回去：%v", connects)
+		}
+	}
+}
+
+// 回滚时镜像名改回迁入前指向的镜像，原来没有的名字删掉；迁入进来、已经没有名字也没有容器在
+// 用的镜像跟着删掉。
+func TestUndoTag(t *testing.T) {
+	var tagged, removed []string
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		switch {
+		case req.Method == "GET" && p == "/images/nginx:1.27/json":
+			io.WriteString(w, `{"Id":"sha256:migrated"}`)
+		case req.Method == "GET" && p == "/images/app:dev/json":
+			io.WriteString(w, `{"Id":"sha256:migrated-app"}`)
+		case req.Method == "GET" && p == "/images/same:1/json":
+			io.WriteString(w, `{"Id":"sha256:same"}`)
+		case req.Method == "POST" && strings.HasSuffix(p, "/tag"):
+			tagged = append(tagged, p+"?"+req.URL.RawQuery)
+			w.WriteHeader(201)
+		case req.Method == "DELETE":
+			removed = append(removed, p)
+			io.WriteString(w, `[]`)
+		default:
+			return false
+		}
+		return true
+	})
+	var out bytes.Buffer
+	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+	problems := u.rollback(context.Background(), []Entry{
+		{Op: opTag, Name: "nginx:1.27", ID: "sha256:original"}, // 原来指向别的镜像
+		{Op: opTag, Name: "app:dev"},                           // 原来没有这个名字
+		{Op: opTag, Name: "same:1", ID: "sha256:same"},         // 没来得及改
+	})
+	if len(problems) > 0 {
+		t.Fatalf("回滚有问题：%v", problems)
+	}
+	if strings.Join(tagged, ",") != "/images/sha256:original/tag?repo=nginx&tag=1.27" {
+		t.Errorf("改回原来的镜像：%v", tagged)
+	}
+	if strings.Join(removed, ",") != "/images/app:dev,/images/sha256:migrated" {
+		t.Errorf("删掉的：%v", removed)
 	}
 }

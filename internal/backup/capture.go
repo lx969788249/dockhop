@@ -312,7 +312,7 @@ func (h hostTar) entry(tw *tar.Writer, p string, d fs.DirEntry, err error) error
 		return err
 	}
 	if mode.IsRegular() {
-		return copyFile(tw, p, hdr.Size, h.logf)
+		return copyFile(h.ctx, tw, p, hdr.Size, h.logf)
 	}
 	return nil
 }
@@ -333,15 +333,18 @@ func (h hostTar) name(p string) (string, error) {
 
 // copyFile 写入一个文件的内容。不停机打包时文件可能正在变化：变长了只取开头
 // size 字节，变短了用 0 补齐，保证 tar 格式完整，并记日志提醒。
-func copyFile(w io.Writer, p string, size int64, logf func(string, ...any)) error {
+func copyFile(ctx context.Context, w io.Writer, p string, size int64, logf func(string, ...any)) error {
 	f, err := os.Open(p)
 	if err != nil {
 		return fmt.Errorf("读取 %s 失败：%v", p, err)
 	}
 	defer f.Close()
-	n, err := io.CopyN(w, f, size)
+	n, err := io.CopyN(w, ctxReader{ctx, f}, size)
 	if err == nil {
 		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	if !errors.Is(err, io.EOF) {
 		return fmt.Errorf("读取 %s 失败：%v", p, err)
@@ -356,4 +359,18 @@ type zeroReader struct{}
 func (zeroReader) Read(p []byte) (int, error) {
 	clear(p)
 	return len(p), nil
+}
+
+// ctxReader 每读一段之前看一眼 ctx：停机打包一个很大的文件时按 Ctrl+C，也能马上停下，
+// 停着的容器尽快恢复，不用等这个文件读完。
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }

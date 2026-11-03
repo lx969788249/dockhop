@@ -1,18 +1,28 @@
 package backup
 
 import (
+	"os"
 	"sort"
 	"strings"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
+	"github.com/lx969788249/dockhop/internal/crypto"
 )
 
 // buildPlan 生成迁移计划：新服务器下载之前据此检查自己能不能迁入。
-func buildPlan(m *bundle.Manifest, col *collected, bundleSize int64) *bundle.Plan {
-	p := &bundle.Plan{Version: 2, Source: m.Source, Images: m.ImageFiles}
+func buildPlan(m *bundle.Manifest, col *collected, bundleSize int64, bundleSum string) *bundle.Plan {
+	p := &bundle.Plan{Version: 2, Source: m.Source, Images: m.ImageFiles, BundleSHA256: bundleSum}
 	p.Sizes.Bundle = bundleSize
 	p.Sizes.ImageFiles = imageFileBytes(m.ImageFiles)
 	p.Sizes.Images = m.Images.Bytes
+	for _, pr := range col.projects {
+		p.Sizes.Projects += pr.dirBytes + pr.outBytes
+	}
+	for _, c := range m.Containers {
+		if c.Changes != nil {
+			p.Sizes.Changes += c.Changes.Bytes
+		}
+	}
 	for _, v := range m.Volumes {
 		p.Sizes.Volumes += v.Bytes
 	}
@@ -138,4 +148,17 @@ func linkPaths(links []bundle.BindLink) []string {
 		out = append(out, l.Link)
 	}
 	return out
+}
+
+// writePlan 把加密的迁移计划写到 path。
+func writePlan(path string, link crypto.Link, p *bundle.Plan) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	err = bundle.EncryptPlan(f, link, p)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }

@@ -14,18 +14,25 @@ import (
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/spec"
 )
 
-// 启动一组服务：组里的每个 Compose 项目、每个独立容器是一个“启动单位”。先把全部容器创建好，
-// 再按单位之间的依赖启动：被用到的先启动，等它就绪了再启动用到它的；互不相关的不互相等，
-// 全部启动之后再一起确认都就绪了。这和服务器重启时一样，没认出来的依赖靠应用自己重试，
-// 或者 Docker 按重启策略重启它。
+// 启动一组服务：组里的每个 Compose 项目、每个独立容器是一个“启动单位”。单位之间的依赖分三种，
+// 强弱不同，各管各的事：
 //
-// “用到”有两种。一种是明确的：--link、--volumes-from、借用别的容器的网络。另一种写在配置里：
-// 容器的环境变量或启动命令里写着同一个网络上另一个容器的名字或网络别名。例如 1Panel 装的
-// Halo 和 PostgreSQL 是两个 Compose 项目，Halo 的启动参数里写着数据库的服务名
-// （r2dbc:pool:postgresql://postgresql:5432/halo）；按名字顺序先启动 Halo 的话，它找不到数据库，
-// 一直起不来。认错了（某个词碰巧和别的容器同名）只会让它晚一点启动。
+//   - 要先存在（exist）：被借用的 Compose 网络由另一个项目创建，或者 --volumes-from 另一个容器。
+//     只影响创建的先后。
+//   - 要先就绪（ready）：借用另一个容器的网络、进程、IPC 命名空间，或者 --link 它。Docker 要求
+//     被依赖的先在运行，所以它先启动、就绪了才启动用到它的；它起不来，用到它的也不启动。
+//   - 最好先就绪（prefer）：从配置里认出来的，容器的环境变量或启动命令里写着同一个网络上另一个
+//     容器的名字或网络别名。例如 1Panel 装的 Halo 和 PostgreSQL 是两个 Compose 项目，Halo 的
+//     启动参数里写着数据库的服务名（r2dbc:pool:postgresql://postgresql:5432/halo）。被认出来的
+//     先启动，等它就绪了再启动用到它的；可这是猜的，可能认错（某个词碰巧和别的容器同名，甚至
+//     方向反了），所以等不到时不拦着：接着启动后面的，最后再给它一次完整的等待时间。
+//
+// 先按“要先存在”和“要先就绪”的顺序把全部容器创建好，再按“要先就绪”和“最好先就绪”的顺序
+// 启动；互不相关的不互相等，全部启动之后再一起确认都就绪了。最坏的情况（猜的依赖都不对）和
+// 服务器重启时一样：全部启动起来，没认出来的依赖靠应用自己重试，或者 Docker 按重启策略重启它。
 
 // unit 是一起启动的一个 Compose 项目或者一个独立容器。
 type unit struct {
@@ -33,9 +40,10 @@ type unit struct {
 	label   string          // 写进日志的名字
 	project *bundle.Project // 独立容器为 nil
 	items   []*citem
-	deps    []unitDep
+	deps    []*unitDep
 	started bool
 	ready   bool
+	waited  bool // 作为“最好先就绪”的依赖等过它、没等到：后面不再为它等，最后再等一次
 
 	// Compose 项目创建时算出来的，启动和等待时还要用
 	cp         compose.Project
@@ -43,18 +51,33 @@ type unit struct {
 	configured map[string]compose.Service
 }
 
-// unitDep 是一个单位用到另一个单位；why 写进日志。
+// unitDep 是一个单位用到另一个单位（见本文件开头）；why 写进日志。
 type unitDep struct {
-	on  *unit
-	why string
+	on                   *unit
+	exist, ready, prefer bool
+	why                  []string
 }
 
 func unitKey(u *unit) string { return u.key }
 
-func (u *unit) depKeys() []string {
+// createAfter 是创建它之前要先创建好的单位。
+func (u *unit) createAfter() []string {
 	var out []string
 	for _, d := range u.deps {
-		out = append(out, d.on.key)
+		if d.exist || d.ready {
+			out = append(out, d.on.key)
+		}
+	}
+	return out
+}
+
+// startAfter 是启动它之前要（最好）先就绪的单位。
+func (u *unit) startAfter() []string {
+	var out []string
+	for _, d := range u.deps {
+		if d.ready || d.prefer {
+			out = append(out, d.on.key)
+		}
 	}
 	return out
 }
@@ -63,6 +86,17 @@ func (u *unit) depKeys() []string {
 func (u *unit) serviceOrder() []string {
 	return dependencyOrder(u.services, func(svc string) string { return svc },
 		func(svc string) []string { return u.configured[svc].Needs() })
+}
+
+// again 让没就绪的容器最后再有一次完整的等待时间，从那时算起，再多给 1 分钟：它可能一直在
+// 等用到它的服务（猜反了），反复退出、被 Docker 自动重启，重启的间隔越拉越长，最长 1 分钟。
+func (u *unit) again() {
+	u.waited = true
+	for _, it := range u.items {
+		if !it.ready {
+			it.startedAt, it.extra = time.Time{}, time.Minute
+		}
+	}
 }
 
 // units 列出一组服务里的启动单位，并找出它们之间的依赖。
@@ -83,27 +117,51 @@ func (r *run) units(g *group) []*unit {
 			out = append(out, &unit{key: "c:" + it.m.Name, label: "容器 " + it.m.Name, items: []*citem{it}})
 		}
 	}
+	byKey := map[string]*unit{}
 	owner := map[string]*unit{}
 	for _, u := range out {
+		byKey[u.key] = u
 		for _, it := range u.items {
 			owner[it.m.Name] = u
 		}
 	}
+	networkOwner := r.networkOwners()
 	for _, u := range out {
-		add := func(on *unit, why string) {
+		dep := func(on *unit) *unitDep {
 			if on == nil || on == u {
-				return
+				return nil
 			}
 			for _, d := range u.deps {
 				if d.on == on {
-					return
+					return d
 				}
 			}
-			u.deps = append(u.deps, unitDep{on, why})
+			d := &unitDep{on: on}
+			u.deps = append(u.deps, d)
+			return d
 		}
 		for _, it := range u.items {
-			for _, dep := range containerDeps(it.c, r.nameOfOld) {
-				add(owner[dep], it.m.Name+" 用 --link、--volumes-from 或借用网络连着 "+dep)
+			for _, x := range spec.Deps(it.c) {
+				name := x.Ref
+				if n := r.nameOfOld(x.Ref); n != "" {
+					name = n
+				}
+				if d := dep(owner[name]); d != nil {
+					how := "--volumes-from"
+					if x.Running {
+						d.ready, how = true, "借用网络（或 --link）"
+					}
+					d.exist = true
+					d.why = append(d.why, it.m.Name+" 用"+how+"连着 "+name)
+				}
+			}
+			for n := range it.c.NetworkSettings.Networks {
+				if proj := networkOwner[n]; proj != "" {
+					if d := dep(byKey["p:"+proj]); d != nil {
+						d.exist = true
+						d.why = append(d.why, it.m.Name+" 接在 Compose 项目 "+proj+" 建的网络 "+n+" 上")
+					}
+				}
 			}
 		}
 		for _, v := range out {
@@ -114,11 +172,34 @@ func (r *run) units(g *group) []*unit {
 			for _, it := range u.items {
 				for _, other := range v.items {
 					if why := mentions(it.c, other.c); why != "" {
-						add(v, it.m.Name+" 的"+why)
+						d := dep(v)
+						d.prefer = true
+						d.why = append(d.why, it.m.Name+" 的"+why)
 						break next
 					}
 				}
 			}
+		}
+	}
+	return out
+}
+
+// networkOwners 是由迁入的 Compose 项目创建的网络 → 项目名：这些网络交给 Compose 按项目文件
+// 创建（见 startServices），用到它们的其他单位要等这个项目创建好。
+func (r *run) networkOwners() map[string]string {
+	out := map[string]string{}
+	for _, n := range r.m.Networks {
+		raw, err := os.ReadFile(filepath.Join(r.dataDir, "networks", n+".json"))
+		if err != nil {
+			continue
+		}
+		var meta struct {
+			Labels map[string]string `json:"Labels"`
+		}
+		_ = json.Unmarshal(raw, &meta)
+		if proj := meta.Labels["com.docker.compose.project"]; proj != "" && r.projectRestored(proj) &&
+			meta.Labels["com.docker.compose.network"] != "" {
+			out[n] = proj
 		}
 	}
 	return out
@@ -184,50 +265,24 @@ func hexID(s string) bool {
 // startGroup 启动一组服务（见本文件开头）。
 func (r *run) startGroup(ctx context.Context, g *group, n *int, total int) error {
 	units := r.units(g)
-	// 先全部创建好。Compose 项目在前：它会建好自己的网络，独立容器可能要接进去。
-	var standalone []*unit
-	for _, u := range units {
-		if u.project == nil {
-			standalone = append(standalone, u)
-			continue
-		}
+	r.logDeps(units)
+	for _, u := range dependencyOrder(units, unitKey, (*unit).createAfter) {
 		r.in(u.key)
-		r.Screen.Note("创建 Compose 项目 " + u.project.Name + " 的容器")
-		if err := r.createProject(ctx, u); err != nil {
+		if err := r.createUnit(ctx, u); err != nil {
 			return r.unitError(u, err)
 		}
 	}
-	// 独立容器按依赖顺序创建：被 --link、--volumes-from、借用网络的要先有。
-	for _, u := range dependencyOrder(standalone, unitKey, func(u *unit) []string {
-		var keys []string
-		for _, dep := range containerDeps(u.items[0].c, r.nameOfOld) {
-			keys = append(keys, "c:"+dep)
+	order := dependencyOrder(units, unitKey, (*unit).startAfter)
+	if len(order) > 1 {
+		var names []string
+		for _, u := range order {
+			names = append(names, u.label)
 		}
-		return keys
-	}) {
-		it := u.items[0]
-		r.in(u.key)
-		r.Screen.Note("创建容器 " + it.m.Name)
-		if err := r.createContainer(ctx, it); err != nil {
-			return r.unitError(u, err)
-		}
-		if err := r.transplantAnonymous(ctx, it, it.newID); err != nil {
-			return r.unitError(u, err)
-		}
-		if err := r.applyChanges(ctx, it); err != nil {
-			return r.unitError(u, err)
-		}
+		r.Log.Printf("启动顺序：%s", strings.Join(names, "、"))
 	}
-	order := dependencyOrder(units, unitKey, (*unit).depKeys)
-	r.logOrder(order)
 	for _, u := range order {
-		// 先等它用到的就绪。还没启动的不等：互相用到、排不出先后时会这样。
-		for _, d := range u.deps {
-			if d.on.started {
-				if err := r.waitUnit(ctx, d.on); err != nil {
-					return err
-				}
-			}
+		if err := r.waitBefore(ctx, u); err != nil {
+			return err
 		}
 		r.in(u.key)
 		if err := r.startUnit(ctx, u, n, total); err != nil {
@@ -242,19 +297,59 @@ func (r *run) startGroup(ctx context.Context, g *group, n *int, total int) error
 	return nil
 }
 
-// logOrder 把启动顺序和原因写进日志。
-func (r *run) logOrder(order []*unit) {
-	if len(order) < 2 {
-		return
+// waitBefore 在启动 u 之前，等它用到的单位就绪：Docker 要求的必须等到；从配置里认出来的
+// 等不到也接着启动（见本文件开头），那个单位最后再等一次。还没启动的不等：互相用到、排不出
+// 先后时会这样。
+func (r *run) waitBefore(ctx context.Context, u *unit) error {
+	for _, d := range u.deps {
+		if !d.on.started || !d.ready && (!d.prefer || d.on.waited) {
+			continue
+		}
+		err := r.waitUnit(ctx, d.on)
+		switch {
+		case err == nil:
+		case d.ready || ctx.Err() != nil:
+			return err
+		default:
+			r.Log.Printf("%s没有就绪（%v）；这个依赖是从配置里认出来的，可能认错了，先接着启动%s，最后再等它一次",
+				d.on.label, err, u.label)
+			d.on.again()
+		}
 	}
-	var names []string
-	for _, u := range order {
-		names = append(names, u.label)
+	return nil
+}
+
+// createUnit 创建一个单位的容器（不启动）。
+func (r *run) createUnit(ctx context.Context, u *unit) error {
+	if u.project != nil {
+		r.Screen.Note("创建 Compose 项目 " + u.project.Name + " 的容器")
+		return r.createProject(ctx, u)
 	}
-	r.Log.Printf("启动顺序：%s", strings.Join(names, "、"))
-	for _, u := range order {
+	it := u.items[0]
+	r.Screen.Note("创建容器 " + it.m.Name)
+	if err := r.createContainer(ctx, it); err != nil {
+		return err
+	}
+	if err := r.transplantAnonymous(ctx, it, it.newID); err != nil {
+		return err
+	}
+	return r.applyChanges(ctx, it)
+}
+
+// logDeps 把单位之间的依赖和原因写进日志。
+func (r *run) logDeps(units []*unit) {
+	for _, u := range units {
 		for _, d := range u.deps {
-			r.Log.Printf("  %s 用到%s（%s），等它就绪后再启动", u.label, d.on.label, d.why)
+			kind := "要等它先建好"
+			switch {
+			case d.ready:
+				kind = "要等它先就绪"
+			case d.prefer && !d.exist:
+				kind = "最好等它先就绪"
+			case d.prefer:
+				kind = "要等它先建好，最好也先就绪"
+			}
+			r.Log.Printf("%s 用到%s，%s：%s", u.label, d.on.label, kind, strings.Join(d.why, "；"))
 		}
 	}
 }
@@ -347,15 +442,17 @@ func (r *run) createProject(ctx context.Context, u *unit) error {
 		files = p.ConfigFiles
 	}
 	cp := compose.Project{Name: p.Name, WorkingDir: p.WorkingDir, Files: append([]string(nil), files...)}
-	// 快照镜像、改名的 digest 镜像：用一个临时的覆盖文件指定镜像，不改用户自己的文件。
+	// 旧版本镜像、改名的 digest 镜像、删掉了文件的镜像：用一个临时的覆盖文件按服务指定镜像，
+	// 不改用户自己的文件。
 	override := map[string]map[string]string{}
-	for _, it := range members {
-		img, err := r.image(ctx, it)
+	for _, svc := range uniqueServices(members) {
+		reps := replicas(members, svc)
+		img, err := r.serviceImage(ctx, p.Name, svc, reps)
 		if err != nil {
 			return err
 		}
-		if img != it.c.Config.Image {
-			override[it.m.Service] = map[string]string{"image": img}
+		if img != reps[0].c.Config.Image {
+			override[svc] = map[string]string{"image": img}
 		}
 	}
 	if len(override) > 0 {

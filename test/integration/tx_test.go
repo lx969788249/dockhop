@@ -845,8 +845,195 @@ networks:
 	}
 	b, _ := os.ReadFile(logs[len(logs)-1])
 	mustContain(t, string(b), "启动顺序：项目 "+db+"、项目 "+app,
-		"项目 "+app+" 用到项目 "+db+"（"+web+" 的启动命令里写着 database），等它就绪后再启动",
+		"项目 "+app+" 用到项目 "+db+"，最好等它先就绪："+web+" 的启动命令里写着 database",
 		"容器 "+web+" 就绪：健康检查通过")
 	m.waitOutSuccess(t)
+	noLeftovers(t, home)
+}
+
+// upProject 在 root/name 下写好 compose.yml（和 files 里的其他文件），用 Compose 启动。
+func upProject(t *testing.T, root, name, compose string, files map[string]string) string {
+	t.Helper()
+	dir := filepath.Join(root, name)
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "compose.yml"), []byte(compose), 0o644)
+	for f, content := range files {
+		os.MkdirAll(filepath.Dir(filepath.Join(dir, f)), 0o755)
+		os.WriteFile(filepath.Join(dir, f), []byte(content), 0o644)
+	}
+	c := composeCmd(t)
+	up := exec.Command(c[0], append(c[1:], "-p", name, "up", "-d")...)
+	up.Dir = dir
+	if b, err := up.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, b)
+	}
+	return dir
+}
+
+// 服务把项目目录本身挂进容器（./:/app）：项目文件随这个挂载目录迁移，迁入前检查要用单独打包的
+// 配置文件（含 env_file）检查，不能因为临时目录里没有文件就说新服务器读不懂配置。
+func TestInProjectInsideMount(t *testing.T) {
+	p := fmt.Sprintf("dmtest_pm%d", os.Getpid())
+	t.Cleanup(func() { removeProject(p); removePrefixed(p) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	dir := upProject(t, t.TempDir(), p, `services:
+  web:
+    image: alpine:3.20
+    command: ["sleep", "600"]
+    labels: {com.centurylinklabs.watchtower.enable: "false"}
+    env_file: [conf/app.env]
+    volumes: ["./:/app"]
+`, map[string]string{"conf/app.env": "GREETING=hello\n", "site/index.html": "migrated-site\n"})
+	web := containerByLabel(t, p, "web")
+	m := startOut(t, "--include", web)
+	removeProject(p)
+	os.RemoveAll(dir)
+
+	home := t.TempDir()
+	if _, code := m.in(t, home, nil); code != 0 {
+		t.Fatalf("迁入应成功：%d", code)
+	}
+	if got := exec1(t, containerByLabel(t, p, "web"), "cat /app/site/index.html; echo $GREETING"); got != "migrated-site\nhello" {
+		t.Errorf("项目文件和 env_file 应迁过来：%q", got)
+	}
+	m.waitOutSuccess(t)
+	noLeftovers(t, home)
+}
+
+// 项目 aapp 把项目 zproxy 建的网络当外部网络用（反向代理常见写法），而 aapp 的名字排在前面：
+// 要先创建 zproxy（Compose 按它的文件建网络），aapp 才找得到网络。
+func TestInSharedComposeNetwork(t *testing.T) {
+	p := fmt.Sprintf("dmtest_sn%d", os.Getpid())
+	app, proxy, network := p+"aapp", p+"zproxy", p+"_proxynet"
+	t.Cleanup(func() {
+		removeProject(app)
+		removeProject(proxy)
+		try("docker", "network", "rm", network)
+		removePrefixed(p)
+	})
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	root := t.TempDir()
+	upProject(t, root, proxy, `services:
+  proxy:
+    image: alpine:3.20
+    command: ["sleep", "600"]
+    labels: {com.centurylinklabs.watchtower.enable: "false"}
+    networks: [proxy]
+networks:
+  proxy: {name: `+network+`}
+`, nil)
+	upProject(t, root, app, `services:
+  app:
+    image: alpine:3.20
+    command: ["sleep", "600"]
+    labels: {com.centurylinklabs.watchtower.enable: "false"}
+    networks: [proxy]
+networks:
+  proxy: {name: `+network+`, external: true}
+`, nil)
+	m := startOut(t, "--include", containerByLabel(t, app, "app")+","+containerByLabel(t, proxy, "proxy"))
+	removeProject(app)
+	removeProject(proxy)
+	try("docker", "network", "rm", network)
+
+	home := t.TempDir()
+	if _, code := m.in(t, home, nil); code != 0 {
+		t.Fatalf("迁入应成功：%d", code)
+	}
+	for _, c := range []string{containerByLabel(t, app, "app"), containerByLabel(t, proxy, "proxy")} {
+		if s := state(t, c); s != "running" {
+			t.Errorf("%s 应在运行：%s", c, s)
+		}
+	}
+	m.waitOutSuccess(t)
+	noLeftovers(t, home)
+}
+
+// 从配置里猜依赖可能猜错：数据库的环境变量里碰巧写着网站容器的名字，看起来像数据库要用网站；
+// 网站其实是按固定 IP 连数据库（认不出来），数据库没起来时它的健康检查过不了。猜出来的依赖
+// 等不到时不能拦着：接着启动数据库，网站最后再等一次，迁入照样成功。
+func TestInWrongGuessDoesNotBlock(t *testing.T) {
+	p := fmt.Sprintf("dmtest_wg%d", os.Getpid())
+	web, db, network := p+"web", p+"db", p+"net"
+	octet := 20 + os.Getpid()%200
+	dbIP := fmt.Sprintf("172.31.%d.20", octet)
+	t.Cleanup(func() { removeAll(web, db); try("docker", "network", "rm", network); removePrefixed(p) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	sh(t, "docker", "network", "create", "--subnet", fmt.Sprintf("172.31.%d.0/24", octet), network)
+	sh(t, "docker", "run", "-d", "--name", db, "--label", noWatchtower, "--network", network, "--ip", dbIP,
+		"--restart", "unless-stopped", "-e", "APP_NAME="+web, "alpine:3.20", "nc", "-lk", "-p", "5432", "-e", "echo")
+	sh(t, "docker", "run", "-d", "--name", web, "--label", noWatchtower, "--network", network, "--restart", "unless-stopped",
+		"--health-cmd", "echo | nc -w 1 "+dbIP+" 5432", "--health-interval", "1s", "--health-timeout", "1s", "--health-retries", "3",
+		"alpine:3.20", "sleep", "600")
+	m := startOut(t, "--include", web+","+db)
+	removeAll(web, db)
+	sh(t, "docker", "network", "rm", network)
+
+	home := t.TempDir()
+	if _, code := m.in(t, home, nil); code != 0 {
+		t.Fatalf("猜错的依赖不应让迁入失败：%d", code)
+	}
+	logs, _ := filepath.Glob(filepath.Join(home, "logs", "in-*.log"))
+	if len(logs) == 0 {
+		t.Fatal("没有迁入日志")
+	}
+	b, _ := os.ReadFile(logs[len(logs)-1])
+	mustContain(t, string(b), "容器 "+db+" 用到容器 "+web+"，最好等它先就绪：", "可能认错了，先接着启动容器 "+db)
+	m.waitOutSuccess(t)
+	noLeftovers(t, home)
+}
+
+// 新服务器上用 --rm 启动的容器和迁入的数据共用：迁入时要先停下它，可它一停就被 Docker 删掉，
+// 恢复不了。要在改动任何东西之前停下，它照常运行。
+func TestInRefusesRemovableWriter(t *testing.T) {
+	f := newTx(t, "rr")
+	f.runWeb(t, nil)
+	m := startOut(t, "--include", f.web)
+	removeAll(f.web)
+	rm := f.p + "_rm"
+	sh(t, "docker", "run", "-d", "--rm", "--name", rm, "--label", noWatchtower, "-v", f.vol+":/data", "alpine:3.20", "sleep", "600")
+	t.Cleanup(func() { removeAll(rm) })
+
+	home := t.TempDir()
+	out, code := m.in(t, home, nil)
+	if code == 0 {
+		t.Fatal("应拒绝迁入")
+	}
+	mustContain(t, out, "是用 --rm 启动的", "还没有改动任何东西")
+	if s := state(t, rm); s != "running" {
+		t.Errorf("--rm 的容器应照常运行：%q", s)
+	}
+}
+
+// 迁入失败回滚时，新服务器上原有的镜像名改回原来指向的镜像：迁入时名字被改成了指向旧服务器
+// 上的那个版本。
+func TestInRollbackRestoresImageNames(t *testing.T) {
+	p := fmt.Sprintf("dmtest_rt%d", os.Getpid())
+	name, ref := p+"_app", p+"_img:1"
+	t.Cleanup(func() { removeAll(name); try("docker", "rmi", "-f", ref); removePrefixed(p) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	build := func(label string) string {
+		t.Helper()
+		cmd := exec.Command("docker", "build", "-q", "-t", ref, "-")
+		cmd.Stdin = strings.NewReader("FROM alpine:3.20\nLABEL dmtest=" + label + "\n")
+		b, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%v\n%s", err, b)
+		}
+		return sh(t, "docker", "image", "inspect", "-f", "{{.Id}}", ref)
+	}
+	build("source")
+	sh(t, "docker", "run", "-d", "--name", name, "--label", noWatchtower, ref, "sleep", "600")
+	m := startOut(t, "--include", name)
+	removeAll(name)
+	target := build("target") // 新服务器上同名的镜像是另一个版本
+
+	home := t.TempDir()
+	if _, code := m.in(t, home, []string{"DOCKHOP_TEST_FAIL=container:" + name}); code == 0 {
+		t.Fatal("应失败")
+	}
+	if got := sh(t, "docker", "image", "inspect", "-f", "{{.Id}}", ref); got != target {
+		t.Errorf("回滚后 %s 应指向原来的镜像 %s，实际 %s", ref, target, got)
+	}
 	noLeftovers(t, home)
 }

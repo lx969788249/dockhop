@@ -148,3 +148,38 @@ func TestPullMissing(t *testing.T) {
 		t.Errorf("没有 --pull 时不应加：%v", got)
 	}
 }
+
+// 项目目录随挂载目录一起迁移时，迁入前检查只拿得到单独打包的配置文件：-f 的文件、项目的
+// .env，以及配置里写到的、在项目目录里面的 env_file、include、extends、configs、secrets 文件。
+// 目录（build 上下文）不要，项目目录以外的另外迁移。
+func TestCheckFiles(t *testing.T) {
+	proj := t.TempDir()
+	for _, d := range []string{"web", "conf", "parts"} {
+		os.MkdirAll(filepath.Join(proj, d), 0o755)
+	}
+	for _, f := range []string{".env", "conf/app.env", "conf/site.conf", "parts/base.yml", "parts/.env", "unused.txt"} {
+		os.WriteFile(filepath.Join(proj, f), []byte("x"), 0o644)
+	}
+	os.WriteFile(filepath.Join(proj, "parts", "db.yml"), []byte("services:\n  db:\n    env_file: ../conf/app.env\n"), 0o644)
+	main := filepath.Join(proj, "compose.yml")
+	os.WriteFile(main, []byte(`
+include: [parts/db.yml]
+services:
+  web:
+    env_file: conf/app.env
+    build: ./web
+    extends: {file: parts/base.yml, service: base}
+configs:
+  site: {file: conf/site.conf}
+`), 0o644)
+	got := CheckFiles(Project{Name: "p", WorkingDir: proj, Files: []string{main}})
+	var rel []string
+	for _, f := range got {
+		r, _ := filepath.Rel(proj, f)
+		rel = append(rel, r)
+	}
+	want := ".env compose.yml conf/app.env conf/site.conf parts/.env parts/base.yml parts/db.yml"
+	if strings.Join(rel, " ") != want {
+		t.Errorf("检查用的配置文件：\n实际 %s\n期望 %s", strings.Join(rel, " "), want)
+	}
+}

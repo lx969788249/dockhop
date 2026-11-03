@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/lx969788249/dockhop/internal/host"
 )
 
 // 事务日志：迁入时对新服务器的每一处改动，都先在日志里追加一条记录（写到磁盘）
@@ -34,6 +36,7 @@ const (
 	opNetwork    Op = "network"     // 新建网络（Name）
 	opContainer  Op = "container"   // 新建容器（Name）
 	opHelper     Op = "helper"      // 新建临时容器（Name），用完就删
+	opTag        Op = "tag"         // 镜像名要改为指向迁入的镜像（Name；ID：原来指向的镜像，为空表示原来没有这个名字）
 	opComposeUp  Op = "compose_up"  // 启动 Compose 项目（Name、Networks：启动前已有的项目网络）
 	opCommit     Op = "commit"      // 已提交：新服务都验证通过，不再撤销
 )
@@ -86,6 +89,15 @@ func openJournal(dir string) (*Journal, error) {
 	}
 	j := &Journal{dir: dir, f: f}
 	if err := j.add(Entry{Op: opStart, PID: os.Getpid()}); err != nil {
+		f.Close()
+		return nil, err
+	}
+	// 日志文件本身也要在目录里留住：断电后找不到日志，就不知道要撤销什么。
+	if err := host.SyncDir(dir); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if err := host.SyncDir(filepath.Dir(dir)); err != nil {
 		f.Close()
 		return nil, err
 	}
@@ -181,7 +193,10 @@ func rewriteJournal(dir string, entries []Entry) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, journalPath(dir))
+	if err := os.Rename(tmp, journalPath(dir)); err != nil {
+		return err
+	}
+	return host.SyncDir(dir)
 }
 
 func committed(entries []Entry) bool {

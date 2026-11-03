@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -170,13 +171,17 @@ func TestHealthTimeout(t *testing.T) {
 	if got := healthTimeout(60*time.Second, 0, 2*s, 2*s, 1); got != 60*time.Second {
 		t.Errorf("检查得勤时至少等 60 秒：%s", got)
 	}
-	// 1Panel 装的 Halo：启动后 30 秒内不算，之后每 30 秒一次、超时 5 秒，连续 5 次没通过才算不健康，
-	// Docker 要 3 分钟才下结论。以前只等 95 秒，小机器上 Java 应用正常启动也会被误判。
-	if got := healthTimeout(60*time.Second, 30*s, 30*s, 5*s, 5); got != 215*time.Second {
+	// 1Panel 装的 Halo：启动后 30 秒内不算，之后每 30 秒一次、每次最多 5 秒，连续 5 次没通过才算
+	// 不健康。Docker 最晚 30 + 5 ×（30 + 5）= 205 秒下结论，再多等 30 秒。以前只等 95 秒。
+	if got := healthTimeout(60*time.Second, 30*s, 30*s, 5*s, 5); got != 235*time.Second {
 		t.Errorf("应等到 Docker 下结论再多 30 秒：%s", got)
 	}
-	// Vaultwarden：每 60 秒一次、超时 10 秒，没写次数（Docker 默认 3 次）。
-	if got := healthTimeout(60*time.Second, 0, 60*s, 10*s, 0); got != 220*time.Second {
+	// 每次检查都要用满时间（检查很慢）时，每一轮都要算上：30 + 5 ×（30 + 30）+ 30 = 360 秒。
+	if got := healthTimeout(60*time.Second, 30*s, 30*s, 30*s, 5); got != 360*time.Second {
+		t.Errorf("每一轮检查的时间都要算上：%s", got)
+	}
+	// Vaultwarden：每 60 秒一次、每次最多 10 秒，没写次数（Docker 默认 3 次）。
+	if got := healthTimeout(60*time.Second, 0, 60*s, 10*s, 0); got != 240*time.Second {
 		t.Errorf("没写的按 Docker 的默认值：%s", got)
 	}
 	if got := healthTimeout(60*time.Second, 2000*s, 2000*s, 0, 3); got != time.Hour {
@@ -407,5 +412,54 @@ func TestPartialRollbackKeepsOtherGroup(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(root, "b", "compose.yml")); err != nil || string(b) != "services: {}" {
 		t.Errorf("保留的那组应原样保留：%q %v", b, err)
+	}
+}
+
+// 迁入要写到的地方包括 Compose 项目的目录和项目目录外的文件：新服务器上用着它们的已有容器
+// 要先停下，保留的服务则不能迁入（不然项目文件会盖掉它正在用的配置）。
+func TestWriteSetIncludesProjectFiles(t *testing.T) {
+	r := &run{m: &bundle.Manifest{}, projects: []bundle.Project{{Name: "blog", WorkingDir: "/srv/blog", Outside: []string{"/etc/blog.env"}}}}
+	vols, dirs := r.writeSet()
+	if len(vols) != 0 || fmt.Sprint(dirs) != "[{p:blog /srv/blog} {p:blog /etc/blog.env}]" {
+		t.Fatalf("要写的地方：%v %v", vols, dirs)
+	}
+	c := &docker.Container{Mounts: []docker.Mount{{Type: "bind", Source: "/srv/blog/config"}}}
+	if !usesData(c, vols, dirs) {
+		t.Error("挂载了项目目录里的子目录，也算在用要写入的数据")
+	}
+}
+
+// 检查 Compose 配置时，报错说的是临时目录里没有的文件（迁入时会放回去），不算数；说的是
+// 临时目录里有的文件（读不懂它），算数。
+func TestMissingIn(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "compose.yml"), []byte("x"), 0o600)
+	if !missingIn("env file "+dir+"/conf/app.env not found: stat "+dir+"/conf/app.env: no such file or directory", dir) {
+		t.Error("没有的文件应算作缺文件")
+	}
+	if missingIn(dir+"/compose.yml: yaml: line 3: mapping values are not allowed", dir) {
+		t.Error("有的文件读不懂，不是缺文件")
+	}
+}
+
+// 下载的文件和迁移计划里记的 SHA-256 对不上（被换成了同一次迁移的另一个文件也一样）：删掉，
+// 不能用。对得上、或者旧版本的计划没有记录时照常用。
+func TestVerifyDownload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "image-1")
+	os.WriteFile(path, []byte("image-2 的内容"), 0o600)
+	var out bytes.Buffer
+	r := &run{Deps: Deps{Screen: ui.New(&out, false, nil)}}
+	want, _ := fileSHA256(path)
+	if err := r.verifyDownload(path, want, "镜像文件"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.verifyDownload(path, "", "镜像文件"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.verifyDownload(path, strings.Repeat("0", 64), "镜像文件"); err == nil || !strings.Contains(out.String(), "对不上") {
+		t.Fatalf("对不上时应失败：%v\n%s", err, out.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Error("对不上的文件应删掉")
 	}
 }

@@ -8,12 +8,15 @@ package restore
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -83,9 +86,14 @@ type run struct {
 	undo    *undo
 	vio     *volumeIO
 	targets map[string]bool   // 被替换的已有容器名
+	writers []writer          // 要临时停下的、和迁入的数据共用的已有容器（decide 找出来的）
 	shared  []Entry           // 临时停止的、和迁入的数据共用卷或目录的容器
 	groups  []*group          // 要迁入的服务分成的组（见 groups.go）
 	groupOf map[string]string // 容器、项目、卷、目录、网络 → 所在组
+
+	replaceProjects  []string                             // 要替换的已有同名 Compose 项目
+	existingProjects map[string][]docker.ContainerSummary // 新服务器上已有的 Compose 项目 → 它的容器
+	noted            map[string]bool                      // 已经在事务日志里记下原来指向的镜像名（见 noteTags）
 
 	done []string // 同一个链接上次已经迁入、这次跳过的服务
 
@@ -170,9 +178,7 @@ func (r *run) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if r.plan != nil {
-		r.decideImages(ctx, r.plan.Images)
-	}
+	r.decideImages(ctx, r.plan.Images)
 	s.End(summary)
 	s.Begin(3, r.steps, "下载迁移包")
 	if err := r.download(ctx); err != nil {
@@ -185,8 +191,15 @@ func (r *run) run(ctx context.Context) error {
 	if err := r.checkCompose(ctx); err != nil {
 		return err
 	}
+	if err := r.decide(ctx); err != nil {
+		return err
+	}
 	s.End(summary)
 
+	// 检查都做完了，从这里开始改动新服务器：每一处改动都先记进事务日志，镜像也不例外。
+	if err := r.begin(); err != nil {
+		return err
+	}
 	s.Begin(4, r.steps, "加载镜像")
 	if err := r.loadImages(ctx); err != nil {
 		return err
@@ -223,8 +236,9 @@ func (r *run) fetchPlan(ctx context.Context) error {
 	s.Note("连接旧服务器 " + r.opts.Link.Host)
 	raw, err := r.client().FetchPlan(ctx, r.opts.Link)
 	if errors.Is(err, transfer.ErrNoPlan) {
-		s.Warn("旧服务器没有提供迁移计划，跳过迁入前检查（有问题会在迁入过程中发现，并自动删除迁入的内容）")
-		return nil
+		// 迁移计划是迁入前检查和核对下载文件的依据，没有它不能迁入。
+		return fail(s, "旧服务器没有提供迁移计划，没法做迁入前检查（还没有下载或改动任何东西）", "",
+			"在旧服务器上重新运行迁出")
 	}
 	if err != nil {
 		var ce *transfer.ConnError
@@ -245,9 +259,6 @@ func (r *run) fetchPlan(ctx context.Context) error {
 func (r *run) check(ctx context.Context) (string, error) {
 	s := r.Screen
 	r.skipDone(ctx)
-	if r.plan == nil {
-		return "跳过", nil
-	}
 	runner := &preflight.Runner{Screen: s, Prompt: r.Prompt, Auto: r.opts.Yes,
 		Collect: func() (*preflight.Target, error) {
 			v := ""
@@ -310,22 +321,21 @@ func (r *run) download(ctx context.Context) error {
 	r.downloaded = true
 	// 先下载要从旧服务器拿的镜像，最后下载迁移包：迁移包一下完，旧服务器就显示“正在迁入”。
 	var parts []fetchPart
-	var bundleSize int64
-	if r.plan != nil {
-		for _, f := range r.plan.Images {
-			if r.fromOldServer(f) {
-				parts = append(parts, fetchPart{url: r.opts.Link.ImageURL(f.File), path: r.imagePath(f), size: f.Bytes})
-			}
+	for _, f := range r.plan.Images {
+		if r.fromOldServer(f) {
+			parts = append(parts, fetchPart{url: r.opts.Link.ImageURL(f.File), path: r.imagePath(f), size: f.Bytes})
 		}
-		bundleSize = r.plan.Sizes.Bundle
 	}
-	parts = append(parts, fetchPart{url: r.opts.Link.BundleURL(), path: r.bundlePath, size: bundleSize})
+	parts = append(parts, fetchPart{url: r.opts.Link.BundleURL(), path: r.bundlePath, size: r.plan.Sizes.Bundle})
 	return r.fetch(ctx, "下载迁移包", parts)
 }
 
 // unpack 解密、解开迁移包，并在改动任何东西之前检查里面的每一份数据。返回这一步的摘要。
 func (r *run) unpack(ctx context.Context) (string, error) {
 	s := r.Screen
+	if err := r.verifyDownload(r.bundlePath, r.plan.BundleSHA256, "迁移包"); err != nil {
+		return "", err
+	}
 	f, err := os.Open(r.bundlePath)
 	if err != nil {
 		return "", fail(s, "打不开迁移包 "+r.bundlePath, err.Error(), "")
@@ -363,6 +373,48 @@ func (r *run) unpack(ctx context.Context) (string, error) {
 		return "", fail(s, err.Error(), "", "在旧服务器重新运行迁出")
 	}
 	return fmt.Sprintf("%s · 校验通过", ui.HumanBytes(st.Size())), nil
+}
+
+// missingIn 表示报错 msg 提到了 dir 下面一个不存在的路径。
+func missingIn(msg, dir string) bool {
+	for _, path := range regexp.MustCompile(regexp.QuoteMeta(dir)+`/[^\s"':,]+`).FindAllString(msg, -1) {
+		if _, err := os.Lstat(path); err != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// verifyDownload 在用下载的文件之前，按迁移计划（经过认证）里记的 SHA-256 确认它就是旧服务器
+// 上的那个文件：同一次迁移的文件都用同一把密钥加密，网络上的设备把两个文件对调，解密也
+// 发现不了。对不上时删掉它，重新运行时会重新下载。旧版本的迁移计划没有记录时不检查。
+func (r *run) verifyDownload(path, want, what string) error {
+	if want == "" {
+		return nil
+	}
+	got, err := fileSHA256(path)
+	if err != nil {
+		return fail(r.Screen, "读不了下载的"+what+" "+path, err.Error(), "")
+	}
+	if got != want {
+		_ = os.Remove(path)
+		return fail(r.Screen, "下载的"+what+"和旧服务器上的对不上（可能在网络上被改动过），已删除", "",
+			"重新运行迁入，会重新下载；如果再次出现，检查两台服务器之间的网络")
+	}
+	return nil
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // scan 检查迁移包里所有的卷、目录和 Compose 文件（路径是否越界、有没有通过软链接
@@ -429,6 +481,11 @@ func (r *run) scan() error {
 				return err
 			}
 		}
+		if p.CheckParts > 0 {
+			if err := check("compose/"+p.Name+"/check", p.CheckParts, "Compose 项目 "+p.Name+" 的配置文件"); err != nil {
+				return err
+			}
+		}
 		if p.OutParts > 0 {
 			roots := make([]string, len(p.Outside))
 			for i, o := range p.Outside {
@@ -486,20 +543,28 @@ func (r *run) checkProject(ctx context.Context, p bundle.Project) error {
 	if len(files) == 0 {
 		files = p.ConfigFiles
 	}
+	// 检查用的项目文件：整个项目目录；项目目录随某个挂载目录迁移时，是单独打包的配置文件。
+	stream, parts := "dir", p.DirParts
+	if parts == 0 {
+		stream, parts = "check", p.CheckParts
+	}
+	if parts == 0 {
+		// v1.1.5 及以前的迁移包没有单独打包配置文件：项目文件都在挂载目录里，这里拿不到。
+		r.Log.Printf("Compose 项目 %s 的文件随挂载目录迁移，迁移包里没有单独的配置文件，跳过检查", p.Name)
+		return nil
+	}
 	stage := filepath.Join(r.workdir, "check-"+p.Name)
 	_ = os.RemoveAll(stage)
 	if err := os.MkdirAll(stage, 0o700); err != nil {
 		return nil
 	}
 	defer os.RemoveAll(stage)
-	if p.DirParts > 0 {
-		rc := bundle.OpenStream(r.dataDir, "compose/"+p.Name+"/dir", p.DirParts)
-		err := bundle.ExtractTree(rc, stage)
-		rc.Close()
-		if err != nil {
-			r.Log.Printf("没能解开 Compose 项目 %s 的文件来检查：%v", p.Name, err)
-			return nil
-		}
+	rc := bundle.OpenStream(r.dataDir, "compose/"+p.Name+"/"+stream, parts)
+	err := bundle.ExtractTree(rc, stage)
+	rc.Close()
+	if err != nil {
+		r.Log.Printf("没能解开 Compose 项目 %s 的文件来检查：%v", p.Name, err)
+		return nil
 	}
 	var args []string
 	for _, f := range files {
@@ -517,16 +582,20 @@ func (r *run) checkProject(ctx context.Context, p bundle.Project) error {
 		}
 		args = append(args, f)
 	}
-	err := r.tool.Exec(ctx, compose.Project{Name: p.Name, WorkingDir: stage, Files: args}, r.Log.Printf, "config", "-q")
+	err = r.tool.Exec(ctx, compose.Project{Name: p.Name, WorkingDir: stage, Files: args}, r.Log.Printf, "config", "-q")
 	if err == nil {
 		return nil
 	}
+	// 只检查新服务器的 Compose 读不读得懂配置；报错说的是检查时手边没有的文件（迁入时会和
+	// 项目一起放回去，或者本来就在挂载目录里）的，不算数。
 	msg := err.Error()
+	missing := missingIn(msg, stage)
 	for _, path := range append(append([]string{p.WorkingDir + "/"}, p.Outside...), p.Skipped...) {
-		if strings.Contains(msg, path) {
-			r.Log.Printf("检查 Compose 项目 %s 时的报错涉及临时目录里没有的文件，不算数", p.Name)
-			return nil
-		}
+		missing = missing || strings.Contains(msg, path)
+	}
+	if missing {
+		r.Log.Printf("检查 Compose 项目 %s 时的报错涉及临时目录里没有的文件，不算数", p.Name)
+		return nil
 	}
 	msg = strings.TrimPrefix(msg, "config -q 失败：")
 	return errors.New(strings.ReplaceAll(msg, stage, p.WorkingDir))
@@ -537,7 +606,15 @@ func (r *run) checkProject(ctx context.Context, p bundle.Project) error {
 func (r *run) loadImages(ctx context.Context) error {
 	s := r.Screen
 	if r.m.Images.Parts > 0 {
-		// 格式版本 1 的迁移包：所有镜像都在包里。
+		// 格式版本 1 的迁移包：所有镜像都在包里，docker load 按里面记的名字加名字。
+		var names []string
+		for ref := range r.m.Images.Refs {
+			names = append(names, ref)
+		}
+		sort.Strings(names)
+		if err := r.noteTags(ctx, names); err != nil {
+			return err
+		}
 		rc := bundle.OpenStream(r.dataDir, "images", r.m.Images.Parts)
 		p := s.StartProgress("加载镜像", r.m.Images.Bytes, "镜像较大时需要几分钟")
 		err := r.Docker.LoadImages(ctx, io.TeeReader(rc, p))
@@ -579,7 +656,11 @@ func (r *run) resolveImage(ctx context.Context, ref string) (string, error) {
 		}
 		return ref, nil
 	}
-	// digest 固定的镜像：导出文件里没有仓库清单，加载后按摘要找不到（实验 3、6）。
+	// digest 固定的镜像：本机已经有这个摘要的镜像（原来就有，或者刚按摘要拉下来的）就直接用。
+	if _, err := r.Docker.InspectImage(ctx, ref); err == nil {
+		return ref, nil
+	}
+	// 导出文件里没有仓库清单，加载后按摘要找不到（实验 3、6）。
 	if !r.d.UseBundleImage(ref) {
 		s.Note("按摘要补齐镜像清单 · " + ref)
 		pctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -603,6 +684,9 @@ func (r *run) resolveImage(ctx context.Context, ref string) (string, error) {
 		return "", fail(s, "镜像 "+ref+" 没有加载成功", "", "")
 	}
 	as := preflight.StripDigest(ref)
+	if err := r.noteTags(ctx, []string{as}); err != nil {
+		return "", err
+	}
 	repo, tag := splitTag(as)
 	if err := r.Docker.TagImage(ctx, id, repo, tag); err != nil {
 		return "", fail(s, "给镜像 "+ref+" 加名字失败", err.Error(), "")
@@ -621,7 +705,10 @@ func splitTag(ref string) (string, string) {
 
 // ---------- 备份已有服务 ----------
 
-func (r *run) prepare(ctx context.Context) error {
+// decide 是改动新服务器之前的最后一道检查，只读不改：按新服务器现在的样子决定替换、保留哪些
+// 已有服务，找出要临时停下的、和迁入的数据共用的容器，并确认要停下的容器都能停下、之后再
+// 原样恢复。之后的改动（加载镜像、备份已有服务、写入数据……）都在事务里，失败时全部撤销。
+func (r *run) decide(ctx context.Context) error {
 	s := r.Screen
 	dc := r.Docker
 	existing, err := dc.Containers(ctx, true)
@@ -638,7 +725,7 @@ func (r *run) prepare(ctx context.Context) error {
 	}
 	policy := r.opts.Existing
 	if policy == "" {
-		policy = "replace" // 检查时问过了，或者用了 --skip-check
+		policy = "replace" // 检查时已经问过
 	}
 
 	// 要迁入的内容：去掉检查时选择跳过的，以及 --existing skip 时已经有的。
@@ -702,12 +789,12 @@ func (r *run) prepare(ctx context.Context) error {
 		return fail(s, "按检查时的选择，没有要迁入的容器了", "", "")
 	}
 
-	// 新服务器上和要写入的数据共用卷或目录的容器：
+	// 新服务器上和要写入的数据（数据卷、挂载目录、Compose 项目的文件）共用的容器：
 	//   - 保留下来的已有服务（检查时选择了保留，或者 --existing skip）：不能覆盖它的数据。
-	//     检查时已经处理过，这里按新服务器现在的情况再确认一次（--skip-check 时没有检查）；
+	//     检查时已经处理过，这里按新服务器现在的情况再确认一次；
 	//   - 其他正在运行的：要先临时停止，否则数据不一致。
 	// 读不到某个容器的配置时，没法确认它有没有在用这些数据，不能当作没有。
-	volumes, binds := r.dataTargets()
+	volumes, dirs := r.writeSet()
 	self, _ := os.Hostname()
 	ignore := map[string]bool{}
 	for _, n := range strings.Split(r.Getenv("DOCKHOP_TEST_IGNORE"), ",") {
@@ -729,7 +816,7 @@ func (r *run) prepare(ctx context.Context) error {
 			continue // 刚好被删掉了
 		case err != nil:
 			return fail(s, "读不到新服务器上的容器 "+name+"，没法确认它有没有在用要写入的数据（还没有改动任何东西）", err.Error(), "确认 Docker 运行正常后重新运行")
-		case !usesData(full, volumes, binds):
+		case !usesData(full, volumes, dirs):
 			continue
 		case kept:
 			return fail(s, "保留的已有容器 "+name+" 和要迁入的容器共用数据，迁入会覆盖它正在用的数据（还没有改动任何东西）", "",
@@ -738,18 +825,75 @@ func (r *run) prepare(ctx context.Context) error {
 		writers = append(writers, writer{summary: c, full: full})
 	}
 	r.buildGroups(writers)
+	r.writers, r.replaceProjects, r.existingProjects = writers, replaceProjects, projects
+	return r.checkStoppable(ctx)
+}
 
-	// 开始事务：之后的每一处改动都先记日志。
+// checkStoppable 确认迁入时要停下的已有容器都能停下、之后再原样恢复（规则见
+// spec.StopRiskOf）：共用数据的容器，以及要被替换的同名容器和同名 Compose 项目的容器。
+func (r *run) checkStoppable(ctx context.Context) error {
+	type stopping struct {
+		c   *docker.Container
+		why string
+	}
+	var list []stopping
+	for _, w := range r.writers {
+		list = append(list, stopping{w.full, "它和迁入的服务共用数据"})
+	}
+	var ids []string
+	for _, it := range r.items {
+		if r.targets[it.m.Name] {
+			ids = append(ids, it.m.Name)
+		}
+	}
+	for _, p := range r.replaceProjects {
+		for _, c := range r.existingProjects[p] {
+			ids = append(ids, c.ID)
+		}
+	}
+	for _, id := range ids {
+		c, _, err := r.Docker.InspectContainer(ctx, id)
+		if err != nil {
+			return fail(r.Screen, "读不到新服务器上要替换的容器 "+id+"（还没有改动任何东西）", err.Error(), "确认 Docker 运行正常后重新运行")
+		}
+		list = append(list, stopping{c, "要被迁入的同名服务替换"})
+	}
+	for _, x := range list {
+		name := x.c.ShortName()
+		switch spec.StopRiskOf(x.c) {
+		case spec.StopRemoves:
+			return fail(r.Screen, "新服务器上的容器 "+name+" 是用 --rm 启动的：迁入时要先停下它（"+x.why+
+				"），可 Docker 一停止就会把它连同匿名卷和容器里的改动一起删掉，迁入失败时也放不回来（还没有改动任何东西）", "",
+				"先把它重新创建成不带 --rm 的容器，再重新运行迁入")
+		case spec.StopReplaced:
+			svc := x.c.Config.Labels["com.docker.swarm.service.name"]
+			return fail(r.Screen, "新服务器上的容器 "+name+" 属于 Swarm 服务 "+svc+"：迁入时要先停下它（"+x.why+
+				"），可它一停就会被 Swarm 换成新的，新的照样在用这些数据（还没有改动任何东西）", "",
+				"先执行 docker service scale "+svc+"=0，迁入完成后再改回原来的个数")
+		}
+	}
+	return nil
+}
+
+// begin 开始事务：从这里起，对新服务器的每一处改动都先记进事务日志，失败、中断时按日志撤销。
+func (r *run) begin() error {
 	if err := os.RemoveAll(r.rbDir); err != nil {
-		return fail(s, "无法清理回滚资料目录 "+r.rbDir, err.Error(), "")
+		return fail(r.Screen, "无法清理回滚资料目录 "+r.rbDir, err.Error(), "")
 	}
 	j, err := openJournal(r.rbDir)
 	if err != nil {
-		return fail(s, "无法创建事务日志，为了安全没有改动任何东西", err.Error(), "检查 "+r.Home+" 是否可写")
+		return fail(r.Screen, "无法创建事务日志，为了安全没有改动任何东西", err.Error(), "检查 "+r.Home+" 是否可写")
 	}
 	r.j = j
+	return nil
+}
+
+// prepare 备份要替换的已有服务，临时停下和迁入的数据共用的容器（都是 decide 找出来的）。
+func (r *run) prepare(ctx context.Context) error {
+	s, dc := r.Screen, r.Docker
 	helperBin := ""
 	if dc.Local() {
+		var err error
 		if helperBin, err = prepareHelper(r.Home); err != nil {
 			s.Warn("准备清空数据卷用的程序失败：%v", err)
 			helperBin = ""
@@ -759,7 +903,7 @@ func (r *run) prepare(ctx context.Context) error {
 	r.undo.vio = r.vio
 
 	stopped := 0
-	for _, w := range writers {
+	for _, w := range r.writers {
 		name := w.summary.Name()
 		e := Entry{Op: opStop, Name: name, ID: w.summary.ID, State: stateOf(w.full), Group: r.groupOf["w:"+name]}
 		if err := r.stopContainer(ctx, e); err != nil {
@@ -810,12 +954,12 @@ func (r *run) prepare(ctx context.Context) error {
 	}
 
 	// 已有的同名 Compose 项目：记下每个容器的完整配置，停止，把有改动的存成回滚镜像，再删除。
-	for _, p := range replaceProjects {
+	for _, p := range r.replaceProjects {
 		r.in("p:" + p)
-		if err := r.backupProject(ctx, p, projects[p]); err != nil {
+		if err := r.backupProject(ctx, p, r.existingProjects[p]); err != nil {
 			return err
 		}
-		backedUp += len(projects[p])
+		backedUp += len(r.existingProjects[p])
 	}
 	r.in("")
 	if r.testFail("prepare") {
@@ -951,6 +1095,29 @@ func (r *run) dataTargets() (map[string]bool, []string) {
 	return vols, binds
 }
 
+// writeTarget 是迁入要写到宿主机上的一处，key 是它在分组里的键：挂载目录是 b:路径，
+// Compose 项目的目录和项目目录外的文件是 p:项目名。
+type writeTarget struct{ key, path string }
+
+// writeSet 是迁入要写入的全部地方：数据卷，以及宿主机上的挂载目录、Compose 项目目录和
+// 项目目录外的文件。新服务器上和它们共用数据的已有容器要先停下（保留的服务则不能迁入），
+// 分组时也和写入它们的服务放在一组。
+func (r *run) writeSet() (map[string]bool, []writeTarget) {
+	vols, binds := r.dataTargets()
+	var dirs []writeTarget
+	for _, b := range binds {
+		dirs = append(dirs, writeTarget{"b:" + b, b})
+	}
+	for _, p := range r.projects {
+		for _, path := range append([]string{p.WorkingDir}, p.Outside...) {
+			if !spec.IsSystemPath(path) {
+				dirs = append(dirs, writeTarget{"p:" + p.Name, path})
+			}
+		}
+	}
+	return vols, dirs
+}
+
 // usedData 是要迁入的容器用到的卷和目录（被跳过的容器独占的数据不写入）。
 func (r *run) usedData() (map[string]bool, map[string]bool) {
 	vols, binds := map[string]bool{}, map[string]bool{}
@@ -985,7 +1152,7 @@ func (r *run) usedData() (map[string]bool, map[string]bool) {
 	return vols, binds
 }
 
-func usesData(c *docker.Container, vols map[string]bool, binds []string) bool {
+func usesData(c *docker.Container, vols map[string]bool, dirs []writeTarget) bool {
 	for _, m := range c.Mounts {
 		switch m.Type {
 		case "volume":
@@ -993,8 +1160,8 @@ func usesData(c *docker.Container, vols map[string]bool, binds []string) bool {
 				return true
 			}
 		case "bind":
-			for _, b := range binds {
-				if spec.PathsOverlap(preflight.Normalize(m.Source), preflight.Normalize(b)) {
+			for _, d := range dirs {
+				if spec.PathsOverlap(preflight.Normalize(m.Source), preflight.Normalize(d.path)) {
 					return true
 				}
 			}
@@ -1129,9 +1296,16 @@ func (r *run) saveVolume(ctx context.Context, name, path string) error {
 	if err != nil {
 		return err
 	}
+	// 接下来就要清空这个卷：备份必须先确实写到磁盘，否则断电后只剩半份。
 	_, err = io.Copy(f, rc)
+	if err == nil {
+		err = f.Sync()
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
+	}
+	if err == nil {
+		err = host.SyncDir(filepath.Dir(path))
 	}
 	return err
 }

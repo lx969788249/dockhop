@@ -38,7 +38,8 @@ func statePath(home string) string { return filepath.Join(home, "state", stateFi
 
 func lockPath(home string) string { return filepath.Join(home, "locks", "out.lock") }
 
-// writeStopped 在停机之前写下记录（先写临时文件再改名，不会留下写了一半的文件）。
+// writeStopped 在停机之前写下记录，并确实写到磁盘：停机后任何时候断电，下次运行都能读到完整的
+// 记录，把停下的容器恢复原状。
 func writeStopped(home string, list []StoppedContainer) error {
 	p := statePath(home)
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
@@ -48,11 +49,7 @@ func writeStopped(home string, list []StoppedContainer) error {
 	if err != nil {
 		return err
 	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, p)
+	return host.WriteFileDurable(p, b, 0o600)
 }
 
 func removeStopped(home string) error {
@@ -85,8 +82,9 @@ func RecoverInterrupted(ctx context.Context, dc *docker.Client, home string, scr
 	defer lock.Unlock()
 	var rec stoppedRecord
 	if err := json.Unmarshal(b, &rec); err != nil {
-		screen.Warn("上次迁出的停机记录读不懂，已忽略：%v", err)
-		return removeStopped(home)
+		// 不能当作没有：删掉记录，可能还停着的容器就没人管了。
+		return fmt.Errorf("上次迁出的停机记录 %s 读不懂（%v），上次停下的容器可能还停着。请执行 docker ps -a 检查，"+
+			"把需要的容器启动起来，然后删除这个文件再重新运行", statePath(home), err)
 	}
 	var still []StoppedContainer
 	for _, c := range rec.Containers {

@@ -100,6 +100,10 @@ type Project struct {
 	ConfigDrift []string `json:"config_drift,omitempty"` // 现在的文件和运行中的容器对不上的服务
 	DirParts    int      `json:"dir_parts"`
 	OutParts    int      `json:"outside_parts,omitempty"`
+	// CheckParts：项目目录在某个挂载目录里时，项目文件随挂载目录迁移（DirParts 为 0），
+	// 迁入前检查要用的配置文件（-f 的文件、.env、env_file、include、extends 等）另外
+	// 单独打包一份（v1.1.6 起）。
+	CheckParts int `json:"check_parts,omitempty"`
 }
 
 // Volume 是迁移的一个数据卷。
@@ -155,4 +159,7 @@ type ImageFile struct {
 	Pull  string   `json:"pull,omitempty"` // 能从镜像仓库拉到同一个镜像的引用（名字@sha256:摘要）；自己构建的镜像没有
 	Bytes int64    `json:"bytes"`          // 文件大小（压缩、加密后）
 	Size  int64    `json:"size"`           // 导出的字节数（压缩前），加载时显示进度用
+	// SHA256 是文件的 SHA-256（v1.1.6 起）。同一次迁移的文件都用同一把密钥加密，单靠解密
+	// 分不出是哪一个；清单和迁移计划都经过认证，下载后按它确认拿到的就是这个文件。
+	SHA256 string `json:"sha256,omitempty"`
 }

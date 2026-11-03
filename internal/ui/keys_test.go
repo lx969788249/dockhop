@@ -1,35 +1,44 @@
 package ui
 
 import (
-	"bufio"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
 )
 
-// chunks 每次 Read 只给出一段，像终端那样：每按一次键到一次。
-type chunks []string
-
-func (c *chunks) Read(b []byte) (int, error) {
-	if len(*c) == 0 {
-		return 0, io.EOF
+// 终端送来的字节流切成键：方向键、功能键算一个；Esc 和后面的键一起到时分开；一串分几次到时
+// 等到齐；一阵子没有新输入时，单独的 Esc 就是按了 Esc。
+func TestKeyParser(t *testing.T) {
+	cases := []struct {
+		name   string
+		chunks []string // 每一段是一次读到的；"" 表示等了一会儿没有新输入
+		want   []Key
+	}{
+		{"单按 Esc，再按回车", []string{"\x1b", "", "\r"}, []Key{KeyEsc, KeyEnter}},
+		{"Esc 和回车一起到", []string{"\x1b\r"}, []Key{KeyEsc, KeyEnter}},
+		{"Esc 和 q 一起到", []string{"\x1bq\n"}, []Key{KeyEsc, 'q', KeyEnter}},
+		{"方向键", []string{"\x1b[A", "x"}, []Key{KeyOther, 'x'}},
+		{"方向键分两次到", []string{"\x1b", "[A", "\r"}, []Key{KeyOther, KeyEnter}},
+		{"带参数的功能键", []string{"\x1b[15~q"}, []Key{KeyOther, 'q'}},
+		{"F1（SS3）", []string{"\x1bOP", "x"}, []Key{KeyOther, 'x'}},
+		{"连着两个方向键再回车", []string{"\x1b[A\x1b[B\r"}, []Key{KeyOther, KeyOther, KeyEnter}},
+		{"没到齐的一串等不到后续", []string{"\x1b[1", ""}, []Key{KeyOther}},
+		{"Esc 后面没有别的", []string{"\x1b", ""}, []Key{KeyEsc}},
 	}
-	n := copy(b, (*c)[0])
-	*c = (*c)[1:]
-	return n, nil
-}
-
-func TestReadKey(t *testing.T) {
-	in := chunks{"\x1b", "\r", "\x1b[A", "q", "\n", "\x1bOP", "x"}
-	r := bufio.NewReader(&in)
-	want := []Key{KeyEsc, KeyEnter, KeyOther, 'q', KeyEnter, KeyOther, 'x'}
-	for i, w := range want {
-		if k, err := readKey(r); err != nil || k != w {
-			t.Fatalf("第 %d 个键：实际 %v（%v），期望 %v", i+1, k, err, w)
+	for _, c := range cases {
+		var p keyParser
+		var got []Key
+		for _, ch := range c.chunks {
+			if ch == "" {
+				got = append(got, p.idle()...)
+			} else {
+				got = append(got, p.feed([]byte(ch))...)
+			}
 		}
-	}
-	if _, err := readKey(r); err != io.EOF {
-		t.Errorf("读完以后应返回 io.EOF，实际 %v", err)
+		if fmt.Sprint(got) != fmt.Sprint(c.want) {
+			t.Errorf("%s：实际 %v，期望 %v", c.name, got, c.want)
+		}
 	}
 }
 

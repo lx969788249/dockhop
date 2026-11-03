@@ -20,11 +20,7 @@ import (
 // 不同版本的 docker compose config 输出差别很大（新版会把 env_file 并进环境变量、
 // 不再列出路径，而且有的版本加了 --no-env-resolution 也一样），所以不依赖它的输出。
 func DeclaredFiles(p Project) (files, unknown []string) {
-	w := &walker{project: p.WorkingDir, read: map[string]bool{}, found: map[string]bool{}, unknown: map[string]bool{}}
-	for _, f := range p.Files {
-		// -f 的文件里的相对路径都从项目目录算起，不管文件本身在哪。
-		w.parse(w.add(f, p.WorkingDir), p.WorkingDir)
-	}
+	w := walk(p)
 	for path := range w.found {
 		if !w.covered(path) {
 			files = append(files, path)
@@ -38,10 +34,45 @@ func DeclaredFiles(p Project) (files, unknown []string) {
 	return files, unknown
 }
 
+// CheckFiles 是 docker compose config 读配置时用到的、在项目目录里面的文件：-f 的文件、
+// 项目目录的 .env，以及配置里写到的 env_file、include、extends、configs、secrets 文件
+// （只要普通文件，build 上下文这类目录不算）。项目目录随某个挂载目录一起迁移时，迁入前
+// 检查拿不到整个项目目录，就用这些文件检查新服务器的 Compose 能不能读懂配置。
+func CheckFiles(p Project) []string {
+	w := walk(p)
+	paths := []string{filepath.Join(p.WorkingDir, ".env")}
+	for path := range w.inside {
+		paths = append(paths, path)
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, path := range paths {
+		if st, err := os.Stat(path); err != nil || !st.Mode().IsRegular() || seen[path] {
+			continue
+		}
+		seen[path] = true
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// walk 从 -f 的文件读起，找出配置写到的所有文件。
+func walk(p Project) *walker {
+	w := &walker{project: p.WorkingDir, read: map[string]bool{}, found: map[string]bool{}, inside: map[string]bool{},
+		unknown: map[string]bool{}}
+	for _, f := range p.Files {
+		// -f 的文件里的相对路径都从项目目录算起，不管文件本身在哪。
+		w.parse(w.add(f, p.WorkingDir), p.WorkingDir)
+	}
+	return w
+}
+
 type walker struct {
 	project string          // 项目目录：里面的文件随项目目录一起打包
 	read    map[string]bool // 读过的 Compose 文件（include 可能互相引用）
 	found   map[string]bool // 项目目录以外、要一起迁移的路径
+	inside  map[string]bool // 项目目录里面写到的路径
 	unknown map[string]bool
 }
 
@@ -64,6 +95,8 @@ func (w *walker) add(path, base string) string {
 	}
 	if path != w.project && !strings.HasPrefix(path, w.project+string(filepath.Separator)) {
 		w.found[path] = true
+	} else {
+		w.inside[path] = true
 	}
 	return path
 }

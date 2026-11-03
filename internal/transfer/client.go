@@ -126,9 +126,13 @@ func (c *Client) bundleExists(ctx context.Context, link crypto.Link) bool {
 // Part 是要下载的一个文件，以及它在这一轮下载里的位置：旧服务器据此显示总的下载进度。
 type Part struct {
 	URL    string // link.BundleURL() 或 link.ImageURL(文件名)
+	Size   int64  // 文件应有的大小（迁移计划里记的，经过认证）；0 表示不知道
 	Before int64  // 这一轮里排在它前面的文件合计多少字节
 	Total  int64  // 这一轮一共要下载多少字节；0 表示只看这一个文件
 }
+
+// errSize 表示旧服务器发来的文件大小和迁移计划里记的不一样：不是要下载的那个文件。
+var errSize = errors.New("旧服务器发来的文件大小和迁移计划里记的不一样")
 
 // Download 把旧服务器上的一个文件（迁移包或镜像文件）下载到 path。path 已经有一部分时
 // 从断点继续；中途断开会自动续传，最多 Retries 次。progress 收到这个文件已经下载的字节数
@@ -142,6 +146,10 @@ func (c *Client) Download(ctx context.Context, link crypto.Link, part Part, path
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if errors.Is(err, errSize) {
+			_ = os.Remove(path)
+			return err
 		}
 		var ce *ConnError
 		if errors.As(err, &ce) && done == 0 {
@@ -209,7 +217,8 @@ func (c *Client) downloadOnce(ctx context.Context, link crypto.Link, part Part, 
 	case http.StatusRequestedRangeNotSatisfiable:
 		// 已经下载完整了（或者本地文件比服务器上的还大，说明不是同一个包）。
 		var size int64
-		if _, err := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes */%d", &size); err == nil && size == have {
+		if _, err := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes */%d", &size); err == nil && size == have &&
+			(part.Size == 0 || size == part.Size) {
 			if progress != nil {
 				progress(have, have)
 			}
@@ -222,12 +231,23 @@ func (c *Client) downloadOnce(ctx context.Context, link crypto.Link, part Part, 
 	default:
 		return have, 0, statusError(link, resp.StatusCode)
 	}
+	// 大小以迁移计划为准：旧服务器（或网络上的设备）说的大小不对，或者发来的数据比应有的多，
+	// 都不是要下载的那个文件，不能一直往磁盘里写。
+	if part.Size > 0 {
+		if total >= 0 && total != part.Size {
+			return have, 0, errSize
+		}
+		total = part.Size
+	}
 	if progress != nil {
 		progress(have, total)
 	}
 	buf := make([]byte, 256<<10)
 	for {
 		n, rerr := resp.Body.Read(buf)
+		if part.Size > 0 && have+int64(n) > part.Size {
+			return have, total, errSize
+		}
 		if n > 0 {
 			if _, err := f.Write(buf[:n]); err != nil {
 				return have, total, err // 写盘失败（磁盘满等），续传也没用

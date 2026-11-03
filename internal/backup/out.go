@@ -5,6 +5,8 @@ package backup
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +26,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/helper"
 	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/logging"
+	"github.com/lx969788249/dockhop/internal/spec"
 	"github.com/lx969788249/dockhop/internal/transfer"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -206,21 +209,17 @@ func (r *run) steps(ctx context.Context) error {
 
 	bundlePath := filepath.Join(r.workdir, "bundle")
 	planPath := filepath.Join(r.workdir, "plan")
-	m, size, err := r.pack(ctx, col, link, bundlePath)
+	m, size, sum, err := r.pack(ctx, col, link, bundlePath)
 	if err != nil {
 		ln.Close()
 		return err
 	}
 	images := len(m.Images.Refs)
 
-	pf, err := os.OpenFile(planPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
-	if err == nil {
-		err = bundle.EncryptPlan(pf, link, buildPlan(m, col, size))
-		pf.Close()
-	}
-	if err != nil {
-		s.Warn("迁移计划生成失败，新服务器将跳过迁入前检查：%v", err)
-		planPath = ""
+	// 迁移计划是新服务器做迁入前检查、核对下载的文件的依据，没有它不能迁入。
+	if err := writePlan(planPath, link, buildPlan(m, col, size, sum)); err != nil {
+		ln.Close()
+		return fail(s, "生成迁移计划失败", err.Error(), "执行 df -h 检查磁盘空间后重新运行")
 	}
 	s.End(fmt.Sprintf("%d 个镜像 · 迁移包共 %s", images, ui.HumanBytes(size+imageFileBytes(m.ImageFiles))))
 
@@ -228,18 +227,19 @@ func (r *run) steps(ctx context.Context) error {
 	return r.serve(ctx, ln, link, bundlePath, planPath, m.ImageFiles)
 }
 
-// pack 是第 4、5 步：停机打包数据，打包镜像并写完迁移包。
-func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path string) (*bundle.Manifest, int64, error) {
+// pack 是第 4、5 步：停机打包数据，打包镜像并写完迁移包。返回清单、迁移包的大小和 SHA-256。
+func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path string) (*bundle.Manifest, int64, string, error) {
 	s, dc := r.Screen, r.Docker
 	s.Begin(4, totalSteps, "停机打包数据")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
-		return nil, 0, fail(s, "无法创建迁移包", err.Error(), "")
+		return nil, 0, "", fail(s, "无法创建迁移包", err.Error(), "")
 	}
 	defer f.Close()
-	w, err := bundle.NewWriter(f, link)
+	sum := sha256.New()
+	w, err := bundle.NewWriter(io.MultiWriter(f, sum), link)
 	if err != nil {
-		return nil, 0, fail(s, "无法创建迁移包", err.Error(), "")
+		return nil, 0, "", fail(s, "无法创建迁移包", err.Error(), "")
 	}
 	info, _ := dc.Info(ctx)
 	hostname, _ := os.Hostname()
@@ -250,18 +250,18 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		Images: bundle.Images{Refs: map[string]string{}}}
 	for _, it := range col.sel.items {
 		if err := w.AddJSON("containers/"+it.name()+".json", it.raw); err != nil {
-			return nil, 0, fail(s, "写入迁移包失败", err.Error(), "")
+			return nil, 0, "", fail(s, "写入迁移包失败", err.Error(), "")
 		}
 	}
 	for _, n := range col.networks {
 		m.Networks = append(m.Networks, n.name)
 		if err := w.AddJSON("networks/"+n.name+".json", n.raw); err != nil {
-			return nil, 0, fail(s, "写入迁移包失败", err.Error(), "")
+			return nil, 0, "", fail(s, "写入迁移包失败", err.Error(), "")
 		}
 	}
 	for _, v := range col.volumes {
 		if err := w.AddJSON("volumes/"+v.name+".json", v.raw); err != nil {
-			return nil, 0, fail(s, "写入迁移包失败", err.Error(), "")
+			return nil, 0, "", fail(s, "写入迁移包失败", err.Error(), "")
 		}
 	}
 
@@ -284,11 +284,11 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	downStart := time.Now()
 	if len(stopList) > 0 {
 		if err := writeStopped(r.Home, stopList); err != nil {
-			return nil, 0, fail(s, "无法写入停机记录，为了安全没有停止任何容器", err.Error(), "检查 "+r.Home+" 是否可写")
+			return nil, 0, "", fail(s, "无法写入停机记录，为了安全没有停止任何容器", err.Error(), "检查 "+r.Home+" 是否可写")
 		}
 		r.stopped, r.toRestore = stopList, len(stopList)
 		if err := stopContainers(ctx, dc, waves, s); err != nil {
-			return nil, 0, fail(s, err.Error(), "执行 docker ps 检查容器状态", "")
+			return nil, 0, "", fail(s, err.Error(), "执行 docker ps 检查容器状态", "")
 		}
 		r.testPause(ctx, "after-stop")
 	}
@@ -301,13 +301,13 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		s.Count("检查容器里的改动", i+1, len(col.sel.items), it.name())
 		moved, keep, deleted, err := layerState(ctx, dc, it)
 		if err != nil {
-			return nil, 0, fail(s, "检查容器 "+it.name()+" 的改动失败", err.Error(), "")
+			return nil, 0, "", fail(s, "检查容器 "+it.name()+" 的改动失败", err.Error(), "")
 		}
 		if moved != "" {
 			// 镜像名已经指向别的版本：给容器实际用的旧版本临时起个名字，导出它。
 			tag := strings.ToLower(it.c.ID[:12])
 			if err := dc.TagImage(ctx, it.c.Image, "dockhop-image", tag); err != nil {
-				return nil, 0, fail(s, "容器 "+it.name()+" 的镜像没法导出", err.Error(), "")
+				return nil, 0, "", fail(s, "容器 "+it.name()+" 的镜像没法导出", err.Error(), "")
 			}
 			r.tempTags = append(r.tempTags, "dockhop-image:"+tag)
 			oldImageOf[it] = "dockhop-image:" + tag
@@ -321,7 +321,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		parts, n, err := r.addStream(w, "changes/"+it.name(), "容器 "+it.name()+" 里的改动", rc, col.layerBytes[it])
 		rc.Close()
 		if err != nil {
-			return nil, 0, fail(s, "打包容器 "+it.name()+" 里的改动失败", err.Error(), "")
+			return nil, 0, "", fail(s, "打包容器 "+it.name()+" 里的改动失败", err.Error(), "")
 		}
 		packed += n
 		changesOf[it] = &bundle.Changes{Paths: keep, Deleted: deleted, Bytes: n, Parts: parts}
@@ -330,12 +330,12 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	for i, v := range col.volumes {
 		rc, err := openVolume(ctx, dc, v, fmt.Sprintf("dockhop-helper-%s-%d", r.rid, i+1), lockPath(r.Home))
 		if err != nil {
-			return nil, 0, fail(s, err.Error(), "", "")
+			return nil, 0, "", fail(s, err.Error(), "", "")
 		}
 		parts, n, err := r.addStream(w, "volumes/"+v.name, "卷 "+displayVolume(v), rc, max(v.bytes, 0))
 		rc.Close()
 		if err != nil {
-			return nil, 0, fail(s, "打包数据卷 "+displayVolume(v)+" 失败", err.Error(), "")
+			return nil, 0, "", fail(s, "打包数据卷 "+displayVolume(v)+" 失败", err.Error(), "")
 		}
 		packed += n
 		m.Volumes = append(m.Volumes, bundle.Volume{Name: v.name, Driver: v.driver, Anonymous: v.anonymous, Bytes: n, Parts: parts})
@@ -345,7 +345,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		parts, n, err := r.addStream(w, "binds/"+b.id, "目录 "+ui.ShortPath(b.path), rc, b.bytes)
 		rc.Close()
 		if err != nil {
-			return nil, 0, fail(s, "打包目录 "+b.path+" 失败", err.Error(), "")
+			return nil, 0, "", fail(s, "打包目录 "+b.path+" 失败", err.Error(), "")
 		}
 		packed += n
 		m.Binds = append(m.Binds, bundle.Bind{ID: b.id, Path: b.path, Link: b.link(), Links: b.links, Dir: b.dir, Bytes: b.bytes, Parts: parts})
@@ -362,9 +362,19 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 			parts, n, err := r.addStream(w, "compose/"+p.u.project+"/dir", "Compose 项目 "+p.u.project, rc, p.dirBytes)
 			rc.Close()
 			if err != nil {
-				return nil, 0, fail(s, "打包 Compose 项目 "+p.u.project+" 失败", err.Error(), "")
+				return nil, 0, "", fail(s, "打包 Compose 项目 "+p.u.project+" 失败", err.Error(), "")
 			}
 			mp.DirParts = parts
+			packed += n
+		}
+		if len(p.check) > 0 {
+			rc := hostTar{ctx: ctx, roots: p.check, base: p.u.workingDir, logf: r.Log.Printf}.stream()
+			parts, n, err := r.addStream(w, "compose/"+p.u.project+"/check", "Compose 项目 "+p.u.project+" 的配置文件", rc, 0)
+			rc.Close()
+			if err != nil {
+				return nil, 0, "", fail(s, "打包 Compose 项目 "+p.u.project+" 的配置文件失败", err.Error(), "")
+			}
+			mp.CheckParts = parts
 			packed += n
 		}
 		if len(p.outside) > 0 {
@@ -372,7 +382,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 			parts, n, err := r.addStream(w, "compose/"+p.u.project+"/outside", "Compose 项目 "+p.u.project+" 引用的文件", rc, p.outBytes)
 			rc.Close()
 			if err != nil {
-				return nil, 0, fail(s, "打包 Compose 项目 "+p.u.project+" 引用的文件失败", err.Error(), "")
+				return nil, 0, "", fail(s, "打包 Compose 项目 "+p.u.project+" 引用的文件失败", err.Error(), "")
 			}
 			mp.OutParts = parts
 			packed += n
@@ -384,7 +394,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	if len(r.stopped) > 0 {
 		r.downtime = time.Since(downStart)
 		if failed := restoreStates(context.WithoutCancel(ctx), dc, r.stopped, s); len(failed) > 0 {
-			return nil, 0, fail(s, fmt.Sprintf("有 %d 个源容器没能恢复原来的状态：%s", len(failed), strings.Join(failed, "、")),
+			return nil, 0, "", fail(s, fmt.Sprintf("有 %d 个源容器没能恢复原来的状态：%s", len(failed), strings.Join(failed, "、")),
 				"立即执行 docker ps -a 检查，并用 docker start 容器名 手动启动", "")
 		}
 		r.restored = len(r.stopped)
@@ -412,26 +422,26 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	m.Images.Refs = refSet
 	files, n, err := r.exportImages(ctx, link, refSet, col.imageBytes)
 	if err != nil {
-		return nil, 0, fail(s, "导出镜像失败", err.Error(), "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
+		return nil, 0, "", fail(s, "导出镜像失败", err.Error(), "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
 	}
 	m.Images.Bytes, m.ImageFiles = n, files
 	r.removeTempTags()
 
 	if err := w.AddJSON("manifest.json", m); err != nil {
-		return nil, 0, fail(s, "写入迁移包失败", err.Error(), "")
+		return nil, 0, "", fail(s, "写入迁移包失败", err.Error(), "")
 	}
 	if err := w.Close(); err != nil {
-		return nil, 0, fail(s, "写入迁移包失败", err.Error(), "执行 df -h 检查磁盘空间")
+		return nil, 0, "", fail(s, "写入迁移包失败", err.Error(), "执行 df -h 检查磁盘空间")
 	}
 	if err := f.Close(); err != nil {
-		return nil, 0, fail(s, "写入迁移包失败", err.Error(), "执行 df -h 检查磁盘空间")
+		return nil, 0, "", fail(s, "写入迁移包失败", err.Error(), "执行 df -h 检查磁盘空间")
 	}
 	st, err := os.Stat(path)
 	if err != nil {
-		return nil, 0, fail(s, "写入迁移包失败", err.Error(), "")
+		return nil, 0, "", fail(s, "写入迁移包失败", err.Error(), "")
 	}
 	r.summary = append(r.summary, fmt.Sprintf("迁移的服务：%s · 迁移包 %s", r.chosen, ui.HumanBytes(st.Size()+imageFileBytes(files))))
-	return m, st.Size(), nil
+	return m, st.Size(), hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 // exportImages 把每个镜像（同一个镜像 ID 的所有名字一起）单独导出成一个压缩、加密的
@@ -459,42 +469,43 @@ func (r *run) exportImages(ctx context.Context, link crypto.Link, refSet map[str
 	for i, refs := range groups {
 		f := bundle.ImageFile{File: fmt.Sprintf("image-%d", i+1), ID: refSet[refs[0]], Refs: refs}
 		f.Pull = r.pullRef(ctx, f.ID, refs)
-		n, size, err := r.exportImage(ctx, link, refs, filepath.Join(dir, f.File), p)
+		n, size, sum, err := r.exportImage(ctx, link, refs, filepath.Join(dir, f.File), p)
 		if err != nil {
 			p.Done(err)
 			return nil, 0, err
 		}
-		f.Bytes, f.Size, total = size, n, total+n
+		f.Bytes, f.Size, f.SHA256, total = size, n, sum, total+n
 		files = append(files, f)
 	}
 	p.Done(nil)
 	return files, total, nil
 }
 
-// exportImage 导出一个镜像到 path，返回导出的字节数（压缩前）和文件大小。
-func (r *run) exportImage(ctx context.Context, link crypto.Link, refs []string, path string, progress io.Writer) (int64, int64, error) {
+// exportImage 导出一个镜像到 path，返回导出的字节数（压缩前）、文件大小和文件的 SHA-256。
+func (r *run) exportImage(ctx context.Context, link crypto.Link, refs []string, path string, progress io.Writer) (int64, int64, string, error) {
 	rc, err := r.Docker.SaveImages(ctx, refs)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, "", err
 	}
 	defer rc.Close()
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, "", err
 	}
 	var n countWriter
-	err = bundle.WriteImageFile(f, link, io.TeeReader(rc, io.MultiWriter(progress, &n)))
+	sum := sha256.New()
+	err = bundle.WriteImageFile(io.MultiWriter(f, sum), link, io.TeeReader(rc, io.MultiWriter(progress, &n)))
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, "", err
 	}
 	st, err := os.Stat(path)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, "", err
 	}
-	return int64(n), st.Size(), nil
+	return int64(n), st.Size(), hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 // pullRef 返回能从镜像仓库拉到这个镜像的引用（名字@sha256:摘要），优先用和容器的镜像名
@@ -899,7 +910,7 @@ func (r *run) confirmShared(col *collected) error {
 func (r *run) checkAutoRemove(col *collected) error {
 	var names []string
 	for _, it := range append(append([]*item(nil), col.sel.items...), col.shared...) {
-		if it.c.HostConfig.AutoRemove && it.c.State.Running {
+		if spec.StopRiskOf(it.c) == spec.StopRemoves {
 			names = append(names, it.name())
 		}
 	}

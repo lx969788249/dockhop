@@ -145,6 +145,8 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 			u.undoBind(e, note)
 		case opVolume:
 			u.undoVolume(ctx, e, note)
+		case opTag:
+			u.undoTag(ctx, e, note)
 		}
 	}
 	if u.fail("rollback-data") {
@@ -202,6 +204,37 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		}
 	}
 	return problems
+}
+
+// undoTag 把镜像名改回迁入前指向的镜像，原来没有的名字删掉。这次迁入进来的镜像因此没有了
+// 名字、也没有容器在用时一起删掉；还有别的名字或者有容器在用的留着（Docker 不让删）。
+func (u *undo) undoTag(ctx context.Context, e Entry, note func(string, ...any)) {
+	cur, err := u.dc.InspectImage(ctx, e.Name)
+	switch {
+	case docker.IsNotFound(err):
+		if e.ID == "" {
+			return // 已经删掉了（之前撤销过）
+		}
+	case err != nil:
+		note("读不到镜像 %s：%v", e.Name, err)
+		return
+	case cur.ID == e.ID:
+		return // 还指向原来的镜像（没来得及改，或者之前撤销过）
+	}
+	if e.ID == "" {
+		if err := u.dc.RemoveImage(ctx, e.Name); err != nil && !docker.IsNotFound(err) {
+			u.logf("回滚：镜像名 %s 有容器在用，保留：%v", e.Name, err)
+		}
+		return
+	}
+	repo, tag := splitTag(e.Name)
+	if err := u.dc.TagImage(ctx, e.ID, repo, tag); err != nil {
+		note("镜像名 %s 没能改回原来的镜像：%v", e.Name, err)
+		return
+	}
+	if cur != nil {
+		_ = u.dc.RemoveImage(ctx, cur.ID)
+	}
 }
 
 // restop 把临时停过、现在又在运行的已有容器重新停下（暂停的先恢复再停）。e.ID 可以是
@@ -315,25 +348,28 @@ func (u *undo) undoVolume(ctx context.Context, e Entry, note func(string, ...any
 	}
 }
 
-// undoRename 把改名备份的旧容器改回原名，重新连上原来的网络。
+// undoRename 让改名备份的旧容器回到原来的名字、接回原来的网络（和固定 IP）。可以重复执行，
+// 不管上次做到哪一步：备份还在就改回原名；已经叫回原名的（记下了还没来得及改名，或者上次回滚
+// 改回原名后被中断）不用改。最后都按记下的网络补上，已经接上的跳过。
 func (u *undo) undoRename(ctx context.Context, e Entry, note func(string, ...any)) {
-	if _, _, err := u.dc.InspectContainer(ctx, e.Backup); err != nil {
-		if !docker.IsNotFound(err) {
-			note("读不到改名备份的旧容器 %s：%v", e.Backup, err)
+	_, _, err := u.dc.InspectContainer(ctx, e.Backup)
+	switch {
+	case err == nil:
+		if c, _, err := u.dc.InspectContainer(ctx, e.Name); err == nil && c.ID != e.ID {
+			_ = u.dc.RemoveContainerAndVolumes(ctx, c.ID)
+		}
+		if err := u.dc.RenameContainer(ctx, e.ID, e.Name); err != nil {
+			note("旧容器 %s 没能改回原名，它现在叫 %s：%v", e.Name, e.Backup, err)
 			return
 		}
-		if c, _, err := u.dc.InspectContainer(ctx, e.Name); err == nil && c.ID == e.ID {
-			return // 记下了但还没改名
+	case !docker.IsNotFound(err):
+		note("读不到改名备份的旧容器 %s：%v", e.Backup, err)
+		return
+	default:
+		if c, _, err := u.dc.InspectContainer(ctx, e.Name); err != nil || c.ID != e.ID {
+			note("旧容器 %s 和它的备份都找不到了", e.Name)
+			return
 		}
-		note("旧容器 %s 和它的备份都找不到了", e.Name)
-		return
-	}
-	if c, _, err := u.dc.InspectContainer(ctx, e.Name); err == nil && c.ID != e.ID {
-		_ = u.dc.RemoveContainerAndVolumes(ctx, c.ID)
-	}
-	if err := u.dc.RenameContainer(ctx, e.ID, e.Name); err != nil {
-		note("旧容器 %s 没能改回原名，它现在叫 %s：%v", e.Name, e.Backup, err)
-		return
 	}
 	reconnect(ctx, u.dc, e.ID, e.Networks, note, e.Name)
 }

@@ -14,6 +14,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/transfer"
 )
 
@@ -44,9 +45,10 @@ var (
 // 一次超时。
 func (r *run) decideImages(ctx context.Context, files []bundle.ImageFile) {
 	r.images = map[string]imageSource{}
-	var mu sync.Mutex
+	// 向镜像仓库的查询同时进行，各自只写自己那一格，全部查完再填表。
+	pullable := make([]bool, len(files))
 	var wg sync.WaitGroup
-	for _, f := range files {
+	for i, f := range files {
 		names := strings.Join(f.Refs, "、")
 		if id := r.localImage(ctx, f); id != "" {
 			r.images[f.File] = imageSource{local: id}
@@ -58,22 +60,25 @@ func (r *run) decideImages(ctx context.Context, files []bundle.ImageFile) {
 			continue
 		}
 		wg.Add(1)
-		go func(f bundle.ImageFile) {
+		go func() {
 			defer wg.Done()
 			c, cancel := context.WithTimeout(ctx, pullCheckTimeout)
 			err := r.Docker.DistributionInspect(c, f.Pull)
 			cancel()
-			mu.Lock()
-			defer mu.Unlock()
 			if err != nil {
 				r.Log.Printf("镜像 %s：镜像仓库里查不到 %s（%v），从旧服务器下载", names, f.Pull, err)
 				return
 			}
-			r.images[f.File] = imageSource{pull: true}
+			pullable[i] = true
 			r.Log.Printf("镜像 %s：从镜像仓库按摘要拉取 %s", names, f.Pull)
-		}(f)
+		}()
 	}
 	wg.Wait()
+	for i, f := range files {
+		if pullable[i] {
+			r.images[f.File] = imageSource{pull: true}
+		}
+	}
 }
 
 // localImage 返回本机上和 f 一模一样的镜像的 ID：镜像 ID 相同，或者有同一个仓库摘要。
@@ -120,7 +125,7 @@ func (r *run) fetch(ctx context.Context, label string, parts []fetchPart) error 
 			p.Done(err)
 			return fail(s, "无法创建下载目录", err.Error(), "")
 		}
-		err := r.client().Download(ctx, r.opts.Link, transfer.Part{URL: part.url, Before: before, Total: total}, part.path,
+		err := r.client().Download(ctx, r.opts.Link, transfer.Part{URL: part.url, Size: part.size, Before: before, Total: total}, part.path,
 			func(done, all int64) {
 				if total == 0 && all > 0 {
 					p.SetTotal(before + all)
@@ -150,12 +155,13 @@ func (r *run) fetch(ctx context.Context, label string, parts []fetchPart) error 
 // 仓库拉；其余的用从旧服务器下载的文件加载。
 func (r *run) loadImageFiles(ctx context.Context) error {
 	files := r.m.ImageFiles
-	if r.images == nil { // 旧服务器没有提供迁移计划：到这里才知道有哪些镜像
-		r.decideImages(ctx, files)
-	}
 	for i, f := range files {
 		label := fmt.Sprintf("加载镜像 %d/%d", i+1, len(files))
 		src := r.images[f.File]
+		// 不管从哪里来，最后都会给它加上原来的名字（加载的文件里也带着这些名字）。
+		if err := r.noteTags(ctx, f.Refs); err != nil {
+			return err
+		}
 		var err error
 		switch {
 		case src.local != "":
@@ -234,6 +240,9 @@ func (r *run) loadImageFile(ctx context.Context, label string, f bundle.ImageFil
 			return err
 		}
 	}
+	if err := r.verifyDownload(path, f.SHA256, "镜像文件"); err != nil {
+		return err
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return fail(s, "打不开下载的镜像文件 "+path, err.Error(), "")
@@ -255,6 +264,33 @@ func (r *run) loadImageFile(ctx context.Context, label string, f bundle.ImageFil
 		return fail(s, "加载镜像失败："+err.Error(), "", "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
 	}
 	_ = os.Remove(path) // 用完就删，省磁盘
+	return nil
+}
+
+// noteTags 在镜像名被改动之前（加名字，或者 docker load 按文件里记的名字加名字），把它们
+// 原来指向哪个镜像记进事务日志：迁入失败时改回去，原来没有的名字删掉（见 undoTag）。
+// 按摘要的引用（名字@sha256:…）不是名字，不会被改动。
+func (r *run) noteTags(ctx context.Context, refs []string) error {
+	if r.noted == nil {
+		r.noted = map[string]bool{}
+	}
+	for _, ref := range refs {
+		if strings.Contains(ref, "@sha256:") || r.noted[ref] {
+			continue
+		}
+		id := ""
+		img, err := r.Docker.InspectImage(ctx, ref)
+		switch {
+		case err == nil:
+			id = img.ID
+		case !docker.IsNotFound(err):
+			return fail(r.Screen, "读不到新服务器上的镜像 "+ref, err.Error(), "确认 Docker 运行正常后重新运行")
+		}
+		if err := r.j.add(Entry{Op: opTag, Name: ref, ID: id}); err != nil {
+			return fail(r.Screen, err.Error(), "", "")
+		}
+		r.noted[ref] = true
+	}
 	return nil
 }
 

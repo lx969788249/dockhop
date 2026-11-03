@@ -52,38 +52,98 @@ func TestStartOrderFollowsReferences(t *testing.T) {
 		"NetworkSettings":{"Networks":{"1panel-network":{"Aliases":null}}}}`)
 
 	projects := []bundle.Project{{Name: "halo"}, {Name: "nginx-proxy-manager"}, {Name: "postgresql"}}
-	r := &run{items: []*citem{halo, npm, pg, probe, backup}, projects: projects}
+	r := &run{items: []*citem{halo, npm, pg, probe, backup}, projects: projects, m: &bundle.Manifest{}}
 	units := r.units(&group{projects: projects, items: r.items})
-	deps := map[string]string{}
-	for _, u := range units {
-		var parts []string
-		for _, d := range u.deps {
-			parts = append(parts, d.on.key+"（"+d.why+"）")
-		}
-		deps[u.key] = strings.Join(parts, "；")
-	}
+	deps := depsOf(units)
 	want := map[string]string{
-		"p:halo":                "p:postgresql（halo 的启动命令里写着 postgresql）",
+		"p:halo":                "p:postgresql 最好先就绪（halo 的启动命令里写着 postgresql）",
 		"p:nginx-proxy-manager": "",
 		"p:postgresql":          "",
 		"c:probe":               "",
-		"c:pg-backup":           "p:postgresql（pg-backup 的环境变量 PGHOST 里写着 1panel-postgresql-ab12）",
+		"c:pg-backup":           "p:postgresql 最好先就绪（pg-backup 的环境变量 PGHOST 里写着 1panel-postgresql-ab12）",
 	}
 	for k, w := range want {
 		if deps[k] != w {
 			t.Errorf("%s 用到：%q，应为 %q", k, deps[k], w)
 		}
 	}
-	var order []string
-	for _, u := range dependencyOrder(units, unitKey, (*unit).depKeys) {
-		order = append(order, u.key)
-	}
-	if got := strings.Join(order, " "); got != "p:nginx-proxy-manager p:postgresql c:probe c:pg-backup p:halo" {
+	if got := orderOf(units, (*unit).startAfter); got != "p:nginx-proxy-manager p:postgresql c:probe c:pg-backup p:halo" {
 		t.Errorf("启动顺序：%s", got)
+	}
+	// 猜出来的依赖不影响创建的先后。
+	if got := orderOf(units, (*unit).createAfter); got != "p:halo p:nginx-proxy-manager p:postgresql c:probe c:pg-backup" {
+		t.Errorf("创建顺序：%s", got)
 	}
 	if why := deps["p:halo"]; strings.Contains(why, "secret-pass") {
 		t.Errorf("理由里不应有启动参数的值：%s", why)
 	}
+}
+
+// 要先存在的必须先创建：项目 aapp 用的网络是项目 zproxy 建的（Compose 按 zproxy 的文件建它），
+// 项目 bweb 借用独立容器 vpn 的网络，独立容器 sidecar 用 --volumes-from 了 data。借用网络还要求
+// 先就绪才能启动；只要先存在的，启动不用等。
+func TestCreateOrderFollowsExistence(t *testing.T) {
+	data := t.TempDir()
+	os.MkdirAll(filepath.Join(data, "networks"), 0o700)
+	os.WriteFile(filepath.Join(data, "networks", "proxynet.json"),
+		[]byte(`{"Name":"proxynet","Labels":{"com.docker.compose.project":"zproxy","com.docker.compose.network":"proxy"}}`), 0o600)
+	app := oldContainer(t, `{"Name":"/aapp-app-1","Config":{"Labels":{"com.docker.compose.project":"aapp","com.docker.compose.service":"app"}},
+		"NetworkSettings":{"Networks":{"proxynet":{}}}}`)
+	proxy := oldContainer(t, `{"Name":"/zproxy-proxy-1","Config":{"Labels":{"com.docker.compose.project":"zproxy","com.docker.compose.service":"proxy"}},
+		"NetworkSettings":{"Networks":{"proxynet":{}}}}`)
+	web := oldContainer(t, `{"Name":"/bweb-web-1","Config":{"Labels":{"com.docker.compose.project":"bweb","com.docker.compose.service":"web"}},
+		"HostConfig":{"NetworkMode":"container:vpn"}}`)
+	vpn := oldContainer(t, `{"Name":"/vpn","NetworkSettings":{"Networks":{"bridge":{}}}}`)
+	sidecar := oldContainer(t, `{"Name":"/sidecar","HostConfig":{"VolumesFrom":["data:ro"]}}`)
+	store := oldContainer(t, `{"Name":"/data"}`)
+	projects := []bundle.Project{{Name: "aapp"}, {Name: "bweb"}, {Name: "zproxy"}}
+	r := &run{items: []*citem{app, proxy, web, sidecar, store, vpn}, projects: projects, dataDir: data,
+		m: &bundle.Manifest{Networks: []string{"proxynet"}}}
+	units := r.units(&group{projects: projects, items: r.items})
+	deps := depsOf(units)
+	want := map[string]string{
+		"p:aapp":    "p:zproxy 要先存在（aapp-app-1 接在 Compose 项目 zproxy 建的网络 proxynet 上）",
+		"p:bweb":    "c:vpn 要先就绪（bweb-web-1 用借用网络（或 --link）连着 vpn）",
+		"c:sidecar": "c:data 要先存在（sidecar 用--volumes-from连着 data）",
+	}
+	for k, w := range want {
+		if deps[k] != w {
+			t.Errorf("%s 用到：%q，应为 %q", k, deps[k], w)
+		}
+	}
+	if got := orderOf(units, (*unit).createAfter); got != "p:zproxy c:data c:vpn p:aapp p:bweb c:sidecar" {
+		t.Errorf("创建顺序：%s", got)
+	}
+	if got := orderOf(units, (*unit).startAfter); got != "p:aapp p:zproxy c:sidecar c:data c:vpn p:bweb" {
+		t.Errorf("启动顺序：%s", got)
+	}
+}
+
+func depsOf(units []*unit) map[string]string {
+	out := map[string]string{}
+	for _, u := range units {
+		var parts []string
+		for _, d := range u.deps {
+			kind := "要先存在"
+			switch {
+			case d.ready:
+				kind = "要先就绪"
+			case d.prefer:
+				kind = "最好先就绪"
+			}
+			parts = append(parts, d.on.key+" "+kind+"（"+strings.Join(d.why, "；")+"）")
+		}
+		out[u.key] = strings.Join(parts, "；")
+	}
+	return out
+}
+
+func orderOf(units []*unit, after func(*unit) []string) string {
+	var keys []string
+	for _, u := range dependencyOrder(units, unitKey, after) {
+		keys = append(keys, u.key)
+	}
+	return strings.Join(keys, " ")
 }
 
 // 假 Docker 上的一个容器：每次查询按顺序给出下一个样子，最后一个样子一直保持。
@@ -152,7 +212,7 @@ func TestWaitReadyFollowsHealthcheck(t *testing.T) {
 	}
 	text := logText(t, r)
 	for _, w := range []string{
-		"健康检查（启动后 30 秒内不算，之后每 30 秒查一次，连续 5 次没通过算不健康），最多等 3 分 35 秒",
+		"健康检查（启动后 30 秒内不算，之后每 30 秒查一次（每次最多 5 秒），连续 5 次没通过算不健康），最多等 3 分 55 秒",
 		"容器 app 健康检查没通过（退出码 7）：curl: (7) Failed to connect to localhost port 8090",
 		"容器 app 健康检查没通过（退出码 22）：curl: (22) The requested URL returned error: 503",
 		"容器 app：不健康", "容器 app 健康检查通过", "容器 app 就绪：健康检查通过",
@@ -272,5 +332,59 @@ func TestUnresolvedHost(t *testing.T) {
 	}
 	if h := unresolvedHint("halo", "Failed to resolve 'api.example.com'"); !strings.Contains(h, "解析不了域名 api.example.com") {
 		t.Errorf("外面的域名：%s", h)
+	}
+}
+
+// 猜出来的依赖等不到时不拦着：接着启动用到它的，它最后再等一次（完整的时间再多 1 分钟）。
+// Docker 要求的依赖等不到时，用到它的不启动。
+func TestWaitBeforeSoftAndHard(t *testing.T) {
+	_, _, r := fakeContainer(t, "", `{"Id":"new-app","Name":"/app","State":{"Status":"exited","ExitCode":1}}`)
+	dep := &unit{key: "c:app", label: "容器 app", started: true,
+		items: []*citem{{m: bundle.Container{Name: "app"}, newID: "new-app", c: &docker.Container{}, startedAt: time.Now()}}}
+	dep.items[0].c.State.Running = true
+	user := &unit{key: "c:user", label: "容器 user", deps: []*unitDep{{on: dep, prefer: true, why: []string{"猜的"}}}}
+	if err := r.waitBefore(context.Background(), user); err != nil {
+		t.Fatalf("猜出来的依赖等不到时不应拦着：%v", err)
+	}
+	if !dep.waited || !dep.items[0].startedAt.IsZero() || dep.items[0].extra != time.Minute {
+		t.Errorf("它最后应再等一次，多给 1 分钟：waited=%v startedAt=%v extra=%v", dep.waited, dep.items[0].startedAt, dep.items[0].extra)
+	}
+	// 已经等过一次的，后面别的单位不再为它等。
+	other := &unit{key: "c:other", deps: []*unitDep{{on: dep, prefer: true}}}
+	if err := r.waitBefore(context.Background(), other); err != nil {
+		t.Fatal(err)
+	}
+	hard := &unit{key: "c:hard", deps: []*unitDep{{on: dep, exist: true, ready: true}}}
+	if err := r.waitBefore(context.Background(), hard); err == nil {
+		t.Error("Docker 要求的依赖没就绪时应失败")
+	}
+}
+
+// 同一个 Compose 服务的副本只能用同一个镜像：镜像里只删每个副本都删过的文件，只有部分副本删过
+// 的明确提示会重新出现；新增和修改的文件各写各的，不放进镜像。
+func TestServiceImageKeepsReplicasApart(t *testing.T) {
+	rep := func(name string, deleted ...string) *citem {
+		c := &docker.Container{}
+		c.Config.Image = "app:1"
+		return &citem{m: bundle.Container{Name: name, Changes: &bundle.Changes{Deleted: deleted}}, c: c}
+	}
+	a, b := rep("stack-web-1", "/etc/a", "/etc/common"), rep("stack-web-2", "/etc/common", "/etc/b")
+	var out bytes.Buffer
+	r := &run{Deps: Deps{Screen: ui.New(&out, false, nil)}, imageAs: map[string]string{}, vio: &volumeIO{}}
+	img, err := r.serviceImage(context.Background(), "stack", "web", []*citem{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 这里没有能删除文件的程序（Docker 不在本机）：照原镜像，并且说明。
+	if img != "app:1" || a.img != img || b.img != img {
+		t.Errorf("镜像：%q（%q、%q）", img, a.img, b.img)
+	}
+	for _, w := range []string{"容器 stack-web-1 里删除过的 1 个文件在新服务器上会重新出现", "容器 stack-web-2 里删除过的 1 个文件"} {
+		if !strings.Contains(out.String(), w) {
+			t.Errorf("应提示「%s」：\n%s", w, out.String())
+		}
+	}
+	if got := intersect([]string{"/a", "/b", "/c"}, []string{"/c", "/a"}); strings.Join(got, ",") != "/a,/c" {
+		t.Errorf("每个副本都删过的：%v", got)
 	}
 }

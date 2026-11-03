@@ -16,15 +16,15 @@ import (
 
 // citem 是要迁入的一个容器。
 type citem struct {
-	m       bundle.Container
-	raw     json.RawMessage
-	c       *docker.Container
-	newID   string
-	img     string // 创建容器用的镜像（算过之后缓存）
-	applied bool   // 容器里的改动已经包含在 img 里
+	m     bundle.Container
+	raw   json.RawMessage
+	c     *docker.Container
+	newID string
+	img   string // 创建容器用的镜像（算过之后缓存）
 
-	startedAt time.Time // 在新服务器上启动它的时候
-	ready     bool      // 已经确认就绪
+	startedAt time.Time     // 在新服务器上启动它的时候
+	ready     bool          // 已经确认就绪
+	extra     time.Duration // 等它就绪时额外多给的时间（见 unit.again）
 }
 
 func (it *citem) name() string { return it.m.Name }
@@ -33,38 +33,97 @@ func (it *citem) running() bool {
 	return it.c.State.Running || it.c.State.Paused || it.c.State.Status == "restarting"
 }
 
-// image 是创建这个容器用的镜像：旧版本镜像、改名后的 digest 镜像或原来的镜像名。
-// 容器里有删除的文件时，先在临时容器里做出带改动的镜像（见 changedImage）。
+// 容器里没挂载出来的改动分两部分恢复：删除的文件做进镜像（Docker 没有删除容器里文件的接口，
+// 只能在临时容器里删掉再 commit，见 imageWithout）；新增和修改的文件在容器创建之后、启动之前
+// 写进这个容器（applyChanges）。这样每个容器的新增、修改都是它自己的，镜像只承载删除。
+
+// baseImage 是创建容器用的原镜像：旧版本镜像、改名后的 digest 镜像，或者原来的镜像名。
+func (r *run) baseImage(it *citem) string {
+	if it.m.OldImage != "" {
+		return it.m.OldImage
+	}
+	if v := r.imageAs[it.c.Config.Image]; v != "" {
+		return v
+	}
+	return it.c.Config.Image
+}
+
+func deletedOf(it *citem) []string {
+	if it.m.Changes == nil {
+		return nil
+	}
+	return it.m.Changes.Deleted
+}
+
+// image 是创建这个独立容器用的镜像：原镜像，容器里删除过文件时是删掉这些文件的镜像。
 func (r *run) image(ctx context.Context, it *citem) (string, error) {
 	if it.img != "" {
 		return it.img, nil
 	}
-	img := it.c.Config.Image
-	if v := r.imageAs[img]; v != "" {
-		img = v
-	}
-	if it.m.OldImage != "" {
-		img = it.m.OldImage
-	}
-	if ch := it.m.Changes; ch != nil && len(ch.Deleted) > 0 {
-		if r.vio.helperBin == "" {
-			r.Screen.Warn("容器 %s 里删除过 %d 个文件，Docker 不在这台服务器上，没法在新容器里删除它们（文件还在，来自镜像）", it.m.Name, len(ch.Deleted))
-		} else {
-			built, err := r.changedImage(ctx, it, img)
-			if err != nil {
-				return "", fmt.Errorf("容器 %s 里的改动没能放进镜像：%v", it.m.Name, err)
-			}
-			img, it.applied = built, true
-		}
+	img, err := r.imageWithout(ctx, r.baseImage(it), deletedOf(it), it.m.Name)
+	if err != nil {
+		return "", fmt.Errorf("容器 %s 里删除过的文件没能在新容器里删除：%v", it.m.Name, err)
 	}
 	it.img = img
 	return img, nil
 }
 
-// changedImage 用临时容器做出带改动的镜像：写入新增和修改的文件、删除删掉的文件，
-// 再在这台服务器上 commit（本机 commit 没问题，只是导出 commit 的镜像有问题）。
-// 镜像的配置和原镜像相同，容器的配置照常来自原始配置。
-func (r *run) changedImage(ctx context.Context, it *citem, base string) (string, error) {
+// serviceImage 是 Compose 服务的镜像。同一个服务的副本只能用同一个镜像（覆盖文件按服务写），
+// 所以镜像里只删掉每个副本都删过的文件；只有部分副本删过的文件，别的副本里还在，不能删，
+// 在删过它的副本里就会重新出现，这里明确提示。新增和修改的文件不在镜像里，每个副本各写各的。
+func (r *run) serviceImage(ctx context.Context, project, svc string, reps []*citem) (string, error) {
+	base := r.baseImage(reps[0])
+	for _, it := range reps[1:] {
+		if b := r.baseImage(it); b != base {
+			r.Screen.Warn("Compose 服务 %s 的副本用的镜像不一样（%s、%s），都按第一个副本的镜像创建", svc, base, b)
+			break
+		}
+	}
+	common := deletedOf(reps[0])
+	for _, it := range reps[1:] {
+		common = intersect(common, deletedOf(it))
+	}
+	for _, it := range reps {
+		if extra := len(deletedOf(it)) - len(common); extra > 0 {
+			r.Screen.Warn("容器 %s 里删除过的 %d 个文件在新服务器上会重新出现：同一个 Compose 服务的副本只能用同一个镜像，"+
+				"别的副本里还有这些文件", it.m.Name, extra)
+		}
+	}
+	img, err := r.imageWithout(ctx, base, common, project+"-"+svc)
+	if err != nil {
+		return "", fmt.Errorf("删除过的文件没能在 Compose 服务 %s 的新容器里删除：%v", svc, err)
+	}
+	for _, it := range reps {
+		it.img = img
+	}
+	return img, nil
+}
+
+func intersect(a, b []string) []string {
+	in := map[string]bool{}
+	for _, v := range b {
+		in[v] = true
+	}
+	var out []string
+	for _, v := range a {
+		if in[v] {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// imageWithout 做出删掉 deleted 这些文件的镜像 dockhop-image:<name>：在临时容器里删除，再在
+// 这台服务器上 commit（本机 commit 没问题，只是导出 commit 的镜像有问题）。镜像的配置和原镜像
+// 相同，容器的配置照常来自原始配置。没有要删的文件时就是原镜像。
+func (r *run) imageWithout(ctx context.Context, base string, deleted []string, name string) (string, error) {
+	if len(deleted) == 0 {
+		return base, nil
+	}
+	if r.vio.helperBin == "" {
+		r.Screen.Warn("%s 里删除过 %d 个文件，Docker 不在这台服务器上，没法在新容器里删除它们（文件还在，来自镜像）", name, len(deleted))
+		return base, nil
+	}
 	dc := r.Docker
 	baseRaw, err := dc.InspectImageRaw(ctx, base)
 	if err != nil {
@@ -82,7 +141,7 @@ func (r *run) changedImage(ctx context.Context, it *citem, base string) (string,
 	// 临时容器只改入口命令（删除文件）和用户（root 才能删）；commit 时把入口命令、命令和
 	// 用户改回原镜像的，镜像的其他配置本来就和原镜像一样。
 	tmp := map[string]any{
-		"Image": base, "Entrypoint": append([]string{"/dockhop-helper", "__remove"}, it.m.Changes.Deleted...),
+		"Image": base, "Entrypoint": append([]string{"/dockhop-helper", "__remove"}, deleted...),
 		"HostConfig": map[string]any{"NetworkMode": "none", "Binds": []string{r.vio.helperBin + ":/dockhop-helper:ro"}},
 	}
 	commitCfg := map[string]any{"Entrypoint": nonNil(bc.Entrypoint), "Cmd": nonNil(bc.Cmd)}
@@ -92,25 +151,28 @@ func (r *run) changedImage(ctx context.Context, it *citem, base string) (string,
 	}
 	// 这个临时容器不能带 dockhop.helper 标签：commit 时标签会进到镜像里，再跟着镜像到
 	// 迁入的容器上。所以记进事务日志，程序被强制结束后由回滚或提交后的清理删除。
-	name := fmt.Sprintf("dockhop-helper-%s-%d", runID, r.vio.n.Add(1))
-	if err := r.j.add(Entry{Op: opHelper, Name: name}); err != nil {
+	helper := fmt.Sprintf("dockhop-helper-%s-%d", runID, r.vio.n.Add(1))
+	if err := r.j.add(Entry{Op: opHelper, Name: helper}); err != nil {
 		return "", err
 	}
-	id, err := dc.CreateContainer(ctx, name, tmp)
+	id, err := dc.CreateContainer(ctx, helper, tmp)
 	if err != nil {
 		return "", err
 	}
 	defer dc.RemoveContainerAndVolumes(context.WithoutCancel(ctx), id)
-	if err := r.putChanges(ctx, it, id); err != nil {
-		return "", err
-	}
 	if err := dc.StartContainer(ctx, id); err != nil {
 		return "", err
 	}
 	if code, err := dc.WaitContainer(ctx, id); err != nil || code != 0 {
 		return "", fmt.Errorf("删除文件失败（退出码 %d）：%v %s", code, err, dc.ContainerLogs(ctx, id, 5))
 	}
-	tag := it.m.Name
+	tag := name
+	if len(tag) > 128 {
+		tag = tag[:128]
+	}
+	if err := r.noteTags(ctx, []string{"dockhop-image:" + tag}); err != nil {
+		return "", err
+	}
 	if _, err := dc.CommitWithConfig(ctx, id, "dockhop-image", tag, commitCfg); err != nil {
 		return "", err
 	}
@@ -124,23 +186,18 @@ func nonNil(v []string) []string {
 	return v
 }
 
-// putChanges 把容器里新增和修改的文件写进 id 这个（没启动的）容器。
-func (r *run) putChanges(ctx context.Context, it *citem, id string) error {
+// applyChanges 在容器创建之后、启动之前，把它里面新增和修改的文件写进去。
+func (r *run) applyChanges(ctx context.Context, it *citem) error {
 	ch := it.m.Changes
+	if ch == nil || len(ch.Paths) == 0 {
+		return nil
+	}
 	rc := bundle.OpenStream(r.dataDir, "changes/"+it.m.Name, ch.Parts)
 	defer rc.Close()
-	if err := r.Docker.PutArchive(ctx, id, "/", rc); err != nil {
+	if err := r.Docker.PutArchive(ctx, it.newID, "/", rc); err != nil {
 		return fmt.Errorf("容器 %s 里的改动没能写入：%v", it.m.Name, err)
 	}
 	return nil
-}
-
-// applyChanges 在容器创建之后、启动之前写入容器里的改动（已经做进镜像的除外）。
-func (r *run) applyChanges(ctx context.Context, it *citem) error {
-	if it.m.Changes == nil || it.applied || len(it.m.Changes.Paths) == 0 {
-		return nil
-	}
-	return r.putChanges(ctx, it, it.newID)
 }
 
 // createContainer 用原始配置创建一个独立容器（不启动）。

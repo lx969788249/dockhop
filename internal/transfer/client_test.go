@@ -123,3 +123,60 @@ func TestConnectTimeoutExplained(t *testing.T) {
 		t.Errorf("建议里应提到安全组：%s", ce.Hint)
 	}
 }
+
+// 文件大小以迁移计划为准：说的大小不对，或者发来的数据比应有的多（没完没了地发），都不是要下载
+// 的文件，马上停下、删掉，不能一直往磁盘里写，也不重试。大小对的照常下载。
+func TestDownloadSizeLimit(t *testing.T) {
+	content := bytes.Repeat([]byte("x"), 100<<10)
+	for _, c := range []struct {
+		name   string
+		size   int64
+		header bool // 是否写 Content-Length
+		ok     bool
+	}{
+		{"大小对", int64(len(content)), true, true},
+		{"说的大小不对", int64(len(content)) - 1, true, false},
+		{"不说大小、发得比应有的多", 10 << 10, false, false},
+	} {
+		var requests atomic.Int32
+		srv := httptestServer(t, func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			if c.header {
+				w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			}
+			w.Write(content)
+		})
+		link, _ := crypto.NewLink("127.0.0.1", srv.port)
+		dst := filepath.Join(t.TempDir(), "bundle")
+		err := NewClient(5*time.Second, t.Logf).Download(context.Background(), link, Part{URL: srv.url, Size: c.size}, dst, nil)
+		if c.ok != (err == nil) {
+			t.Errorf("%s：%v", c.name, err)
+		}
+		if !c.ok {
+			if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
+				t.Errorf("%s：不对的文件应删掉", c.name)
+			}
+			if !errors.Is(err, errSize) || requests.Load() != 1 {
+				t.Errorf("%s：应马上停下、不重试（请求了 %d 次）：%v", c.name, requests.Load(), err)
+			}
+		}
+	}
+}
+
+type testServer struct {
+	url  string
+	port int
+}
+
+func httptestServer(t *testing.T, h http.HandlerFunc) testServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &http.Server{Handler: h}
+	go s.Serve(ln)
+	t.Cleanup(func() { s.Close() })
+	port := ln.Addr().(*net.TCPAddr).Port
+	return testServer{url: "http://127.0.0.1:" + strconv.Itoa(port) + "/file", port: port}
+}

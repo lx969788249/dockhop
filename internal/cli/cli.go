@@ -65,9 +65,13 @@ func (e *Env) fill() {
 	}
 }
 
-// dockhopHome 是日志、记录和工作文件的目录：DOCKHOP_HOME，默认 ~/.dockhop。
+// dockhopHome 是日志、记录和工作文件的目录：DOCKHOP_HOME，默认 ~/.dockhop。总是绝对路径：
+// 锁文件的路径记在临时容器的标签上，用来判断它是哪个任务的，从别的目录运行时也要认得出。
 func (e *Env) dockhopHome() string {
 	if h := e.Getenv("DOCKHOP_HOME"); h != "" {
+		if abs, err := filepath.Abs(h); err == nil {
+			return abs
+		}
 		return h
 	}
 	home, err := e.HomeDir()

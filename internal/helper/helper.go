@@ -38,7 +38,9 @@ func Clean(ctx context.Context, dc *docker.Client, lock string) {
 			if othersRunning(lock) {
 				continue
 			}
-		case host.Held(owner):
+		case !filepath.IsAbs(owner), host.Held(owner):
+			// 相对路径的锁（老版本的 DOCKHOP_HOME 写的是相对路径）从这里认不出是哪个文件，
+			// 和有人拿着的一样，不删。
 			continue
 		}
 		_ = dc.RemoveContainerAndVolumes(ctx, c.ID)

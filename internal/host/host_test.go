@@ -61,3 +61,40 @@ func TestInfo(t *testing.T) {
 		}
 	}
 }
+
+// 判断不了一个锁有没有人拿着（打不开锁文件）时，当作有人拿着：宁可留着没用的临时容器，也
+// 不能删掉别的任务正在用的。只有锁文件不存在、或者自己能拿到时才算没人拿着。
+func TestHeldWhenUnknown(t *testing.T) {
+	dir := t.TempDir()
+	if Held(filepath.Join(dir, "missing.lock")) {
+		t.Error("锁文件不存在：没人拿着")
+	}
+	free := filepath.Join(dir, "free.lock")
+	os.WriteFile(free, nil, 0o600)
+	if Held(free) {
+		t.Error("自己能拿到：没人拿着")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root 读得了任何文件")
+	}
+	locked := filepath.Join(dir, "unreadable.lock")
+	os.WriteFile(locked, nil, 0)
+	if !Held(locked) {
+		t.Error("打不开锁文件时应当作有人拿着")
+	}
+}
+
+func TestWriteFileDurable(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "state.json")
+	for _, content := range []string{"first", "second"} {
+		if err := WriteFileDurable(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := os.ReadFile(p); string(b) != content {
+			t.Errorf("内容：%q", b)
+		}
+	}
+	if _, err := os.Stat(p + ".tmp"); !os.IsNotExist(err) {
+		t.Error("临时文件应已改名")
+	}
+}

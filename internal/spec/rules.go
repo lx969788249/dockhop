@@ -65,29 +65,71 @@ var anonymousVolume = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 func IsAnonymousVolume(name string) bool { return anonymousVolume.MatchString(name) }
 
-// Dependencies 返回容器依赖的其他容器（名字或 ID）：借用网络、进程、IPC 命名空间
-// 的容器，--link 和 --volumes-from 引用的容器。离开它们，这个容器无法启动。
-func Dependencies(c *docker.Container) []string {
-	var deps []string
+// Dep 是容器依赖的另一个容器（名字或 ID）。Running 表示 Docker 要求被依赖的容器先在
+// 运行（借用它的网络、进程、IPC 命名空间，--link）；否则只要求它先存在（--volumes-from）。
+type Dep struct {
+	Ref     string
+	Running bool
+}
+
+// Deps 返回容器依赖的其他容器。离开它们，这个容器无法创建或启动。
+func Deps(c *docker.Container) []Dep {
+	var deps []Dep
 	for _, mode := range []string{c.HostConfig.NetworkMode, c.HostConfig.PidMode, c.HostConfig.IpcMode} {
 		if ref, ok := strings.CutPrefix(mode, "container:"); ok && ref != "" {
-			deps = append(deps, ref)
+			deps = append(deps, Dep{Ref: ref, Running: true})
 		}
 	}
 	// Links 形如 "/db:/web/database"，第一段是被链接的容器。
 	for _, l := range c.HostConfig.Links {
 		target, _, _ := strings.Cut(l, ":")
 		if target = strings.TrimPrefix(target, "/"); target != "" {
-			deps = append(deps, target)
+			deps = append(deps, Dep{Ref: target, Running: true})
 		}
 	}
 	// VolumesFrom 形如 "data" 或 "data:ro"。
 	for _, v := range c.HostConfig.VolumesFrom {
 		if name, _, _ := strings.Cut(v, ":"); name != "" {
-			deps = append(deps, name)
+			deps = append(deps, Dep{Ref: name})
 		}
 	}
 	return deps
+}
+
+// Dependencies 返回容器依赖的其他容器的名字或 ID（见 Deps）。
+func Dependencies(c *docker.Container) []string {
+	var refs []string
+	for _, d := range Deps(c) {
+		refs = append(refs, d.Ref)
+	}
+	return refs
+}
+
+// StopRisk 是停下一个正在运行的容器、之后再恢复它时会出的问题。
+type StopRisk int
+
+const (
+	// StopSafe：可以停下，之后原样恢复。
+	StopSafe StopRisk = iota
+	// StopRemoves：用 --rm 启动的，一停止 Docker 就把它连同匿名卷和容器里没挂载出来的
+	// 改动一起删掉，恢复不了。
+	StopRemoves
+	// StopReplaced：Swarm 服务的任务，停了会被 Swarm 换成新的，新的照样在用数据，停不住。
+	StopReplaced
+)
+
+// StopRiskOf 判断能不能停下 c 再恢复。没在运行（也没暂停）的容器不用停，总是安全的。
+// 迁出时停机打包、迁入时临时停下共用数据的容器或替换同名服务，都按这一条规则判断。
+func StopRiskOf(c *docker.Container) StopRisk {
+	switch {
+	case !c.State.Running && !c.State.Paused:
+		return StopSafe
+	case IsSwarmTask(c.Config.Labels):
+		return StopReplaced
+	case c.HostConfig.AutoRemove:
+		return StopRemoves
+	}
+	return StopSafe
 }
 
 // 运行时临时目录里的改动不算可写层改动；Docker 自己管理的几个文件也不算。

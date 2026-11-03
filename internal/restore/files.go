@@ -11,6 +11,8 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/lx969788249/dockhop/internal/host"
 )
 
 // 宿主机文件操作：目录整体替换、Compose 项目文件逐个安装，以及它们的回滚。
@@ -154,6 +156,10 @@ func moveOrCopy(src, dst string) error {
 		_ = os.RemoveAll(tmp)
 		return err
 	}
+	// 复制出来的这一份要先确实写到磁盘，才能删掉原来的。
+	if err := host.SyncDir(filepath.Dir(dst)); err != nil {
+		return err
+	}
 	return os.RemoveAll(src)
 }
 
@@ -162,7 +168,8 @@ var rename = os.Rename
 
 // copyTree 复制文件或目录，保留属主、权限、修改时间和软链接。
 func copyTree(src, dst string) error {
-	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+	var dirs []string
+	err := filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -176,10 +183,21 @@ func copyTree(src, dst string) error {
 			if err := os.MkdirAll(target, 0o700); err != nil {
 				return err
 			}
+			dirs = append(dirs, target)
 			return copyMeta(p, target, info)
 		}
 		return copyEntry(p, target, info)
 	})
+	if err != nil {
+		return err
+	}
+	// 文件写完时已经各自写到磁盘；再把每个目录里的变化也写到磁盘，从里往外。
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := host.SyncDir(dirs[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // copyEntry 复制一个非目录的文件（普通文件、软链接、FIFO）。
@@ -209,6 +227,9 @@ func copyEntry(src, dst string, info fs.FileInfo) error {
 			return err
 		}
 		_, err = io.Copy(out, in)
+		if err == nil {
+			err = out.Sync()
+		}
 		if cerr := out.Close(); err == nil {
 			err = cerr
 		}

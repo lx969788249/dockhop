@@ -20,6 +20,8 @@ type Plan struct {
 	Binds      []PlanBind      `json:"binds,omitempty"`
 	Networks   []PlanNetwork   `json:"networks,omitempty"`
 	Images     []ImageFile     `json:"images,omitempty"` // 单独提供的镜像文件：新服务器下载之前决定每个镜像从哪里来
+	// BundleSHA256 是迁移包文件的 SHA-256（v1.1.6 起），新服务器下载后据此确认。
+	BundleSHA256 string `json:"bundle_sha256,omitempty"`
 }
 
 // PlanSizes 是各部分解开后的大小（字节），新服务器据此检查磁盘空间。
@@ -29,6 +31,8 @@ type PlanSizes struct {
 	Images     int64 `json:"images"`
 	Volumes    int64 `json:"volumes"`
 	Binds      int64 `json:"binds"`
+	Projects   int64 `json:"projects,omitempty"` // Compose 项目目录和它引用的项目目录外的文件（v1.1.6 起）
+	Changes    int64 `json:"changes,omitempty"`  // 容器里没挂载出来的改动（v1.1.6 起）
 }
 
 // PlanContainer 是预检需要的容器信息。

@@ -129,7 +129,7 @@ func TestImageSources(t *testing.T) {
 
 	var out bytes.Buffer
 	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Getenv: func(string) string { return "" }},
-		opts: Options{Link: link}, workdir: t.TempDir(), m: &bundle.Manifest{ImageFiles: files}}
+		opts: Options{Link: link}, workdir: t.TempDir(), m: &bundle.Manifest{ImageFiles: files}, j: testJournal(t)}
 	r.decideImages(context.Background(), files)
 	want := map[string]imageSource{"image-1": {local: "sha256:here"}, "image-2": {pull: true}, "image-3": {pull: true}, "image-5": {pull: true}}
 	for _, f := range files {
@@ -151,5 +151,20 @@ func TestImageSources(t *testing.T) {
 	}
 	if left, _ := filepath.Glob(filepath.Join(r.workdir, "images", "*")); len(left) > 0 {
 		t.Errorf("加载完应删掉下载的镜像文件：%v", left)
+	}
+	// 每个名字改动之前都记进了事务日志（原来指向哪个镜像；没有的为空），失败时改回去。
+	entries, err := readJournal(r.j.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var noted []string
+	for _, e := range entries {
+		if e.Op == opTag {
+			noted = append(noted, e.Name+"="+e.ID)
+		}
+	}
+	sort.Strings(noted)
+	if got := strings.Join(noted, " "); got != "db:16= gone:1= local:1= mine:dev= slow:1= web:1.25= web:latest=" {
+		t.Errorf("记下的镜像名：%s", got)
 	}
 }
