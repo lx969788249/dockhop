@@ -1,10 +1,12 @@
 // dockhop.run：一行命令 bash <(curl -fsSL https://dockhop.run) 用的短地址。
 //
-// curl、wget 来访问时，直接返回仓库 main 分支上的 run.sh（在 Cloudflare 上缓存 5 分钟）；
-// 浏览器来访问时，跳到 GitHub 上的项目页。程序本身由 run.sh 从 Gitee 或 GitHub 下载，不经过这里。
+// curl、wget 来访问时，直接返回仓库 main 分支上的 run.sh（在 Cloudflare 上缓存 5 分钟），并填上
+// 成功完成迁移的次数；浏览器来访问时，跳到 GitHub 上的项目页。程序本身由 run.sh 从 Gitee 或
+// GitHub 下载，不经过这里。
 //
-// /count 是成功完成迁移的次数（D1 里只存这一个数字）：程序开头的菜单读出来显示；迁入
-// 成功时程序发一个空的 POST，次数加 1。不记录任何别的东西。
+// /count 是成功完成迁移的次数（D1 里只存这一个数字）：程序开头的菜单显示它（通过一行命令运行时
+// 用 run.sh 里填好的，直接运行程序时来这里读）；迁入成功时程序发一个空的 POST，次数加 1。
+// 不记录任何别的东西。
 
 const SCRIPT = "https://raw.githubusercontent.com/lx969788249/dockhop/main/run.sh";
 const REPO = "https://github.com/lx969788249/dockhop";
@@ -35,11 +37,20 @@ export default {
     if (url.pathname === "/" && !cli) {
       return Response.redirect(REPO, 302);
     }
-    const upstream = await fetch(SCRIPT, { cf: { cacheTtl: 300, cacheEverything: true } });
+    // 次数和脚本一起读，填进脚本里预留的 COUNT="" 这一行，程序开头的菜单直接显示，不用再来问
+    // 一次（从国内访问这里常常要好几秒）。1 秒内读不到就不填，程序会自己再读。
+    const [upstream, n] = await Promise.all([
+      fetch(SCRIPT, { cf: { cacheTtl: 300, cacheEverything: true } }),
+      within(readCount(env), 1000),
+    ]);
     if (!upstream.ok) {
       return text(`echo "下载安装脚本失败（GitHub 返回 ${upstream.status}），请稍后重试" >&2; exit 1\n`, 502);
     }
-    return new Response(upstream.body, {
+    let script = await upstream.text();
+    if (n !== null) {
+      script = script.replace(/^COUNT=""$/m, `COUNT="${n}"`);
+    }
+    return new Response(script, {
       headers: {
         "content-type": "text/plain; charset=utf-8",
         "cache-control": "public, max-age=300",
@@ -52,19 +63,37 @@ export default {
 // count 读出或增加成功完成迁移的次数。出了问题（例如免费额度用完）返回 503，程序会当作
 // 读不到：菜单里不显示这一行，迁移照常进行。
 async function count(request, env) {
-  try {
-    if (request.method === "POST") {
-      // 只认 DockHop 发来的；同一个地址一分钟最多算 5 次，防止有人刷数字。
-      const ua = request.headers.get("user-agent") ?? "";
-      const ip = request.headers.get("cf-connecting-ip") ?? "";
-      if (ua.startsWith("DockHop/") && (await env.LIMIT.limit({ key: ip })).success) {
-        await env.DB.prepare("UPDATE counter SET n = n + 1").run();
-      }
-      return new Response(null, { status: 204 });
-    }
-    const row = await env.DB.prepare("SELECT n FROM counter").first();
-    return text(`${row?.n ?? 0}\n`, 200);
-  } catch {
-    return text("暂时读不到\n", 503);
+  if (request.method !== "POST") {
+    const n = await readCount(env);
+    return n === null ? text("暂时读不到\n", 503) : text(`${n}\n`, 200);
   }
+  try {
+    // 只认 DockHop 发来的；同一个地址一分钟最多算 5 次，防止有人刷数字。
+    const ua = request.headers.get("user-agent") ?? "";
+    const ip = request.headers.get("cf-connecting-ip") ?? "";
+    if (ua.startsWith("DockHop/") && (await env.LIMIT.limit({ key: ip })).success) {
+      await env.DB.prepare("UPDATE counter SET n = n + 1").run();
+    }
+    return new Response(null, { status: 204 });
+  } catch {
+    return text("暂时记不了\n", 503);
+  }
+}
+
+// readCount 读出成功完成迁移的次数；出了问题时为 null。
+async function readCount(env) {
+  try {
+    const row = await env.DB.prepare("SELECT n FROM counter").first();
+    const n = row?.n ?? 0;
+    return Number.isSafeInteger(n) && n >= 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+// within 等 p 最多 ms 毫秒，到时还没有结果时为 null。
+function within(p, ms) {
+  let timer;
+  const late = new Promise((resolve) => (timer = setTimeout(() => resolve(null), ms)));
+  return Promise.race([p, late]).finally(() => clearTimeout(timer));
 }

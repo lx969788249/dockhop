@@ -59,11 +59,12 @@ func TestMenuShowsCount(t *testing.T) {
 	}))
 	defer srv.Close()
 	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
+	var vars map[string]string // 环境变量
 	menu := func(url string) (string, time.Duration) {
 		var errb bytes.Buffer
 		start := time.Now()
 		Run(nil, Env{Stderr: &errb, Stdout: &bytes.Buffer{}, TTY: true, Input: strings.NewReader("1\n"), Version: "1.1.2", Count: url,
-			Getenv: func(string) string { return "" }, HomeDir: func() (string, error) { return t.TempDir(), nil }})
+			Getenv: func(k string) string { return vars[k] }, HomeDir: func() (string, error) { return t.TempDir(), nil }})
 		return errb.String(), time.Since(start)
 	}
 	if out, _ := menu(srv.URL + "?case=ok"); !strings.Contains(out, "已成功完成迁移：") || !strings.Contains(out, "1234") {
@@ -80,8 +81,24 @@ func TestMenuShowsCount(t *testing.T) {
 		}
 	}
 
-	// 迁入成功后加一：带着版本号发一个空的 POST。
-	countMigration(&Env{Version: "1.1.2", Count: srv.URL + "?case=ok", Context: t.Context(), Getenv: func(string) string { return "" }})
+	// 通过一行命令运行时，run.sh 把 dockhop.run 填好的次数交过来：直接显示，不再去问（地址连不上
+	// 也照样显示）；交来的不是数字时照常去读；关了统计时照样不显示。
+	vars = map[string]string{"DOCKHOP_COUNT": "42"}
+	if out, took := menu("http://127.0.0.1:1/count"); !strings.Contains(out, "已成功完成迁移：") || !strings.Contains(out, "42") || took > time.Second {
+		t.Errorf("应直接显示交来的次数（用时 %s）：%q", took, out)
+	}
+	vars = map[string]string{"DOCKHOP_COUNT": "abc"}
+	if out, _ := menu(srv.URL + "?case=ok"); !strings.Contains(out, "1234") {
+		t.Errorf("交来的不是数字时应照常去读：%q", out)
+	}
+	vars = map[string]string{"DOCKHOP_COUNT": "42", "DOCKHOP_NO_STATS": "1"}
+	if out, _ := menu("http://127.0.0.1:1/count"); strings.Contains(out, "已成功完成迁移") {
+		t.Errorf("关了统计时不应显示：%q", out)
+	}
+
+	// 迁入成功时加一：在后台带着版本号发一个空的 POST，wait 等它发完。
+	wait := countMigration(&Env{Version: "1.1.2", Count: srv.URL + "?case=ok", Context: t.Context(), Getenv: func(string) string { return "" }})
+	wait()
 	mu.Lock()
 	defer mu.Unlock()
 	if len(posts) != 1 || posts[0] != "DockHop/1.1.2" {

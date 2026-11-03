@@ -256,14 +256,14 @@ func runIn(env *Env, opts InOptions) error {
 		return err
 	}
 	t.redactor.AddSecret(link.Secret())
+	wait := func() {} // 迁入成功时发出的计数，退出前等它结束
 	err = restore.Run(env.Context, restore.Deps{
 		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
 		Home: t.home, Version: env.Version, Getenv: env.Getenv,
+		Succeeded: func() { wait = countMigration(env) },
 	}, restore.Options{Link: link, Yes: opts.Yes, Existing: opts.Existing, KeepSucceeded: opts.KeepSucceeded})
 	t.finish(err == nil)
-	if err == nil {
-		countMigration(env)
-	}
+	wait()
 	if errors.Is(err, restore.ErrReported) {
 		return errReported
 	}

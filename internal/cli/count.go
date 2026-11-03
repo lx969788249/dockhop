@@ -21,10 +21,15 @@ func (e *Env) countOn() bool {
 	return e.Count != "" && release && !off("DOCKHOP_NO_STATS") && !off("DO_NOT_TRACK")
 }
 
-// migrations 读出成功完成迁移的次数，最多等 1.5 秒；读不到时返回 0。
+// migrations 读出成功完成迁移的次数；读不到时返回 0。通过一行命令运行时，dockhop.run 返回
+// run.sh 时已经把次数填在里面，run.sh 用 DOCKHOP_COUNT 交过来，不用再问一次（从国内访问
+// dockhop.run 常常要好几秒）；直接运行程序时才去读，最多等 1.5 秒，免得菜单出来得慢。
 func migrations(env *Env) int {
 	if !env.countOn() {
 		return 0
+	}
+	if n, err := strconv.Atoi(env.Getenv("DOCKHOP_COUNT")); err == nil && n >= 0 {
+		return n
 	}
 	status, body := countRequest(env, http.MethodGet, 1500*time.Millisecond)
 	n, err := strconv.Atoi(body)
@@ -34,11 +39,19 @@ func migrations(env *Env) int {
 	return n
 }
 
-// countMigration 在迁入成功后把次数加一，最多等 3 秒，结果不管。
-func countMigration(env *Env) {
-	if env.countOn() {
-		countRequest(env, http.MethodPost, 3*time.Second)
+// countMigration 在迁入成功时把次数加一，结果不管。马上在后台发出，返回的 wait 等它结束：
+// 从国内访问 dockhop.run 常常要好几秒，所以和收尾（删除临时文件、通知旧服务器、显示结果）
+// 同时进行，最多等 10 秒。
+func countMigration(env *Env) (wait func()) {
+	if !env.countOn() {
+		return func() {}
 	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		countRequest(env, http.MethodPost, 10*time.Second)
+	}()
+	return func() { <-done }
 }
 
 // countRequest 发一个计数请求，返回状态码和回复的内容（最多 32 个字节）；出错时状态码为 0。

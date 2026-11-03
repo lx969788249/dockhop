@@ -53,6 +53,9 @@ type Deps struct {
 	Home     string
 	Version  string
 	Getenv   func(string) string
+	// Succeeded 在迁入成功（已经提交，不会再回滚）时调用一次，可以为空。之后还有收尾：
+	// 删除临时文件、通知旧服务器、显示结果。
+	Succeeded func()
 }
 
 // ErrReported 表示失败原因已经显示在结果摘要里。
@@ -119,6 +122,9 @@ func Run(ctx context.Context, d Deps, o Options) error {
 	err = r.run(ctx)
 	if err != nil && r.j != nil && !r.committed {
 		r.rollback(context.WithoutCancel(ctx))
+	}
+	if err == nil && d.Succeeded != nil {
+		d.Succeeded()
 	}
 	r.j.close()
 	r.cleanFiles(err == nil)

@@ -434,7 +434,7 @@ http://203.0.113.7:8080/k3Jx9QmP2vLa/#a7j8zg6qtzkg8ddwxnzl94th3c4ns7ckdzjxu0w0fy
 
 - `run.sh`（约 30 行）：判断 CPU 架构（x86_64 / arm64 / armv7）→ 从 GitHub Releases 下载对应程序 → 核对 SHA-256 → 运行 → 删除。
 - 国内访问 GitHub 慢：程序同时发布在 Gitee 和 GitHub 上（v1.1.3 起，发布时 `scripts/gitee-release.sh` 自动同步到 Gitee）。`run.sh` 先同时从两边各下载 2 秒比一比，从快的那个下载压缩包；15 秒内平均不到 20KB/s 或失败时换另一个，新地址支持时从断开的地方接着下载（GitHub 支持，Gitee 不支持、只能从头下载）。也支持 `DOCKHOP_MIRROR=镜像地址`（设置后只用它）。程序的校验值写在 `run.sh` 里，从哪里下载都能确认没被篡改。以前的 Cloudflare 中转（`dockhop.run/v版本号/…`）已经去掉，`dockhop.run` 只返回 `run.sh` 和迁移次数。
-- 成功完成迁移的次数（v1.1.2 加入）：迁入成功后程序向 `dockhop.run/count` 发一个空的 POST，Worker 在 D1 里把唯一的一个数字加 1（只认 `DockHop/` 开头的 User-Agent，同一个地址一分钟最多算 5 次）；开头的菜单最多等 1.5 秒读出这个数字显示。只有正式发布的版本访问，`DOCKHOP_NO_STATS=1` 或 `DO_NOT_TRACK=1` 时不访问；连不上、出错时不显示、不报错。
+- 成功完成迁移的次数（v1.1.2 加入）：迁入成功后程序向 `dockhop.run/count` 发一个空的 POST，Worker 在 D1 里把唯一的一个数字加 1（只认 `DockHop/` 开头的 User-Agent，同一个地址一分钟最多算 5 次）；开头的菜单显示这个数字。只有正式发布的版本访问，`DOCKHOP_NO_STATS=1` 或 `DO_NOT_TRACK=1` 时不访问；连不上、出错时不显示、不报错。v1.1.7 起：从国内访问 `dockhop.run` 常常要好几秒（实测 2.5～14 秒），以前菜单最多等 1.5 秒去读，国内基本显示不出来；“加一”在结果显示完才发、只等 3 秒，国内大约一半没算上。现在一行命令下载 `run.sh` 时，Worker 顺便把次数填进脚本里预留的 `COUNT=""`（1 秒内读不到就不填），`run.sh` 用 `DOCKHOP_COUNT` 交给程序，菜单直接显示，不再单独请求；直接运行程序时才去读，最多等 1.5 秒。“加一”在迁入提交成功时就在后台发出，和收尾（删除临时文件、通知旧服务器、显示结果）同时进行，退出前最多等 10 秒。
 - 发布：打标签后 GitHub Actions 自动编译三个架构、生成校验值、发布，再同步到 Gitee（上传和 GitHub 上一样的文件，只保留最近 10 个版本：Gitee 每个仓库的附件合计不能超过 1GB）。从 GitHub 的服务器往 Gitee 上传很慢（实测每秒十几到几十 KB，还会断，一个版本要半小时左右），所以 `run.sh` 要用的压缩包先传，已经传好的文件不重传，长时间没有进展的上传自动重试。同步失败不影响 GitHub 上的发布，可以手动运行 gitee 工作流接着同步。更新说明（v1.1.6 起）写在附注标签里：第一行是一句话摘要，空一行之后是几条简短的说明，放到 GitHub 和 Gitee 的发布页上。
 - 版本号从 1.0.0 开始（第 7 节）。
 
@@ -546,7 +546,7 @@ http://203.0.113.7:8080/k3Jx9QmP2vLa/#a7j8zg6qtzkg8ddwxnzl94th3c4ns7ckdzjxu0w0fy
 | `RESTORE_CONNECT_TIMEOUT`、`RESTORE_STARTUP_GRACE`、`DOCKER_MIGRATE_PROGRESS_INTERVAL`、`DOCKER_MIGRATE_PROGRESS_MODE`、`DM_PROGRESS_STALL`、`RESTORE_IGNORE_CONTAINERS`、`DOCKER_MIGRATE_IGNORE_CONTAINERS` | 只供测试使用，改为不写进文档的 `DOCKHOP_TEST_*` |
 | `DOCKER_MIGRATE_GZIP_LEVEL`、`DOCKER_MIGRATE_LIB_ONLY`、各种 `DM_*` | 不再需要 |
 
-新增：`DOCKHOP_MIRROR`（`run.sh` 下载程序用的镜像站）。
+新增：`DOCKHOP_MIRROR`（`run.sh` 下载程序用的镜像站）。`DOCKHOP_COUNT` 是 `run.sh` 交给程序的迁移次数（3.4.14），不写进用户文档。
 
 ## 附录 C：必须保留的事务和安全场景（来自 integration_docker.sh）
 

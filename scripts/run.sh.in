@@ -15,6 +15,9 @@ SHA256_ARM64="__SHA256_ARM64__"
 SHA256_ARMV7="__SHA256_ARMV7__"
 GITEE="https://gitee.com/lx969788249/dockhop/releases/download"
 GITHUB="https://github.com/lx969788249/dockhop/releases/download"
+# 成功完成迁移的次数：dockhop.run 返回这个脚本时填上，交给程序在菜单里显示（从国内访问
+# dockhop.run 常常要好几秒，程序自己再去问就来不及了）。从别处下载的这个脚本里是空的。
+COUNT=""
 
 fail() {
   printf '✗ %s\n' "$1" >&2
@@ -205,6 +208,6 @@ chmod +x "$bin"
 # 恢复，这里把终端设置恢复原样，免得之后打字不显示。
 tty_state="$(stty -g 2>/dev/null </dev/tty || true)"
 rc=0
-"$bin" "$@" || rc=$?
+DOCKHOP_COUNT="$COUNT" "$bin" "$@" || rc=$?
 [[ -z "$tty_state" ]] || stty "$tty_state" 2>/dev/null </dev/tty || true
 exit "$rc"
