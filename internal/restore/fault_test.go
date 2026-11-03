@@ -329,7 +329,7 @@ func TestStartupFailureHidesEnvSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.j.close()
-	readyErr := r.waitReady(context.Background(), "web", "new-web")
+	readyErr := r.waitReady(context.Background(), &citem{m: bundle.Container{Name: "web"}, newID: "new-web"})
 	if readyErr == nil || !strings.Contains(readyErr.Error(), "cannot connect using") {
 		t.Fatalf("报错里应带着容器最后的输出：%v", readyErr)
 	}
@@ -593,7 +593,11 @@ esac
 		return ""
 	}}, tool: tool, j: j, workdir: home, items: []*citem{
 		member("stack-web-1", "web", "1", true), member("stack-web-2", "web", "2", false), member("stack-db-1", "db", "1", true)}}
-	if err := r.startProject(context.Background(), bundle.Project{Name: "stack", WorkingDir: home}); err != nil {
+	u := &unit{key: "p:stack", project: &bundle.Project{Name: "stack", WorkingDir: home}, items: r.items}
+	if err := r.createProject(context.Background(), u); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.startProject(context.Background(), u); err != nil {
 		t.Fatal(err)
 	}
 	log, _ := os.ReadFile(cmdlog)

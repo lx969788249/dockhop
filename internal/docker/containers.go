@@ -13,27 +13,37 @@ import (
 
 // Container 是容器详情里 DockHop 需要读取的部分；完整配置另外按原始 JSON 保存。
 type Container struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
-	Image string `json:"Image"` // 镜像 ID
-	State struct {
-		Status  string `json:"Status"`
-		Running bool   `json:"Running"`
-		Paused  bool   `json:"Paused"`
-		Health  *struct {
-			Status string `json:"Status"`
+	ID           string `json:"Id"`
+	Name         string `json:"Name"`
+	Image        string `json:"Image"`        // 镜像 ID
+	RestartCount int    `json:"RestartCount"` // Docker 按重启策略自动重启的次数
+	State        struct {
+		Status    string `json:"Status"`
+		Running   bool   `json:"Running"`
+		Paused    bool   `json:"Paused"`
+		ExitCode  int    `json:"ExitCode"`
+		OOMKilled bool   `json:"OOMKilled"`
+		Error     string `json:"Error"`
+		StartedAt string `json:"StartedAt"`
+		Health    *struct {
+			Status        string        `json:"Status"`
+			FailingStreak int           `json:"FailingStreak"` // 连续没通过的次数
+			Log           []HealthProbe `json:"Log"`
 		} `json:"Health"`
 	} `json:"State"`
 	Config struct {
 		Image       string            `json:"Image"` // 创建时用的镜像名
 		Labels      map[string]string `json:"Labels"`
 		Env         []string          `json:"Env"`
+		Entrypoint  StrSlice          `json:"Entrypoint"`
+		Cmd         StrSlice          `json:"Cmd"`
 		StopTimeout *int              `json:"StopTimeout"`
 		Healthcheck *struct {
 			Test        []string `json:"Test"`
 			Interval    int64    `json:"Interval"`
 			Timeout     int64    `json:"Timeout"`
 			StartPeriod int64    `json:"StartPeriod"`
+			Retries     int      `json:"Retries"`
 		} `json:"Healthcheck"`
 	} `json:"Config"`
 	HostConfig struct {
@@ -63,9 +73,35 @@ type Container struct {
 				IPv4Address string `json:"IPv4Address"`
 				IPv6Address string `json:"IPv6Address"`
 			} `json:"IPAMConfig"`
-			Aliases []string `json:"Aliases"`
+			Aliases  []string `json:"Aliases"`
+			DNSNames []string `json:"DNSNames"` // 在这个网络上能找到它的全部名字（Docker 25 起）
 		} `json:"Networks"`
 	} `json:"NetworkSettings"`
+}
+
+// HealthProbe 是 Docker 记下的一次健康检查（只保留最近 5 次）。
+type HealthProbe struct {
+	Start    string `json:"Start"`
+	End      string `json:"End"`
+	ExitCode int    `json:"ExitCode"`
+	Output   string `json:"Output"`
+}
+
+// StrSlice 是配置里的命令（Entrypoint、Cmd）：一般是字符串数组，很老的 Docker 可能给一个字符串。
+type StrSlice []string
+
+func (s *StrSlice) UnmarshalJSON(b []byte) error {
+	var list []string
+	if err := json.Unmarshal(b, &list); err == nil {
+		*s = list
+		return nil
+	}
+	var one string
+	if err := json.Unmarshal(b, &one); err != nil {
+		return err
+	}
+	*s = StrSlice{one}
+	return nil
 }
 
 // PortBinding 是一个端口映射。

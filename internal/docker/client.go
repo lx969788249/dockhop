@@ -189,6 +189,12 @@ func CompareVersions(a, b string) int {
 	return 0
 }
 
+type quietKey struct{}
+
+// Quiet 让用这个 ctx 发出的请求不写进日志：每秒一次的轮询会把日志刷满，轮询的地方自己记下
+// 状态的变化。出错照常记。
+func Quiet(ctx context.Context) context.Context { return context.WithValue(ctx, quietKey{}, true) }
+
 // do 发出请求。path 以 / 开头且不含版本前缀时原样请求；body 为 io.Reader 时
 // 原样发送，否则编码成 JSON；out 为 *json.RawMessage、*[]byte 或其他结构体。
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, body any, contentType string, out any) error {
@@ -238,7 +244,9 @@ func (c *Client) send(ctx context.Context, method, path string, q url.Values, bo
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	c.logf("Docker 接口：%s %s", method, path)
+	if ctx.Value(quietKey{}) == nil {
+		c.logf("Docker 接口：%s %s", method, path)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err

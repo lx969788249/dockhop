@@ -765,3 +765,88 @@ func TestInSymlinkAliases(t *testing.T) {
 	m.waitOutSuccess(t)
 	noLeftovers(t, home)
 }
+
+// 1Panel 的样子：应用和数据库是两个 Compose 项目，接在同一个外部网络上，应用的启动命令里写着
+// 数据库的服务名。应用的项目名排在前面，按名字顺序先启动它的话，它连不上数据库、一直在重启，
+// 健康检查过不了。要先启动数据库、等它就绪，再启动应用；日志里写明顺序和原因。
+func TestInCrossProjectOrder(t *testing.T) {
+	p := fmt.Sprintf("dmtest_xo%d", os.Getpid())
+	app, db, shared := p+"app", p+"db", p+"net"
+	t.Cleanup(func() {
+		removeProject(app)
+		removeProject(db)
+		try("docker", "network", "rm", shared)
+		removePrefixed(p)
+	})
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	sh(t, "docker", "network", "create", shared)
+	root := t.TempDir()
+	files := map[string]string{
+		db: `services:
+  database:
+    image: alpine:3.20
+    command: ["nc", "-lk", "-p", "5432", "-e", "echo"]
+    labels: {com.centurylinklabs.watchtower.enable: "false"}
+    networks: [shared]
+networks:
+  shared: {name: ` + shared + `, external: true}
+`,
+		app: `services:
+  web:
+    image: alpine:3.20
+    restart: always
+    labels: {com.centurylinklabs.watchtower.enable: "false"}
+    networks: [shared]
+    entrypoint: ["sh", "-c", "for i in 1 2 3; do echo | nc -w 2 database 5432 >/dev/null && touch /tmp/ready && exec sleep 600; sleep 1; done; echo cannot reach database; exit 1", "--"]
+    command: ["--db-url=tcp://database:5432/app"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 2s
+      retries: 3
+      start_period: 1s
+networks:
+  shared: {name: ` + shared + `, external: true}
+`,
+	}
+	c := composeCmd(t)
+	for _, proj := range []string{db, app} {
+		dir := filepath.Join(root, proj)
+		os.MkdirAll(dir, 0o755)
+		os.WriteFile(filepath.Join(dir, "compose.yml"), []byte(files[proj]), 0o644)
+		up := exec.Command(c[0], append(c[1:], "-p", proj, "up", "-d")...)
+		up.Dir = dir
+		if b, err := up.CombinedOutput(); err != nil {
+			t.Fatalf("%v\n%s", err, b)
+		}
+	}
+	web, database := containerByLabel(t, app, "web"), containerByLabel(t, db, "database")
+	healthy := func() bool { return try("docker", "inspect", "-f", "{{.State.Health.Status}}", web) == "healthy" }
+	for i := 0; i < 60 && !healthy(); i++ {
+		time.Sleep(time.Second)
+	}
+	if !healthy() {
+		t.Fatalf("旧服务器上的应用没有就绪：\n%s", try("docker", "logs", web))
+	}
+	m := startOut(t, "--include", web+","+database)
+	removeProject(app)
+	removeProject(db)
+	sh(t, "docker", "network", "rm", shared)
+
+	home := t.TempDir()
+	if _, code := m.in(t, home, nil); code != 0 {
+		t.Fatalf("迁入应成功：%d", code)
+	}
+	if !healthy() {
+		t.Errorf("迁入后应用应健康：%s", try("docker", "inspect", "-f", "{{.State.Status}} {{.State.Health.Status}}", web))
+	}
+	logs, _ := filepath.Glob(filepath.Join(home, "logs", "in-*.log"))
+	if len(logs) == 0 {
+		t.Fatal("没有迁入日志")
+	}
+	b, _ := os.ReadFile(logs[len(logs)-1])
+	mustContain(t, string(b), "启动顺序：项目 "+db+"、项目 "+app,
+		"项目 "+app+" 用到项目 "+db+"（"+web+" 的启动命令里写着 database），等它就绪后再启动",
+		"容器 "+web+" 就绪：健康检查通过")
+	m.waitOutSuccess(t)
+	noLeftovers(t, home)
+}

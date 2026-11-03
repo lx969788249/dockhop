@@ -167,14 +167,19 @@ func TestDependencyOrder(t *testing.T) {
 
 func TestHealthTimeout(t *testing.T) {
 	s := int64(time.Second)
-	if got := healthTimeout(60*time.Second, 0, 2*s, 2*s); got != 60*time.Second {
-		t.Errorf("检查间隔短时用默认的 60 秒：%s", got)
+	if got := healthTimeout(60*time.Second, 0, 2*s, 2*s, 1); got != 60*time.Second {
+		t.Errorf("检查得勤时至少等 60 秒：%s", got)
 	}
-	// Vaultwarden：每 60 秒检查一次、超时 10 秒。
-	if got := healthTimeout(60*time.Second, 0, 60*s, 10*s); got != 100*time.Second {
-		t.Errorf("要够第一次检查跑完：%s", got)
+	// 1Panel 装的 Halo：启动后 30 秒内不算，之后每 30 秒一次、超时 5 秒，连续 5 次没通过才算不健康，
+	// Docker 要 3 分钟才下结论。以前只等 95 秒，小机器上 Java 应用正常启动也会被误判。
+	if got := healthTimeout(60*time.Second, 30*s, 30*s, 5*s, 5); got != 215*time.Second {
+		t.Errorf("应等到 Docker 下结论再多 30 秒：%s", got)
 	}
-	if got := healthTimeout(60*time.Second, 2000*s, 2000*s, 0); got != time.Hour {
+	// Vaultwarden：每 60 秒一次、超时 10 秒，没写次数（Docker 默认 3 次）。
+	if got := healthTimeout(60*time.Second, 0, 60*s, 10*s, 0); got != 220*time.Second {
+		t.Errorf("没写的按 Docker 的默认值：%s", got)
+	}
+	if got := healthTimeout(60*time.Second, 2000*s, 2000*s, 0, 3); got != time.Hour {
 		t.Errorf("最多一小时：%s", got)
 	}
 }

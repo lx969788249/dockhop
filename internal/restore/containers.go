@@ -22,6 +22,9 @@ type citem struct {
 	newID   string
 	img     string // 创建容器用的镜像（算过之后缓存）
 	applied bool   // 容器里的改动已经包含在 img 里
+
+	startedAt time.Time // 在新服务器上启动它的时候
+	ready     bool      // 已经确认就绪
 }
 
 func (it *citem) name() string { return it.m.Name }
@@ -235,124 +238,6 @@ func (r *run) transplantAnonymous(ctx context.Context, it *citem, newID string) 
 		}
 	}
 	return nil
-}
-
-// startAndVerify 启动容器并确认它正常：有健康检查的等到健康，没有的确认它
-// 启动后没有马上退出。原来是暂停状态的，最后再暂停。
-func (r *run) startAndVerify(ctx context.Context, it *citem, id string) error {
-	if err := r.Docker.StartContainer(ctx, id); err != nil {
-		return fmt.Errorf("容器 %s 启动失败：%v", it.m.Name, err)
-	}
-	if err := r.waitReady(ctx, it.m.Name, id); err != nil {
-		return err
-	}
-	if it.c.State.Paused {
-		if err := r.Docker.PauseContainer(ctx, id); err != nil {
-			return fmt.Errorf("没能把容器 %s 恢复成暂停状态：%v", it.m.Name, err)
-		}
-	}
-	return nil
-}
-
-// waitReady 等容器就绪。
-func (r *run) waitReady(ctx context.Context, name, id string) error {
-	c, _, err := r.Docker.InspectContainer(ctx, id)
-	if err != nil {
-		return err
-	}
-	hc := c.Config.Healthcheck
-	hasCheck := hc != nil && len(hc.Test) > 0 && hc.Test[0] != "NONE"
-	started := time.Now()
-	if !hasCheck {
-		grace := r.startupGrace()
-		for {
-			c, _, err := r.Docker.InspectContainer(ctx, id)
-			if err != nil {
-				return err
-			}
-			if c.State.Status != "running" {
-				return fmt.Errorf("容器 %s 启动后马上退出了（%s）%s", name, c.State.Status, r.logsHint(ctx, id))
-			}
-			if time.Since(started) >= grace {
-				return nil
-			}
-			if err := sleep(ctx, time.Second); err != nil {
-				return err
-			}
-		}
-	}
-	timeout := healthTimeout(minHealthWait, hc.StartPeriod, hc.Interval, hc.Timeout)
-	for {
-		c, _, err := r.Docker.InspectContainer(ctx, id)
-		if err != nil {
-			return err
-		}
-		status := c.State.Status
-		if c.State.Health != nil && status == "running" {
-			status = c.State.Health.Status
-		}
-		switch status {
-		case "healthy":
-			r.Log.Printf("容器 %s 健康检查通过（%s）", name, time.Since(started).Round(time.Second))
-			return nil
-		case "unhealthy", "exited", "dead":
-			return fmt.Errorf("容器 %s 健康检查没有通过（%s）%s", name, status, r.logsHint(ctx, id))
-		}
-		elapsed := time.Since(started)
-		if elapsed >= timeout {
-			return fmt.Errorf("容器 %s 健康检查超时（等了 %d 秒）%s", name, int(timeout.Seconds()), r.logsHint(ctx, id))
-		}
-		r.Screen.Note(fmt.Sprintf("%s 健康检查 · %s · %d/%d 秒", name, status, int(elapsed.Seconds()), int(timeout.Seconds())))
-		if err := sleep(ctx, time.Second); err != nil {
-			return err
-		}
-	}
-}
-
-// logsHint 是容器最后的输出，接在报错后面。报错会显示在屏幕和结果里，所以先隐藏秘密。
-func (r *run) logsHint(ctx context.Context, id string) string {
-	if logs := r.Redactor.Redact(r.Docker.ContainerLogs(ctx, id, 5)); logs != "" {
-		r.Log.Printf("容器最后的输出：\n%s", logs)
-		return "，最后的输出：" + lastLine(logs)
-	}
-	return ""
-}
-
-func lastLine(s string) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
-	l := strings.TrimSpace(lines[len(lines)-1])
-	if len([]rune(l)) > 160 {
-		l = string([]rune(l)[:160]) + "…"
-	}
-	return l
-}
-
-// minHealthWait 是健康检查至少等多久。
-const minHealthWait = 60 * time.Second
-
-// healthTimeout 是健康检查最长等多久：至少 base，并且够容器自己的健康检查跑完第一次。
-// 有的镜像每 60 秒才检查一次（例如 Vaultwarden），固定等 60 秒会在第一次检查出结果之前就超时。
-func healthTimeout(base time.Duration, startPeriod, interval, timeout int64) time.Duration {
-	if interval <= 0 {
-		interval = int64(30 * time.Second)
-	}
-	if timeout <= 0 {
-		timeout = int64(30 * time.Second)
-	}
-	need := time.Duration(startPeriod+interval+timeout) + 30*time.Second
-	if need < base {
-		need = base
-	}
-	return min(need, time.Hour)
-}
-
-func (r *run) startupGrace() time.Duration {
-	if v := r.Getenv("DOCKHOP_TEST_STARTUP_GRACE"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
-	}
-	return 3 * time.Second
 }
 
 func sleep(ctx context.Context, d time.Duration) error {

@@ -11,8 +11,9 @@
 #
 # 每个应用目录里：
 #   compose.yml 等   应用本身（官方 Compose 文件，固定版本）
-#   app.env          可选：APP_PROJECT（项目名，默认目录名）、NEW_MEMORY（新服务器内存上限）
+#   app.env          可选：APP_PROJECT（项目名，默认目录名；几个项目用空格分开）、NEW_MEMORY（新服务器内存上限）
 #   up.sh            可选：自定义启动方式；默认 docker compose up -d --wait
+#   new.sh           可选：迁入前在新服务器上准备环境（例如 1Panel 已经建好的网络）
 #   seed.sh          在旧服务器上写入一份能认出来的数据
 #   verify.sh        在新服务器上确认这份数据还在
 #
@@ -126,9 +127,13 @@ preload_images() {
   docker save "${images[@]}" | docker exec -i "$host" docker load -q >/dev/null
 }
 
+# 应用目录和它下面一层子目录里的 Compose 文件用到的镜像（1Panel 的样子是每个应用一个子目录）。
 compose_images() {
-  local dir="$1"
-  (cd "$dir" && docker compose config --images 2>/dev/null) |
+  local dir="$1" d
+  for d in "$dir" "$dir"/*/; do
+    [[ -d "$d" ]] || continue
+    (cd "$d" && docker compose config --images 2>/dev/null) || true
+  done |
     while read -r img; do
       # 需要现场构建的镜像拉不到，交给 up.sh 构建。
       if docker image inspect "$img" >/dev/null 2>&1 || docker manifest inspect "$img" >/dev/null 2>&1; then
@@ -271,6 +276,7 @@ run_app() {
 
   log "[${app}] 新服务器迁入"
   t=$SECONDS
+  [[ ! -f "${dir}/new.sh" ]] || run_script_on "$new" "${dir}/new.sh"
   if ! run_in "$link" "${tmp}/in.log"; then
     echo "迁入失败" >&2
     tail -n 60 "${tmp}/in.log" >&2
@@ -289,8 +295,14 @@ run_app() {
   run_script_on "$new" "${dir}/verify.sh" -e APP_PROJECT="$project"
   dump_state "$new" >"${tmp}/after.json"
   compare_state "${tmp}/before.json" "${tmp}/after.json" "新服务器与旧服务器"
+  local -a projects known=(-e '')
+  local p
+  read -r -a projects <<<"$project"
+  for p in "${projects[@]}"; do
+    known+=(-e "$p")
+  done
   if docker exec "$new" docker ps -a --format '{{.Label "com.docker.compose.project"}}' |
-    grep -v -x -F -e "$project" -e '' | grep -q .; then
+    grep -v -x -F "${known[@]}" | grep -q .; then
     echo "新服务器上多出了别的 Compose 项目" >&2
     docker exec "$new" docker ps -a >&2
     return 1

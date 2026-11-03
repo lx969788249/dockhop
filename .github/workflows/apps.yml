@@ -32,6 +32,8 @@ jobs:
           - { app: vaultwarden }
           - { app: uptime-kuma }
           - { app: halo }
+          # 1Panel 装的 Halo 和 PostgreSQL：两个 Compose 项目共用 1panel-network，Halo 按服务名连数据库。
+          - { app: 1panel }
           - { app: memos }
           - { app: tricky }
           - { app: unreachable }
@@ -40,6 +42,7 @@ jobs:
           - { app: tricky, old: "29", new: "29" }
           - { app: wordpress, old: "29", new: "29" }
           - { app: digest, old: "29", new: "29" }
+          - { app: 1panel, old: "29", new: "29" }
           # 不同 Docker 版本之间迁移：老版本 → 新版本、新版本 → 老版本。
           - { app: tricky, old: "20.10", new: "29" }
           - { app: tricky, old: "29", new: "20.10" }
