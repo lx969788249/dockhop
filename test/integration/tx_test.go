@@ -135,7 +135,7 @@ func TestInReplaceAndRollback(t *testing.T) {
 	if code == 0 {
 		t.Fatal("模拟失败时迁入应失败")
 	}
-	mustContain(t, out, "❌ 迁入失败，迁入的内容已全部删除", "原来的服务和数据都在", "重新运行时不用重新下载")
+	mustContain(t, out, "❌ 迁入失败，迁入的内容已全部删除", "原来的服务和数据都在", "用同一个链接重新迁入时不用重新下载，不迁了可以删掉这个目录")
 	f.targetIntact(t, oldID)
 	noLeftovers(t, home)
 
