@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,7 +16,9 @@ import (
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/crypto"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/transfer"
+	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 // ---------- 镜像从哪里来 ----------
@@ -123,7 +126,7 @@ func (r *run) fetch(ctx context.Context, label string, parts []fetchPart) error 
 	for _, part := range parts {
 		if err := os.MkdirAll(filepath.Dir(part.path), 0o700); err != nil {
 			p.Done(err)
-			return fail(s, "无法创建下载目录", err.Error(), "")
+			return s.StepFailed("无法创建下载目录", err.Error(), "")
 		}
 		err := r.client().Download(ctx, r.opts.Link, transfer.Part{URL: part.url, Size: part.size, Before: before, Total: total}, part.path,
 			func(done, all int64) {
@@ -136,12 +139,12 @@ func (r *run) fetch(ctx context.Context, label string, parts []fetchPart) error 
 			p.Done(err)
 			var ce *transfer.ConnError
 			if errors.As(err, &ce) {
-				return fail(s, ce.Reason, "", ce.Hint)
+				return s.StepFailed(ce.Reason, "", ce.Hint)
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			return fail(s, label+"失败："+err.Error(), "", "检查两台服务器之间的网络后重新运行，会从断点继续")
+			return s.StepFailed(label+"失败："+err.Error(), "", "检查两台服务器之间的网络后重新运行，会从断点继续")
 		}
 		if st, err := os.Stat(part.path); err == nil {
 			before += st.Size()
@@ -245,12 +248,12 @@ func (r *run) loadImageFile(ctx context.Context, label string, f bundle.ImageFil
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return fail(s, "打不开下载的镜像文件 "+path, err.Error(), "")
+		return s.StepFailed("打不开下载的镜像文件 "+path, err.Error(), "")
 	}
 	defer file.Close()
 	rc, err := bundle.OpenImageFile(file, r.opts.Link)
 	if err != nil {
-		return fail(s, "镜像文件解不开："+err.Error(), "", "在旧服务器重新运行迁出")
+		return s.StepFailed("镜像文件解不开："+err.Error(), "", "在旧服务器重新运行迁出")
 	}
 	p := s.StartProgress(label, f.Size, "镜像较大时需要几分钟")
 	err = r.Docker.LoadImages(ctx, io.TeeReader(rc, p))
@@ -259,9 +262,9 @@ func (r *run) loadImageFile(ctx context.Context, label string, f bundle.ImageFil
 	if err != nil {
 		if errors.Is(err, crypto.ErrCorrupted) {
 			_ = os.Remove(path)
-			return fail(s, "下载的镜像文件不完整或被改动过，已删除", "", "重新运行迁入，会重新下载")
+			return s.StepFailed("下载的镜像文件不完整或被改动过，已删除", "", "重新运行迁入，会重新下载")
 		}
-		return fail(s, "加载镜像失败："+err.Error(), "", "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
+		return s.StepFailed("加载镜像失败："+err.Error(), "", "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
 	}
 	_ = os.Remove(path) // 用完就删，省磁盘
 	return nil
@@ -284,10 +287,10 @@ func (r *run) noteTags(ctx context.Context, refs []string) error {
 		case err == nil:
 			id = img.ID
 		case !docker.IsNotFound(err):
-			return fail(r.Screen, "读不到新服务器上的镜像 "+ref, err.Error(), "确认 Docker 运行正常后重新运行")
+			return r.Screen.StepFailed("读不到新服务器上的镜像 "+ref, err.Error(), "确认 Docker 运行正常后重新运行")
 		}
 		if err := r.j.add(Entry{Op: opTag, Name: ref, ID: id}); err != nil {
-			return fail(r.Screen, err.Error(), "", "")
+			return r.Screen.StepFailed(err.Error(), "", "")
 		}
 		r.noted[ref] = true
 	}
@@ -303,8 +306,108 @@ func (r *run) tagRefs(ctx context.Context, id string, f bundle.ImageFile) error 
 		}
 		repo, tag := splitTag(ref)
 		if err := r.Docker.TagImage(ctx, id, repo, tag); err != nil {
-			return fail(r.Screen, "给镜像 "+ref+" 加名字失败", err.Error(), "")
+			return r.Screen.StepFailed("给镜像 "+ref+" 加名字失败", err.Error(), "")
 		}
 	}
 	return nil
+}
+
+func (r *run) loadImages(ctx context.Context) error {
+	s := r.Screen
+	if r.m.Images.Parts > 0 {
+		// 格式版本 1 的迁移包：所有镜像都在包里，docker load 按里面记的名字加名字。
+		var names []string
+		for ref := range r.m.Images.Refs {
+			names = append(names, ref)
+		}
+		sort.Strings(names)
+		if err := r.noteTags(ctx, names); err != nil {
+			return err
+		}
+		rc := bundle.OpenStream(r.dataDir, "images", r.m.Images.Parts)
+		p := s.StartProgress("加载镜像", r.m.Images.Bytes, "镜像较大时需要几分钟")
+		err := r.Docker.LoadImages(ctx, io.TeeReader(rc, p))
+		rc.Close()
+		p.Done(err)
+		if err != nil {
+			return s.StepFailed("加载镜像失败："+err.Error(), "", "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
+		}
+		_ = os.RemoveAll(filepath.Join(r.dataDir, "images")) // 用完就删，省磁盘
+	} else if err := r.loadImageFiles(ctx); err != nil {
+		return err
+	}
+	refs := make([]string, 0, len(r.m.Images.Refs))
+	for ref := range r.m.Images.Refs {
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	for _, ref := range refs {
+		name, err := r.resolveImage(ctx, ref)
+		if err != nil {
+			return err
+		}
+		// 恢复数据卷的临时容器用第一个镜像来建。用名字而不是 ID：containerd 存储里
+		// 按多平台镜像的 ID 创建容器会选错平台。
+		if r.helperImage == "" {
+			r.helperImage = name
+		}
+	}
+	s.End(fmt.Sprintf("%d 个镜像 · %s", len(refs), ui.HumanBytes(r.m.Images.Bytes)))
+	return nil
+}
+
+// resolveImage 确认迁移包里的一个镜像在这台服务器上能用，返回用来创建容器的名字。
+func (r *run) resolveImage(ctx context.Context, ref string) (string, error) {
+	s := r.Screen
+	if !strings.Contains(ref, "@sha256:") {
+		if _, err := r.Docker.InspectImage(ctx, ref); err != nil {
+			return "", s.StepFailed("镜像 "+ref+" 没有加载成功", err.Error(), "")
+		}
+		return ref, nil
+	}
+	// digest 固定的镜像：本机已经有这个摘要的镜像（原来就有，或者刚按摘要拉下来的）就直接用。
+	if _, err := r.Docker.InspectImage(ctx, ref); err == nil {
+		return ref, nil
+	}
+	// 导出文件里没有仓库清单，加载后按摘要找不到（实验 3、6）。
+	if !r.d.UseBundleImage(ref) {
+		s.Note("按摘要补齐镜像清单 · " + ref)
+		pctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		err := r.Docker.PullImage(pctx, ref, nil)
+		cancel()
+		if err == nil {
+			return ref, nil
+		}
+		s.Warn("镜像 %s 没能按摘要补齐（%v），改用迁移包里的镜像", ref, err)
+	}
+	// 加载后的镜像只能按 ID 找到：旧版 Docker 的 ID 是配置的摘要，新版（containerd 存储）
+	// 的 ID 就是引用里的摘要。
+	id := ""
+	for _, cand := range []string{r.m.Images.Refs[ref], "sha256:" + ref[strings.LastIndex(ref, "@sha256:")+8:]} {
+		if img, err := r.Docker.InspectImage(ctx, cand); err == nil {
+			id = img.ID
+			break
+		}
+	}
+	if id == "" {
+		return "", s.StepFailed("镜像 "+ref+" 没有加载成功", "", "")
+	}
+	as := preflight.StripDigest(ref)
+	if err := r.noteTags(ctx, []string{as}); err != nil {
+		return "", err
+	}
+	repo, tag := splitTag(as)
+	if err := r.Docker.TagImage(ctx, id, repo, tag); err != nil {
+		return "", s.StepFailed("给镜像 "+ref+" 加名字失败", err.Error(), "")
+	}
+	r.imageAs[ref] = as
+	return as, nil
+}
+
+func splitTag(ref string) (string, string) {
+	i := strings.LastIndex(ref, ":")
+	if i < 0 || strings.Contains(ref[i:], "/") {
+		return ref, "latest"
+	}
+	return ref[:i], ref[i+1:]
 }

@@ -404,3 +404,16 @@ func shortRef(ref string) string {
 	}
 	return ref
 }
+
+// chosenText 是迁移哪些服务：独立容器写容器名、Compose 项目写项目名。
+func chosenText(sel *selection) string {
+	names := make([]string, 0, len(sel.units))
+	for _, u := range sel.units {
+		names = append(names, u.label())
+	}
+	t := ui.Names(names)
+	if len(sel.items) != len(names) {
+		t += fmt.Sprintf("（共 %d 个容器）", len(sel.items))
+	}
+	return t
+}

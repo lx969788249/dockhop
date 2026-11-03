@@ -16,7 +16,7 @@ func TestFinishLeavesNothing(t *testing.T) {
 		name string
 		err  error
 		keep bool
-	}{{"成功", nil, false}, {"取消", ui.ErrCancelled, false}, {"失败", errReported, true}} {
+	}{{"成功", nil, false}, {"取消", ui.ErrCancelled, false}, {"失败", ui.ErrReported, true}} {
 		home := filepath.Join(t.TempDir(), ".dockhop")
 		for _, d := range []string{"work", "state", "rollback", "bin", "locks"} {
 			os.MkdirAll(filepath.Join(home, d), 0o700)

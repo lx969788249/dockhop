@@ -322,7 +322,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		if spec.StopRiskOf(it.c) == spec.StopReplaced {
 			// Swarm 会马上重新创建停掉的容器，停不住。
 			svc := it.c.Config.Labels[labelSwarmService]
-			return fail(screen, fmt.Sprintf("容器 %s 属于 Swarm 服务 %s，和选中的容器共用数据，但它一停就会被 Swarm 重新启动，打包的数据没法保证一致，已取消（什么都没有改动）", it.name(), svc),
+			return screen.StepFailed(fmt.Sprintf("容器 %s 属于 Swarm 服务 %s，和选中的容器共用数据，但它一停就会被 Swarm 重新启动，打包的数据没法保证一致，已取消（什么都没有改动）", it.name(), svc),
 				"", "先执行 docker service scale "+svc+"=0，迁出后再改回原来的个数")
 		}
 		out.shared = append(out.shared, it)

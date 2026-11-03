@@ -41,8 +41,8 @@ func startTask(env *Env, kind string) (*task, error) {
 	if err != nil {
 		reason, hint := explainDockerError(err)
 		t.screen.Problem(reason, hint)
-		t.finish(errReported)
-		return nil, errReported
+		t.finish(ui.ErrReported)
+		return nil, ui.ErrReported
 	}
 	t.docker = dc
 	// 出问题时用户只需附上日志：Docker 的情况也记下来。

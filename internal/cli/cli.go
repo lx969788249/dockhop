@@ -205,16 +205,13 @@ func runOut(env *Env, opts OutOptions) error {
 			return err
 		}
 		t.screen.Problem(err.Error(), "")
-		return errReported
+		return ui.ErrReported
 	}
 	err = backup.Run(env.Context, backup.Deps{
 		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
 		Home: t.home, Version: env.Version, Getenv: env.Getenv,
 	}, backup.Options{Include: opts.Include, StopShared: opts.StopShared, Port: opts.Port, Host: opts.Host})
 	t.finish(err)
-	if errors.Is(err, backup.ErrReported) {
-		return errReported
-	}
 	return err
 }
 
@@ -244,7 +241,7 @@ func runIn(env *Env, opts InOptions) error {
 		var le *crypto.LinkError
 		if errors.As(err, &le) {
 			env.screen.Problem(err.Error(), "")
-			return errReported
+			return ui.ErrReported
 		}
 		return err
 	}
@@ -264,14 +261,8 @@ func runIn(env *Env, opts InOptions) error {
 	}, restore.Options{Link: link, Yes: opts.Yes, Existing: opts.Existing, KeepSucceeded: opts.KeepSucceeded})
 	t.finish(err)
 	wait()
-	if errors.Is(err, restore.ErrReported) {
-		return errReported
-	}
 	return err
 }
-
-// errReported 表示错误已经显示过了，只需要返回失败的退出码。
-var errReported = errors.New("已显示")
 
 func exitCode(err error, stderr io.Writer) int {
 	if err == nil {
@@ -293,7 +284,7 @@ func exitCode(err error, stderr io.Writer) int {
 	case errors.Is(err, io.EOF):
 		fmt.Fprintln(stderr, "\n已取消。")
 		return ExitInterrupted
-	case errors.Is(err, errReported), errors.Is(err, flag.ErrHelp):
+	case errors.Is(err, ui.ErrReported), errors.Is(err, flag.ErrHelp):
 		return ExitFailed
 	default:
 		fmt.Fprintln(stderr, "✗ "+err.Error())

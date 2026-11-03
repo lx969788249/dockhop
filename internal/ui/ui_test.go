@@ -394,15 +394,19 @@ func TestStepFailedWhenInterrupted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var out bytes.Buffer
 	s := New(&out, false, nil).WithContext(ctx)
-	s.StepFailed("读取 Docker 信息失败", "")
-	if s.Failure() == nil || !strings.Contains(out.String(), "✗ 读取 Docker 信息失败") {
-		t.Fatalf("没打断时应显示失败：%q", out.String())
+	err := s.StepFailed("读取 Docker 信息失败", "permission denied", "")
+	if !errors.Is(err, ErrReported) || s.Failure() == nil || !strings.Contains(out.String(), "✗ 读取 Docker 信息失败：permission denied") {
+		t.Fatalf("没打断时应显示失败：%v %q", err, out.String())
 	}
 	out.Reset()
 	s = New(&out, false, nil).WithContext(ctx)
 	cancel()
-	s.StepFailed("读取 Docker 信息失败：context canceled", "")
-	if s.Failure() != nil || out.Len() != 0 {
-		t.Fatalf("被打断时不应显示失败：%q", out.String())
+	err = s.StepFailed("读取 Docker 信息失败", "context canceled", "")
+	if !errors.Is(err, ErrReported) || s.Failure() != nil || out.Len() != 0 {
+		t.Fatalf("被打断时不应显示失败：%v %q", err, out.String())
+	}
+	var none *Screen
+	if err := none.StepFailed("x", "", ""); !errors.Is(err, ErrReported) {
+		t.Fatalf("没有屏幕时也应返回 ErrReported：%v", err)
 	}
 }

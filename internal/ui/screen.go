@@ -8,6 +8,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -313,15 +314,26 @@ func (s *Screen) Error(reason, hint string) {
 	s.keep(s.color(red, "✗") + " " + reason)
 }
 
-// StepFailed 报告当前步骤失败，和 Error 一样。只是用户已经按了 Ctrl+C（WithContext 给的 context
-// 已取消）时，这一步是被打断的，失败只是结果：只写进日志，不显示、不算失败原因，结果里会说
-// 已取消或已中断。被打断以后还得让用户知道的问题（例如停下的容器没能恢复）用 Error。
-func (s *Screen) StepFailed(reason, hint string) {
-	if s.ctx != nil && s.ctx.Err() != nil {
-		s.log.Printf("被打断：%s", reason)
-		return
+// ErrReported 表示失败原因已经显示过（当场一行，结果摘要里再写一遍），调用方只需返回失败的退出码。
+var ErrReported = errors.New("已显示")
+
+// StepFailed 报告当前步骤失败（detail 是出错的细节，和 reason 不同时接在后面），返回 ErrReported：
+// 步骤里出错时 return s.StepFailed(…)。和 Error 一样显示，只是用户已经按了 Ctrl+C（WithContext
+// 给的 context 已取消）时，这一步是被打断的，失败只是结果：只写进日志，不显示、不算失败原因，
+// 结果里会说已取消或已中断。被打断以后还得让用户知道的问题（例如停下的容器没能恢复）用 Error。
+// 没有屏幕（s 为 nil）时只返回 ErrReported。
+func (s *Screen) StepFailed(reason, detail, hint string) error {
+	if detail != "" && detail != reason {
+		reason += "：" + detail
 	}
-	s.Error(reason, hint)
+	switch {
+	case s == nil:
+	case s.ctx != nil && s.ctx.Err() != nil:
+		s.log.Printf("被打断：%s", reason)
+	default:
+		s.Error(reason, hint)
+	}
+	return ErrReported
 }
 
 // Problem 显示一个没法继续的问题和建议，用在不会再有结果摘要的地方

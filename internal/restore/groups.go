@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -304,12 +305,12 @@ func (r *run) commitPartial(ctx context.Context, ok, failed []*group) error {
 			continue
 		}
 		if err := restoreState(ctx, r.Docker, e.ID, e.State); err != nil {
-			return fail(s, "新服务已验证，但临时停下的容器 "+e.Name+" 没能恢复", err.Error(), "")
+			return s.StepFailed("新服务已验证，但临时停下的容器 "+e.Name+" 没能恢复", err.Error(), "")
 		}
 	}
 	entries, err := readJournal(r.rbDir)
 	if err != nil {
-		return fail(s, "事务日志读不了", err.Error(), "")
+		return s.StepFailed("事务日志读不了", err.Error(), "")
 	}
 	var keep, drop []Entry
 	for _, e := range entries {
@@ -321,7 +322,7 @@ func (r *run) commitPartial(ctx context.Context, ok, failed []*group) error {
 	}
 	r.j.close()
 	if err := rewriteJournal(r.rbDir, drop); err != nil {
-		return fail(s, "写入事务日志失败", err.Error(), "")
+		return s.StepFailed("写入事务日志失败", err.Error(), "")
 	}
 	// 从这里开始，保留下来的组就算迁入完成了，不再整体删除。
 	r.committed, r.partial = true, true
@@ -448,12 +449,12 @@ func (r *run) skipDone(ctx context.Context) {
 	for _, c := range st.Containers {
 		switch {
 		case c.Project != "":
-			if projectOK[c.Project] && !has(r.d.SkipProjects, c.Project) {
+			if projectOK[c.Project] && !slices.Contains(r.d.SkipProjects, c.Project) {
 				r.d.SkipProjects = append(r.d.SkipProjects, c.Project)
 				r.done = append(r.done, "Compose 项目 "+c.Project)
 			}
 		case alive[c.Name]:
-			if !has(r.d.SkipContainers, c.Name) {
+			if !slices.Contains(r.d.SkipContainers, c.Name) {
 				r.d.SkipContainers = append(r.d.SkipContainers, c.Name)
 				r.done = append(r.done, c.Name)
 			}
@@ -462,4 +463,13 @@ func (r *run) skipDone(ctx context.Context) {
 	if len(r.done) > 0 {
 		r.Screen.Info("上次已经迁入、这次跳过：%s", strings.Join(r.done, "、"))
 	}
+}
+
+func (r *run) projectRestored(name string) bool {
+	for _, p := range r.projects {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
 }

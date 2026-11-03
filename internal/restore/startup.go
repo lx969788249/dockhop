@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/spec"
+	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 // 启动一组服务：组里的每个 Compose 项目、每个独立容器是一个“启动单位”。单位之间的依赖分三种，
@@ -571,4 +573,128 @@ func (r *run) startProject(ctx context.Context, u *unit) error {
 		}
 	}
 	return nil
+}
+
+func (r *run) startServices(ctx context.Context) error {
+	// 先建好所有独立网络，再启动 Compose 项目：Compose 自动分配网段时会占用第一个空闲网段，
+	// 可能正是独立网络在旧服务器上用的网段。
+	for _, n := range r.m.Networks {
+		g := r.groupByID(r.groupOf["n:"+n])
+		if g == nil || g.reason != "" || n == "bridge" || n == "host" || n == "none" {
+			continue // 没有要迁入的容器用它
+		}
+		r.in("n:" + n)
+		raw, err := os.ReadFile(filepath.Join(r.dataDir, "networks", n+".json"))
+		if err != nil {
+			r.groupFailed(g, "迁移包里缺少网络 "+n+" 的配置："+err.Error(), "")
+			continue
+		}
+		var meta struct {
+			Labels map[string]string `json:"Labels"`
+		}
+		_ = json.Unmarshal(raw, &meta)
+		if proj := meta.Labels["com.docker.compose.project"]; proj != "" && r.projectRestored(proj) && meta.Labels["com.docker.compose.network"] != "" {
+			continue // 交给 Compose 按项目文件创建
+		}
+		if err := r.ensureNetwork(ctx, n, raw); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			r.groupFailed(g, err.Error(), "检查是否和新服务器上已有网络的网段冲突")
+		}
+	}
+
+	// 一组没能启动时，接着启动其他组，最后再决定怎么处理。
+	total, n := 0, 0
+	for _, it := range r.items {
+		if it.m.Project == "" || !r.projectRestored(it.m.Project) {
+			total++
+		}
+	}
+	for _, g := range r.groups {
+		if g.reason != "" {
+			continue
+		}
+		if err := r.startGroup(ctx, g, &n, total); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			r.groupFailed(g, err.Error(), groupHint(err))
+		}
+	}
+	r.in("")
+	ok, failed := r.splitGroups()
+	switch {
+	case len(failed) == 0:
+		return nil
+	case len(ok) == 0:
+		return ui.ErrReported
+	}
+	keep, err := r.decidePartial(ok, failed)
+	if err != nil || !keep {
+		return ui.ErrReported
+	}
+	return nil
+}
+
+// startError 是一组服务没能启动的原因和建议。
+type startError struct{ reason, hint string }
+
+func (e *startError) Error() string { return e.reason }
+
+func groupHint(err error) string {
+	var se *startError
+	if errors.As(err, &se) {
+		return se.hint
+	}
+	return ""
+}
+
+// groupFailed 记下一组没能启动，并显示原因。
+func (r *run) groupFailed(g *group, reason, hint string) {
+	g.reason = reason
+	if len(r.groups) > 1 {
+		r.Log.Printf("这一组没能启动：%s", g.label())
+	}
+	_ = r.Screen.StepFailed(reason, "", hint)
+}
+
+// replicas 是服务 svc 在旧服务器上的容器，按副本编号排好。
+func replicas(items []*citem, svc string) []*citem {
+	var out []*citem
+	for _, it := range items {
+		if it.m.Service == svc {
+			out = append(out, it)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return replicaNumber(out[i].c.Config.Labels) < replicaNumber(out[j].c.Config.Labels)
+	})
+	return out
+}
+
+// replicaNumber 是 Compose 给容器记的副本编号（com.docker.compose.container-number）。
+func replicaNumber(labels map[string]string) int {
+	n, _ := strconv.Atoi(labels["com.docker.compose.container-number"])
+	return n
+}
+
+func uniqueServices(items []*citem) []string {
+	var out []string
+	for _, it := range items {
+		out = append(out, it.m.Service)
+	}
+	return uniq(out)
+}
+
+func uniq(list []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, v := range list {
+		if v != "" && !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	return out
 }
