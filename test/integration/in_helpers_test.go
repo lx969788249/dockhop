@@ -176,6 +176,9 @@ func noLeftovers(t *testing.T, home string) {
 	// 只有日志、重试用的下载和记录。
 	entries, _ := os.ReadDir(home)
 	for _, e := range entries {
+		if !e.IsDir() {
+			continue // 测试用的暂停标记（test-paused-*），平时不会有
+		}
 		inside, _ := os.ReadDir(filepath.Join(home, e.Name()))
 		if e.Name() == "bin" || e.Name() == "locks" || len(inside) == 0 {
 			t.Errorf("DockHop 的目录里不应留下 %s：%v", e.Name(), inside)
