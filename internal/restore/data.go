@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -48,7 +49,7 @@ func (r *run) restoreData(ctx context.Context) error {
 		}
 		entry := Entry{Op: opVolume, Name: v.Name, Existed: existed}
 		if existed {
-			if volumeDriver(cur.Driver) != volumeDriver(meta.Driver) || !sameLabels(cur.Options, meta.Options) {
+			if volumeDriver(cur.Driver) != volumeDriver(meta.Driver) || !maps.Equal(cur.Options, meta.Options) {
 				return s.StepFailed("新服务器上已有同名、但存储方式不同的数据卷 "+v.Name+"，拒绝覆盖", "",
 					"确认新服务器上的这个卷可以删除后，执行 docker volume rm "+v.Name+" 再重试")
 			}

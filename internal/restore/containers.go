@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -473,7 +474,7 @@ func (r *run) ensureNetwork(ctx context.Context, name string, raw json.RawMessag
 		if driverName(cur.Driver) != driverName(n.Driver) || !sameSubnets(cur.IPAM.Config, n.IPAM.Config) && !r.d.AutoSubnetFor(name) {
 			return fmt.Errorf("新服务器上已有同名网络 %s，但设置和旧服务器不同；为了不影响用它的其他容器，没有改动它", name)
 		}
-		if !sameLabels(cur.Labels, n.Labels) {
+		if !maps.Equal(cur.Labels, n.Labels) {
 			r.Screen.Warn("网络 %s 已存在，只是标签和旧服务器不同，直接沿用，不做修改", name)
 		}
 		return nil
@@ -521,16 +522,4 @@ func subnets(cfg []docker.IPAMConfig) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-func sameLabels(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
-	return true
 }

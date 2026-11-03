@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -190,7 +191,7 @@ func TestEvaluateKeptData(t *testing.T) {
 	d := &Decisions{SkipContainers: []string{"web"}}
 	r := &Runner{Screen: ui.New(io.Discard, false, nil), Prompt: ui.NewPrompter(strings.NewReader("1\n1\n"), io.Discard),
 		Collect: func() (*Target, error) { return tg, nil }}
-	if _, err := r.Run(p, d, Options{}); err != nil || !d.SkippedContainer(p.Containers[1]) || !has(d.SkipProjects, "site") {
+	if _, err := r.Run(p, d, Options{}); err != nil || !d.SkippedContainer(p.Containers[1]) || !slices.Contains(d.SkipProjects, "site") {
 		t.Fatalf("选择一起跳过之后应能继续：%v %+v", err, d)
 	}
 }
@@ -223,6 +224,13 @@ func TestEvaluateNetworksAndVolumes(t *testing.T) {
 	tg.Volumes["data"] = &docker.Volume{Name: "data", Driver: "local"}
 	if i := find(Evaluate(testPlan(), tg, &Decisions{}, Options{}), "volume_replace"); i == nil || i.Level != Info {
 		t.Error("同名同存储方式的卷只提示会替换")
+	}
+	// 选项条数一样、名字不同：值都是空的也是不同的存储方式（以前会当成一样）。
+	tg.Volumes["data"] = &docker.Volume{Name: "data", Driver: "local", Options: map[string]string{"device": ""}}
+	p := testPlan()
+	p.Volumes[0].Opts = map[string]string{"type": ""}
+	if find(Evaluate(p, tg, &Decisions{}, Options{}), "volume_mismatch") == nil {
+		t.Error("同名卷的选项名字不同时应询问")
 	}
 }
 
@@ -275,7 +283,7 @@ func TestRunnerAuto(t *testing.T) {
 	if _, err := r.Run(testPlan(), d, Options{}); err != nil {
 		t.Fatalf("--yes 应自动处理：%v\n%s", err, out.String())
 	}
-	if len(d.Ports) != 1 || d.Ports[0].NewPort != "81" || !has(d.ReplaceContainers, "web") {
+	if len(d.Ports) != 1 || d.Ports[0].NewPort != "81" || !slices.Contains(d.ReplaceContainers, "web") {
 		t.Errorf("自动处理的结果：%+v", d)
 	}
 	sum := strings.Join(d.Summary(), "\n")
@@ -508,7 +516,7 @@ func TestComposeFixedIPNotAuto(t *testing.T) {
 	d = &Decisions{}
 	ask := &Runner{Screen: ui.New(io.Discard, false, nil), Prompt: ui.NewPrompter(strings.NewReader("2\n1\n"), io.Discard),
 		Collect: func() (*Target, error) { return tg, nil }}
-	if _, err := ask.Run(p, d, Options{}); err != nil || !has(d.SkipProjects, "app") || !d.AutoIPFor("solo", "ext") {
+	if _, err := ask.Run(p, d, Options{}); err != nil || !slices.Contains(d.SkipProjects, "app") || !d.AutoIPFor("solo", "ext") {
 		t.Fatalf("跳过项目后，独立容器改为自动分配：%v %+v", err, d)
 	}
 }

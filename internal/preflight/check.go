@@ -13,8 +13,10 @@ package preflight
 
 import (
 	"fmt"
+	"maps"
 	"net"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -96,17 +98,8 @@ type Decisions struct {
 	Skipped           []Skip       `json:"skipped,omitempty"`
 }
 
-func has(list []string, v string) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
 func add(list []string, v string) []string {
-	if has(list, v) {
+	if slices.Contains(list, v) {
 		return list
 	}
 	return append(list, v)
@@ -114,7 +107,7 @@ func add(list []string, v string) []string {
 
 // Skipped 表示容器（或它所在的项目）是否按选择跳过。
 func (d *Decisions) SkippedContainer(c bundle.PlanContainer) bool {
-	return has(d.SkipContainers, c.Name) || (c.Project != "" && has(d.SkipProjects, c.Project))
+	return slices.Contains(d.SkipContainers, c.Name) || (c.Project != "" && slices.Contains(d.SkipProjects, c.Project))
 }
 
 // AutoIPFor 表示容器在这个网络里是否改为自动分配 IP（单独选择、网段改为自动、沿用已有网络时都是）。
@@ -124,7 +117,7 @@ func (d *Decisions) AutoIPFor(container, network string) bool {
 			return true
 		}
 	}
-	return has(d.AutoSubnet, network) || has(d.ReuseNetwork, network)
+	return slices.Contains(d.AutoSubnet, network) || slices.Contains(d.ReuseNetwork, network)
 }
 
 // currentPort 是端口映射现在的样子：调整过就是调整后的，否则就是原来的。处理一个问题时
@@ -147,16 +140,18 @@ func (d *Decisions) PortFor(r PortRef) (PortChange, bool) {
 }
 
 // UseBundleImage 表示这个 digest 固定的镜像是否改用迁移包里的镜像。
-func (d *Decisions) UseBundleImage(ref string) bool { return has(d.BundleImages, ref) }
+func (d *Decisions) UseBundleImage(ref string) bool { return slices.Contains(d.BundleImages, ref) }
 
 // KeepVolume 表示是否保留新服务器上已有的这个卷、不写入迁移过来的数据。
-func (d *Decisions) KeepVolume(name string) bool { return has(d.KeepVolumes, name) }
+func (d *Decisions) KeepVolume(name string) bool { return slices.Contains(d.KeepVolumes, name) }
 
 // ReuseExisting 表示是否沿用新服务器上已有的同名网络。
-func (d *Decisions) ReuseExisting(network string) bool { return has(d.ReuseNetwork, network) }
+func (d *Decisions) ReuseExisting(network string) bool {
+	return slices.Contains(d.ReuseNetwork, network)
+}
 
 // AutoSubnetFor 表示网络是否改为让 Docker 自动选择网段。
-func (d *Decisions) AutoSubnetFor(network string) bool { return has(d.AutoSubnet, network) }
+func (d *Decisions) AutoSubnetFor(network string) bool { return slices.Contains(d.AutoSubnet, network) }
 
 // Options 是检查的选项。
 type Options struct {
@@ -288,7 +283,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		if !ok {
 			continue
 		}
-		if has(d.ReplaceContainers, c.Name) {
+		if slices.Contains(d.ReplaceContainers, c.Name) {
 			continue
 		}
 		switch o.Existing {
@@ -316,7 +311,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		if !t.Projects[p] {
 			continue
 		}
-		if has(d.ReplaceProjects, p) {
+		if slices.Contains(d.ReplaceProjects, p) {
 			continue
 		}
 		switch o.Existing {
@@ -344,7 +339,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		if !ok {
 			continue
 		}
-		if driverOf(cur.Driver) != driverOf(v.Driver) || !sameMap(cur.Options, v.Opts) {
+		if driverOf(cur.Driver) != driverOf(v.Driver) || !maps.Equal(cur.Options, v.Opts) {
 			addIssue(Issue{Level: Ask, Kind: "volume_mismatch", Volume: v.Name,
 				Title: "新服务器已有同名数据卷 " + v.Name + "，但它的存储方式和旧服务器不同"})
 		} else {
@@ -375,10 +370,12 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 // 或者 --existing skip）不迁入，但共用数据的其他容器迁入时会写入它的卷和目录，等于没保住
 // 它的数据。保留的服务用到的数据按新服务器上它实际挂载的、加上旧服务器上同名服务挂载的算。
 func keptDataIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, addIssue func(Issue)) {
-	keptProject := func(p string) bool { return t.Projects[p] && (has(d.SkipProjects, p) || o.Existing == "skip") }
+	keptProject := func(p string) bool {
+		return t.Projects[p] && (slices.Contains(d.SkipProjects, p) || o.Existing == "skip")
+	}
 	keptContainer := func(name string) bool {
 		_, ok := t.Containers[name]
-		return ok && (has(d.SkipContainers, name) || o.Existing == "skip")
+		return ok && (slices.Contains(d.SkipContainers, name) || o.Existing == "skip")
 	}
 	kept := func(c bundle.PlanContainer) bool {
 		if c.Project != "" {
@@ -623,9 +620,9 @@ func portIssues(t *Target, d *Decisions, containers []bundle.PlanContainer, plan
 			return false
 		}
 		if tc := t.Containers[name]; tc.Project != "" {
-			return planProjects[tc.Project] && !has(d.SkipProjects, tc.Project)
+			return planProjects[tc.Project] && !slices.Contains(d.SkipProjects, tc.Project)
 		}
-		return planNames[name] && !has(d.SkipContainers, name)
+		return planNames[name] && !slices.Contains(d.SkipContainers, name)
 	}
 	requested := map[string][]binding{} // 协议/端口 → 迁移包里要用它的容器
 	for _, c := range containers {
@@ -797,18 +794,6 @@ func driverOf(d string) string {
 		return "local"
 	}
 	return d
-}
-
-func sameMap(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
-	return true
 }
 
 func sameSet(a, b []string) bool {
