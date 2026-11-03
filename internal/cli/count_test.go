@@ -67,7 +67,7 @@ func TestMenuShowsCount(t *testing.T) {
 			Getenv: func(k string) string { return vars[k] }, HomeDir: func() (string, error) { return t.TempDir(), nil }})
 		return errb.String(), time.Since(start)
 	}
-	if out, _ := menu(srv.URL + "?case=ok"); !strings.Contains(out, "已成功完成迁移：") || !strings.Contains(out, "1234") {
+	if out, _ := menu(srv.URL + "?case=ok"); !strings.Contains(out, "已协助完成迁移：") || !strings.Contains(out, "1234") {
 		t.Errorf("应显示次数：%q", out)
 	}
 	for _, c := range []string{"quota", "html", "slow", "closed"} {
@@ -76,7 +76,7 @@ func TestMenuShowsCount(t *testing.T) {
 			url = "http://127.0.0.1:1/count"
 		}
 		out, took := menu(url)
-		if strings.Contains(out, "已成功完成迁移") || !strings.Contains(out, "1. 迁出") || took > 2500*time.Millisecond {
+		if strings.Contains(out, "已协助完成迁移") || !strings.Contains(out, "1. 迁出") || took > 2500*time.Millisecond {
 			t.Errorf("%s：不应显示次数，菜单照常出来（用时 %s）：%q", c, took, out)
 		}
 	}
@@ -84,7 +84,7 @@ func TestMenuShowsCount(t *testing.T) {
 	// 通过一行命令运行时，run.sh 把 dockhop.run 填好的次数交过来：直接显示，不再去问（地址连不上
 	// 也照样显示）；交来的不是数字时照常去读；关了统计时照样不显示。
 	vars = map[string]string{"DOCKHOP_COUNT": "42"}
-	if out, took := menu("http://127.0.0.1:1/count"); !strings.Contains(out, "已成功完成迁移：") || !strings.Contains(out, "42") || took > time.Second {
+	if out, took := menu("http://127.0.0.1:1/count"); !strings.Contains(out, "已协助完成迁移：") || !strings.Contains(out, "42") || took > time.Second {
 		t.Errorf("应直接显示交来的次数（用时 %s）：%q", took, out)
 	}
 	vars = map[string]string{"DOCKHOP_COUNT": "abc"}
@@ -92,7 +92,7 @@ func TestMenuShowsCount(t *testing.T) {
 		t.Errorf("交来的不是数字时应照常去读：%q", out)
 	}
 	vars = map[string]string{"DOCKHOP_COUNT": "42", "DOCKHOP_NO_STATS": "1"}
-	if out, _ := menu("http://127.0.0.1:1/count"); strings.Contains(out, "已成功完成迁移") {
+	if out, _ := menu("http://127.0.0.1:1/count"); strings.Contains(out, "已协助完成迁移") {
 		t.Errorf("关了统计时不应显示：%q", out)
 	}
 

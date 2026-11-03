@@ -181,7 +181,7 @@ func menu(env *Env) error {
 	n := migrations(env)
 	env.screen.Start()
 	if n > 0 {
-		env.screen.Println(" 已成功完成迁移：" + env.screen.Green(strconv.Itoa(n)) + " 次\n")
+		env.screen.Println(" 已协助完成迁移：" + env.screen.Green(strconv.Itoa(n)) + " 次\n")
 	}
 	choice, err := env.prompt.Choose([]string{"迁出", "迁入"})
 	if err != nil {
