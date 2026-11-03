@@ -5,16 +5,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -399,6 +403,8 @@ func TestUndoTag(t *testing.T) {
 			io.WriteString(w, `{"Id":"sha256:migrated-app"}`)
 		case req.Method == "GET" && p == "/images/same:1/json":
 			io.WriteString(w, `{"Id":"sha256:same"}`)
+		case req.Method == "GET" && p == "/images/sha256:migrated/json":
+			io.WriteString(w, `{"Id":"sha256:migrated","RepoTags":[]}`) // 名字改回去之后，它没有名字了
 		case req.Method == "POST" && strings.HasSuffix(p, "/tag"):
 			tagged = append(tagged, p+"?"+req.URL.RawQuery)
 			w.WriteHeader(201)
@@ -425,5 +431,189 @@ func TestUndoTag(t *testing.T) {
 	}
 	if strings.Join(removed, ",") != "/images/app:dev,/images/sha256:migrated" {
 		t.Errorf("删掉的：%v", removed)
+	}
+}
+
+// 原来的两个 Compose 项目：zside 的 sidecar 借用 avpn 的 vpn 的网络。回滚时不管它们在日志里谁先
+// 谁后，都要先重建、启动 vpn，再重建、启动 sidecar：Docker 要求被借用网络的容器先存在、先在运行。
+func TestRollbackRestoresAcrossProjects(t *testing.T) {
+	vpnID, sideID := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	raw := func(id, name, mode string) json.RawMessage {
+		b, _ := json.Marshal(map[string]any{"Id": id, "Name": "/" + name, "Image": "sha256:original",
+			"Config": map[string]any{"Image": "alpine"}, "HostConfig": map[string]any{"NetworkMode": mode}})
+		return b
+	}
+	old := map[string]OldContainer{
+		"avpn":  {ID: vpnID, Name: "avpn-vpn-1", State: "running", Raw: raw(vpnID, "avpn-vpn-1", "bridge")},
+		"zside": {ID: sideID, Name: "zside-sidecar-1", State: "running", Raw: raw(sideID, "zside-sidecar-1", "container:"+vpnID)},
+	}
+	for _, order := range [][]string{{"avpn", "zside"}, {"zside", "avpn"}} {
+		t.Run(strings.Join(order, "-"), func(t *testing.T) {
+			type box struct {
+				mode    string
+				running bool
+			}
+			live := map[string]*box{} // 名字 → 新服务器上的容器
+			var events []string
+			dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+				p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+				ref := strings.Split(strings.TrimPrefix(p, "/containers/"), "/")[0]
+				switch {
+				case strings.HasPrefix(p, "/images/"):
+					io.WriteString(w, `{"Id":"sha256:original"}`)
+				case p == "/containers/create":
+					var body struct{ HostConfig struct{ NetworkMode string } }
+					json.NewDecoder(req.Body).Decode(&body)
+					if peer, ok := strings.CutPrefix(body.HostConfig.NetworkMode, "container:"); ok && live[peer] == nil {
+						http.Error(w, `{"message":"No such container: `+peer+`"}`, 404)
+						return true
+					}
+					name := req.URL.Query().Get("name")
+					live[name] = &box{mode: body.HostConfig.NetworkMode}
+					events = append(events, "建 "+name)
+					io.WriteString(w, `{"Id":"`+name+`"}`)
+				case live[ref] == nil:
+					http.Error(w, `{"message":"No such container"}`, 404)
+				case req.Method == "GET":
+					fmt.Fprintf(w, `{"Id":%q,"Name":"/%s","State":{"Running":%t}}`, ref, ref, live[ref].running)
+				case strings.HasSuffix(p, "/start"):
+					if peer, ok := strings.CutPrefix(live[ref].mode, "container:"); ok && (live[peer] == nil || !live[peer].running) {
+						http.Error(w, `{"message":"cannot join network of a non running container"}`, http.StatusConflict)
+						return true
+					}
+					live[ref].running = true
+					events = append(events, "启动 "+ref)
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					return false
+				}
+				return true
+			})
+			var entries []Entry
+			for _, p := range order {
+				entries = append(entries, Entry{Op: opComposeOld, Name: p, Old: []OldContainer{old[p]}})
+			}
+			var out bytes.Buffer
+			u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+			problems := u.rollback(context.Background(), entries)
+			if len(problems) > 0 || strings.Join(events, "，") != "建 avpn-vpn-1，建 zside-sidecar-1，启动 avpn-vpn-1，启动 zside-sidecar-1" {
+				t.Fatalf("顺序：%v；问题：%v", events, problems)
+			}
+		})
+	}
+}
+
+// images 是一个按 Docker 的规则管镜像名的假 Docker：按 ID 删镜像时，它只剩一个名字就连名字一起删，
+// 有几个名字就拒绝；按名字删时去掉这个名字，镜像没有名字了就一起删。
+type images struct {
+	mu      sync.Mutex
+	tags    map[string]string // 名字 → 镜像 ID
+	ids     map[string]bool
+	deleted []string
+}
+
+func (d *images) docker(t *testing.T) *docker.Client {
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		ref, ok := strings.CutPrefix(strings.TrimPrefix(req.URL.Path, "/v1.44"), "/images/")
+		if !ok {
+			return false
+		}
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		namesOf := func(id string) []string {
+			var out []string
+			for name, x := range d.tags {
+				if x == id {
+					out = append(out, name)
+				}
+			}
+			return out
+		}
+		switch {
+		case req.Method == "GET" && ref == "json":
+			var list []map[string]string
+			for id := range d.ids {
+				list = append(list, map[string]string{"Id": id})
+			}
+			b, _ := json.Marshal(list)
+			w.Write(b)
+		case req.Method == "GET":
+			ref = strings.TrimSuffix(ref, "/json")
+			id := d.tags[ref]
+			if id == "" && d.ids[ref] {
+				id = ref
+			}
+			if id == "" {
+				http.Error(w, `{"message":"No such image"}`, 404)
+				return true
+			}
+			b, _ := json.Marshal(map[string]any{"Id": id, "RepoTags": namesOf(id)})
+			w.Write(b)
+		case req.Method == "POST" && strings.HasSuffix(ref, "/tag"):
+			d.tags[req.URL.Query().Get("repo")+":"+req.URL.Query().Get("tag")] = strings.TrimSuffix(ref, "/tag")
+			w.WriteHeader(201)
+		case req.Method == "DELETE" && d.ids[ref]:
+			if len(namesOf(ref)) > 1 {
+				http.Error(w, `{"message":"conflict: image is referenced in multiple repositories"}`, http.StatusConflict)
+				return true
+			}
+			for _, name := range namesOf(ref) {
+				delete(d.tags, name)
+			}
+			delete(d.ids, ref)
+			d.deleted = append(d.deleted, ref)
+		case req.Method == "DELETE" && d.tags[ref] != "":
+			id := d.tags[ref]
+			delete(d.tags, ref)
+			if len(namesOf(id)) == 0 {
+				delete(d.ids, id)
+				d.deleted = append(d.deleted, id)
+			}
+		default:
+			return false
+		}
+		return true
+	})
+	return dc
+}
+
+// 回滚时镜像名改回迁入前的样子，只删这次迁入带来的镜像。迁入的镜像和这台服务器上原有的一模
+// 一样（例如原来就拉过、另有名字指向它），或者两个镜像名互相换了指向，都不能删原有的镜像：
+// 以前改回一个名字就按 ID 删它原来指向的镜像，会删掉原有的镜像，后面的名字也改不回去了。
+func TestRollbackKeepsImagesThatWereThere(t *testing.T) {
+	cases := []struct {
+		name    string
+		had     []string          // 加载镜像之前已有的镜像
+		now     map[string]string // 回滚开始时的镜像名
+		entries []Entry
+		want    map[string]string
+		deleted string
+	}{
+		{"迁入的镜像原来就有", []string{"sha256:old", "sha256:cached"},
+			map[string]string{"app:1": "sha256:cached", "cache:stable": "sha256:cached"},
+			[]Entry{{Op: opTag, Name: "app:1", ID: "sha256:old"}},
+			map[string]string{"app:1": "sha256:old", "cache:stable": "sha256:cached"}, ""},
+		{"两个名字换了指向", []string{"sha256:A", "sha256:B"},
+			map[string]string{"a:1": "sha256:B", "b:1": "sha256:A"},
+			[]Entry{{Op: opTag, Name: "a:1", ID: "sha256:A"}, {Op: opTag, Name: "b:1", ID: "sha256:B"}},
+			map[string]string{"a:1": "sha256:A", "b:1": "sha256:B"}, ""},
+		{"迁入带来的镜像", []string{"sha256:old"},
+			map[string]string{"app:1": "sha256:new", "app:latest": "sha256:new"},
+			[]Entry{{Op: opTag, Name: "app:1", ID: "sha256:old"}, {Op: opTag, Name: "app:latest"}},
+			map[string]string{"app:1": "sha256:old"}, "sha256:new"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			d := &images{tags: c.now, ids: map[string]bool{}}
+			for _, id := range append(slices.Clone(c.had), slices.Collect(maps.Values(c.now))...) {
+				d.ids[id] = true
+			}
+			var out bytes.Buffer
+			u := &undo{dc: d.docker(t), screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+			problems := u.rollback(context.Background(), append([]Entry{{Op: opImages, Names: c.had}}, c.entries...))
+			if len(problems) > 0 || !maps.Equal(d.tags, c.want) || strings.Join(d.deleted, ",") != c.deleted {
+				t.Fatalf("镜像名 %v，删掉的 %v，问题 %v", d.tags, d.deleted, problems)
+			}
+		})
 	}
 }

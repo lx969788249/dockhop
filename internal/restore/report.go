@@ -62,10 +62,14 @@ func (r *run) servicesText() string {
 	return ui.Names(names)
 }
 
+// changed 表示这次运行改动过这台服务器：开始了这次迁入的事务，或者撤销过迁入的内容（这次的，
+// 或者上次被强制结束时留下的）。
+func (r *run) changed() bool { return r.j != nil || r.rollbackDone }
+
 func (r *run) report(ctx context.Context, err error) error {
-	// 还没改动新服务器就取消了（回答问题、检查、下载时按 Ctrl+C）：不用摆出一整块失败结果。
+	// 还没改动这台服务器就取消了（回答问题、检查、下载时按 Ctrl+C）：不用摆出一整块失败结果。
 	// 按没按 Ctrl+C 看 ctx：被打断的那一步返回什么错误都有可能。
-	if (ui.Canceled(err) || ctx.Err() != nil) && r.j == nil {
+	if (ui.Canceled(err) || ctx.Err() != nil) && !r.changed() {
 		msg := "\n已取消，这台服务器上什么都没有改动。"
 		if r.downloaded {
 			msg += "已经下载的部分留着，用同一个链接重新迁入会接着下载。"

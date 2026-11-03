@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
@@ -33,8 +34,8 @@ type undo struct {
 //     没能做到时停下：它们可能还在写数据，这时放回的数据会被覆盖，回滚资料全部保留，交给
 //     人工处理。
 //  2. 再处理数据：删除这次写入的网络、Compose 文件、目录、数据卷，放回原有的。
-//  3. 最后放回旧服务：重建旧 Compose 容器、旧容器改回原名、启动临时停下的容器。
-//     原有的数据没能全部放回时，旧服务保持停止，以免在不完整的数据上运行。
+//  3. 最后放回旧服务：旧容器改回原名、重建旧 Compose 容器，再按依赖统一启动原来在运行的
+//     （包括临时停下的）。原有的数据没能全部放回时，旧服务保持停止，以免在不完整的数据上运行。
 func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 	var problems []string
 	note := func(format string, args ...any) {
@@ -109,6 +110,7 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 
 	// 第 2 遍：数据。
 	u.screen.Note("删除这次写入的网络、文件、目录和数据卷，放回原有的")
+	var brought, had []string // 镜像名改回去之前指向的镜像，加载镜像之前已有的镜像
 	for i := len(entries) - 1; i >= 0; i-- {
 		e := entries[i]
 		switch e.Op {
@@ -146,9 +148,14 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		case opVolume:
 			u.undoVolume(ctx, e, note)
 		case opTag:
-			u.undoTag(ctx, e, note)
+			if id := u.undoTag(ctx, e, note); id != "" {
+				brought = append(brought, id)
+			}
+		case opImages:
+			had = e.Names
 		}
 	}
+	u.removeImages(ctx, brought, had)
 	if u.fail("rollback-data") {
 		note("（测试）模拟数据没能放回")
 	}
@@ -157,83 +164,129 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		note("原有的数据没能全部放回，原来的服务保持停止，请按回滚资料人工处理")
 	}
 
-	// 第 3 遍：旧服务。
+	// 第 3 遍：旧服务。先全部放回去：旧容器改回原名，再重建原来的 Compose 容器（改回原名之后，
+	// 按名字引用它们的才找得到）；最后按依赖统一启动原来在运行的，被借用网络等的先启动。依赖可能
+	// 跨项目、跨独立容器（例如一个项目借用另一个项目的容器的网络），按日志一条一条地放回、启动，
+	// 会把用到别人的排在前面，它就启动不了。
 	u.screen.Note("放回新服务器上原来的服务")
 	images := map[string]string{}
-	oldNames := map[string]string{}
+	oldNames := map[string]string{} // 原来的 Compose 容器：ID → 名字
+	names := map[string]string{}    // 要放回、要启动的全部容器：ID → 名字
+	var olds []OldContainer
 	for _, e := range entries {
 		for k, v := range e.Images {
 			images[k] = v
 		}
 		for _, o := range e.Old {
-			oldNames[o.ID] = o.Name
+			oldNames[o.ID], names[o.ID] = o.Name, o.Name
+			olds = append(olds, o)
+		}
+		if e.Op == opStop || e.Op == opRename {
+			names[e.ID] = e.Name
 		}
 	}
-	// 原来的 Compose 容器删除、重建之后 ID 就变了：它们之间按 ID 的引用（借用网络的
-	// container:<ID> 等）改成按名字。
-	nameOf := func(ref string) string {
-		for id, name := range oldNames {
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].Op == opRename {
+			u.undoRename(ctx, entries[i], note)
+		}
+	}
+	type revive struct {
+		name, id, state string
+		deps            []string
+	}
+	var revives []revive
+	depsOf := func(c *docker.Container) []string { return containerDeps(c, nameIn(names)) }
+	conf := map[string]*docker.Container{}
+	for _, o := range olds {
+		conf[o.Name] = &docker.Container{}
+		_ = json.Unmarshal(o.Raw, conf[o.Name])
+	}
+	for _, o := range dependencyOrder(olds, func(o OldContainer) string { return o.Name },
+		func(o OldContainer) []string { return depsOf(conf[o.Name]) }) {
+		if id := u.undoOldCompose(ctx, o, images[o.ID], nameIn(oldNames), note); id != "" {
+			revives = append(revives, revive{o.Name, id, o.State, depsOf(conf[o.Name])})
+		}
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		if e := entries[i]; e.Op == opStop {
+			var deps []string
+			if c, _, err := u.dc.InspectContainer(ctx, e.ID); err == nil {
+				deps = depsOf(c)
+			}
+			revives = append(revives, revive{e.Name, e.ID, e.State, deps})
+		}
+	}
+	if !dataOK {
+		return problems
+	}
+	for _, v := range dependencyOrder(revives, func(v revive) string { return v.name }, func(v revive) []string { return v.deps }) {
+		if err := restoreState(ctx, u.dc, v.id, v.state); err != nil {
+			note("原来的容器 %s 没能恢复原来的状态（%s）：%v", v.name, v.state, err)
+		}
+	}
+	return problems
+}
+
+// nameIn 返回按 ids（ID → 名字）把引用的 ID（或它的前缀）换成名字的函数：原来的 Compose 容器
+// 删除、重建之后 ID 就变了，它们之间按 ID 的引用（借用网络的 container:<ID> 等）要改成按名字。
+func nameIn(ids map[string]string) func(string) string {
+	return func(ref string) string {
+		for id, name := range ids {
 			if id == ref || len(ref) >= 12 && strings.HasPrefix(id, ref) {
 				return name
 			}
 		}
 		return ""
 	}
-	for i := len(entries) - 1; i >= 0; i-- {
-		e := entries[i]
-		switch e.Op {
-		case opComposeOld:
-			// 被借用网络等的容器先重建、先启动。
-			conf := map[string]*docker.Container{}
-			for _, o := range e.Old {
-				conf[o.Name] = &docker.Container{}
-				_ = json.Unmarshal(o.Raw, conf[o.Name])
-			}
-			for _, o := range dependencyOrder(e.Old, func(o OldContainer) string { return o.Name },
-				func(o OldContainer) []string { return containerDeps(conf[o.Name], nameOf) }) {
-				u.undoOldCompose(ctx, o, images[o.ID], dataOK, nameOf, note)
-			}
-		case opRename:
-			u.undoRename(ctx, e, note)
-		case opStop:
-			if dataOK {
-				if err := restoreState(ctx, u.dc, e.ID, e.State); err != nil {
-					note("容器 %s 没能恢复原来的状态（%s）：%v", e.Name, e.State, err)
-				}
-			}
-		}
-	}
-	return problems
 }
 
-// undoTag 把镜像名改回迁入前指向的镜像，原来没有的名字删掉。这次迁入进来的镜像因此没有了
-// 名字、也没有容器在用时一起删掉；还有别的名字或者有容器在用的留着（Docker 不让删）。
-func (u *undo) undoTag(ctx context.Context, e Entry, note func(string, ...any)) {
+// undoTag 把镜像名改回迁入前指向的镜像，原来没有的名字删掉（它是镜像最后一个名字、又没有
+// 容器在用时，Docker 会连镜像一起删）。返回改回去之前这个名字指向的镜像，等名字都改回去之后
+// 再看它要不要删（见 removeImages）：现在删，后面要改回去的名字可能正好要用它；没改动时为空。
+func (u *undo) undoTag(ctx context.Context, e Entry, note func(string, ...any)) string {
 	cur, err := u.dc.InspectImage(ctx, e.Name)
 	switch {
 	case docker.IsNotFound(err):
 		if e.ID == "" {
-			return // 已经删掉了（之前撤销过）
+			return "" // 已经删掉了（之前撤销过）
 		}
 	case err != nil:
 		note("读不到镜像 %s：%v", e.Name, err)
-		return
+		return ""
 	case cur.ID == e.ID:
-		return // 还指向原来的镜像（没来得及改，或者之前撤销过）
+		return "" // 还指向原来的镜像（没来得及改，或者之前撤销过）
 	}
 	if e.ID == "" {
 		if err := u.dc.RemoveImage(ctx, e.Name); err != nil && !docker.IsNotFound(err) {
 			u.logf("回滚：镜像名 %s 有容器在用，保留：%v", e.Name, err)
 		}
-		return
+		return ""
 	}
 	repo, tag := splitTag(e.Name)
 	if err := u.dc.TagImage(ctx, e.ID, repo, tag); err != nil {
 		note("镜像名 %s 没能改回原来的镜像：%v", e.Name, err)
-		return
+		return ""
 	}
-	if cur != nil {
-		_ = u.dc.RemoveImage(ctx, cur.ID)
+	if cur == nil {
+		return ""
+	}
+	return cur.ID
+}
+
+// removeImages 删掉这次迁入带来的镜像：镜像名都改回去之后，它们原来指向的这些镜像（ids）没有
+// 名字、也没有容器在用的，就删掉。加载镜像之前这台服务器上就有的（had）一个不删，哪怕现在没有
+// 名字；按 ID 删镜像时 Docker 会连它仅剩的一个名字一起删，所以还有名字的也不删。
+func (u *undo) removeImages(ctx context.Context, ids, had []string) {
+	for _, id := range ids {
+		if slices.Contains(had, id) {
+			continue
+		}
+		if img, err := u.dc.InspectImage(ctx, id); err != nil || len(img.RepoTags) > 0 {
+			continue // 已经删掉了（同一个镜像出现了几次），或者还有名字指向它
+		}
+		if err := u.dc.RemoveImage(ctx, id); err != nil && !docker.IsNotFound(err) {
+			u.logf("回滚：镜像 %s 有容器在用，保留：%v", id, err)
+		}
 	}
 }
 
@@ -413,17 +466,11 @@ func reconnect(ctx context.Context, dc *docker.Client, id string, raw json.RawMe
 	}
 }
 
-// undoOldCompose 按记录原样重建新服务器上原有的 Compose 容器。nameOf 把配置里引用的
-// 旧 ID 换成名字。
-func (u *undo) undoOldCompose(ctx context.Context, o OldContainer, image string, dataOK bool, nameOf func(string) string, note func(string, ...any)) {
+// undoOldCompose 按记录原样重建新服务器上原有的 Compose 容器（不启动，启动见 rollback），
+// 返回它的 ID；没能重建时为空。nameOf 把配置里引用的旧 ID 换成名字。
+func (u *undo) undoOldCompose(ctx context.Context, o OldContainer, image string, nameOf func(string) string, note func(string, ...any)) string {
 	if c, _, err := u.dc.InspectContainer(ctx, o.ID); err == nil {
-		// 还没被删除：只需恢复状态。
-		if dataOK {
-			if err := restoreState(ctx, u.dc, c.ID, o.State); err != nil {
-				note("原来的容器 %s 没能恢复状态：%v", o.Name, err)
-			}
-		}
-		return
+		return c.ID // 还没被删除，只需恢复状态
 	}
 	if c, _, err := u.dc.InspectContainer(ctx, o.Name); err == nil {
 		_ = u.dc.RemoveContainerAndVolumes(ctx, c.ID)
@@ -452,23 +499,19 @@ func (u *undo) undoOldCompose(ctx context.Context, o OldContainer, image string,
 	}.Build()
 	if err != nil {
 		note("原来的容器 %s 没能重建：%v", o.Name, err)
-		return
+		return ""
 	}
 	id, err := u.dc.CreateContainer(ctx, o.Name, built.Body)
 	if err != nil {
 		note("原来的容器 %s 没能重建：%v", o.Name, err)
-		return
+		return ""
 	}
 	for _, c := range built.Connects {
 		if err := u.dc.ConnectNetwork(ctx, c.Network, id, c.Endpoint); err != nil {
 			note("原来的容器 %s 没能连上网络 %s：%v", o.Name, c.Network, err)
 		}
 	}
-	if dataOK {
-		if err := restoreState(ctx, u.dc, id, o.State); err != nil {
-			note("原来的容器 %s 没能恢复状态：%v", o.Name, err)
-		}
-	}
+	return id
 }
 
 // restoreState 把容器恢复成原来的状态：运行或暂停；原来停着的不动。

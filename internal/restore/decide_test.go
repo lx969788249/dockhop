@@ -51,3 +51,28 @@ func TestDecideRefusesUnstoppableWriters(t *testing.T) {
 		}
 	}
 }
+
+// decide 之后、改动之前（加载镜像可能要好一会儿），新服务器上启动了一个在用要写入的目录的
+// 容器：照 decide 时的样子做，就不会停下它，数据写进去时它还在用。要在动已有的服务和数据之前
+// 发现，停下。
+func TestRecheckBeforePrepare(t *testing.T) {
+	lists := 0
+	failed, stopped := prepareWith(t, preflight.Decisions{}, func(w http.ResponseWriter, p, shared string) bool {
+		switch p {
+		case "/containers/json":
+			if lists++; lists == 1 {
+				io.WriteString(w, `[]`)
+			} else {
+				io.WriteString(w, `[{"Id":"late-id","Names":["/late"],"State":"running"}]`)
+			}
+		case "/containers/late-id/json":
+			io.WriteString(w, `{"Id":"late-id","Name":"/late","State":{"Status":"running","Running":true},"Mounts":[{"Type":"bind","Source":"`+shared+`"}]}`)
+		default:
+			return false
+		}
+		return true
+	})
+	if !strings.Contains(failed, "late 在检查之后有了变化") || len(stopped) > 0 {
+		t.Fatalf("应在动已有的服务之前停下（停过 %v）：\n%s", stopped, failed)
+	}
+}

@@ -51,6 +51,9 @@ func (r *run) prepareWorkdir(token string) error {
 }
 
 func (r *run) download(ctx context.Context) error {
+	if err := r.checkSums(); err != nil {
+		return err
+	}
 	if err := r.prepareWorkdir(""); err != nil {
 		return err
 	}
@@ -74,9 +77,23 @@ func (r *run) dropDownload() {
 	}
 }
 
+// checkSums 确认可能要从旧服务器下载的镜像文件（从镜像仓库拉不下来时也会改从旧服务器下载），
+// 迁移计划里都记着 SHA-256（见 verifyDownload）。1.1.6 之前的旧服务器没有记：同一次迁移的
+// 镜像文件有好几个，被对调了也发现不了，不能用。迁移包只有一个，没有可以对调的，没记时照常用。
+func (r *run) checkSums() error {
+	for _, f := range r.plan.Images {
+		if r.images[f.File].local == "" && f.SHA256 == "" {
+			return r.Screen.StepFailed("旧服务器上的 DockHop 是 1.1.6 之前的版本，迁移计划里没有镜像文件的校验值，"+
+				"没法确认下载的镜像没有被调换（还没有下载或改动任何东西）", "",
+				"在旧服务器上结束这次迁出，重新运行一行命令迁出（会用最新版），再用新的链接迁入")
+		}
+	}
+	return nil
+}
+
 // verifyDownload 在用下载的文件之前，按迁移计划（经过认证）里记的 SHA-256 确认它就是旧服务器
 // 上的那个文件：同一次迁移的文件都用同一把密钥加密，网络上的设备把两个文件对调，解密也
-// 发现不了。对不上时删掉它，重新运行时会重新下载。旧版本的迁移计划没有记录时不检查。
+// 发现不了。对不上时删掉它，重新运行时会重新下载。没有记录时不检查（见 checkSums）。
 func (r *run) verifyDownload(path, want, what string) error {
 	if want == "" {
 		return nil

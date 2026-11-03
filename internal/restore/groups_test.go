@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -156,5 +157,45 @@ func TestPartialRollbackKeepsOtherGroup(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(root, "b", "compose.yml")); err != nil || string(b) != "services: {}" {
 		t.Errorf("保留的那组应原样保留：%q %v", b, err)
+	}
+}
+
+// 只保留一部分服务时，只有没保留的那组用到的镜像，名字也要改回去、迁入带来的镜像删掉；
+// 几组都用的镜像名留着。
+func TestPartialRollbackRestoresImageNames(t *testing.T) {
+	var out bytes.Buffer
+	r := &run{Deps: Deps{Screen: ui.New(&out, false, nil)}, m: &bundle.Manifest{}}
+	for _, name := range []string{"good", "bad"} {
+		r.items = append(r.items, &citem{m: bundle.Container{Name: name, ImageID: "sha256:src-" + name}, c: &docker.Container{}})
+	}
+	r.items[0].c.Config.Image, r.items[1].c.Config.Image = "base:1", "base:1" // 两组都用 base:1
+	r.buildGroups(nil)
+	if r.imageKey("sha256:src-bad", []string{"bad:1"}) != "c:bad" || r.imageKey("sha256:src-base", []string{"base:1"}) != "" {
+		t.Fatal("只有一组用的镜像跟着那一组，两组都用的算共用")
+	}
+	d := &images{tags: map[string]string{"good:1": "sha256:new-good", "bad:1": "sha256:new-bad", "base:1": "sha256:new-base"},
+		ids: map[string]bool{"sha256:old-bad": true, "sha256:new-good": true, "sha256:new-bad": true, "sha256:new-base": true}}
+	r.undo = &undo{dc: d.docker(t), screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+	j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.j, r.rbDir = j, j.dir
+	for _, e := range []Entry{{Op: opStart}, {Op: opImages, Names: []string{"sha256:old-bad"}}} {
+		j.add(e)
+	}
+	for _, x := range []struct{ id, ref, was string }{{"sha256:src-good", "good:1", ""}, {"sha256:src-bad", "bad:1", "sha256:old-bad"}, {"sha256:src-base", "base:1", ""}} {
+		r.in(r.imageKey(x.id, []string{x.ref}))
+		j.add(Entry{Op: opTag, Name: x.ref, ID: x.was})
+	}
+	ok, bad := r.groupByID(r.groupOf["c:good"]), r.groupByID(r.groupOf["c:bad"])
+	bad.reason = "没能启动"
+	r.Home = t.TempDir()
+	if err := r.commitPartial(context.Background(), []*group{ok}, []*group{bad}); err != errPartial {
+		t.Fatal(err)
+	}
+	want := map[string]string{"good:1": "sha256:new-good", "bad:1": "sha256:old-bad", "base:1": "sha256:new-base"}
+	if !maps.Equal(d.tags, want) || strings.Join(d.deleted, ",") != "sha256:new-bad" {
+		t.Fatalf("镜像名 %v，删掉的 %v", d.tags, d.deleted)
 	}
 }

@@ -74,6 +74,7 @@ func prepareWith(t *testing.T, d preflight.Decisions, handle func(w http.Respons
 	var out bytes.Buffer
 	screen := ui.New(&out, false, nil)
 	r := &run{Deps: Deps{Docker: dc, Home: home, Screen: screen, Getenv: func(string) string { return "" }}, d: d,
+		plan:    &bundle.Plan{Containers: []bundle.PlanContainer{{Name: "kept"}, {Name: "new-app"}}},
 		m:       &bundle.Manifest{Containers: []bundle.Container{{Name: "kept"}, {Name: "new-app"}}, Binds: []bundle.Bind{{Path: shared}}},
 		dataDir: data, rbDir: filepath.Join(home, "rollback", "current"), anonVolumes: map[string]bundle.Volume{},
 		undo: &undo{dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}

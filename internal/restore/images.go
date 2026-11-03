@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -162,6 +163,7 @@ func (r *run) loadImageFiles(ctx context.Context) error {
 		label := fmt.Sprintf("加载镜像 %d/%d", i+1, len(files))
 		src := r.images[f.File]
 		// 不管从哪里来，最后都会给它加上原来的名字（加载的文件里也带着这些名字）。
+		r.in(r.imageKey(f.ID, f.Refs))
 		if err := r.noteTags(ctx, f.Refs); err != nil {
 			return err
 		}
@@ -270,6 +272,24 @@ func (r *run) loadImageFile(ctx context.Context, label string, f bundle.ImageFil
 	return nil
 }
 
+// imageKey 返回用到这个镜像（镜像 ID 是 id，或者镜像名在 refs 里）的容器所在的组（见 in）：
+// 只有一组服务用它时，它的名字跟着这一组走，只保留一部分服务时，没保留的那组用的名字也要改回去；
+// 几组都用它时为空，算整次迁入共用的。
+func (r *run) imageKey(id string, refs []string) string {
+	key := ""
+	for _, it := range r.items {
+		if (id == "" || it.m.ImageID != id) && !slices.Contains(refs, it.c.Config.Image) {
+			continue
+		}
+		k := "c:" + it.m.Name
+		if key != "" && r.groupOf[k] != r.groupOf[key] {
+			return ""
+		}
+		key = k
+	}
+	return key
+}
+
 // noteTags 在镜像名被改动之前（加名字，或者 docker load 按文件里记的名字加名字），把它们
 // 原来指向哪个镜像记进事务日志：迁入失败时改回去，原来没有的名字删掉（见 undoTag）。
 // 按摘要的引用（名字@sha256:…）不是名字，不会被改动。
@@ -314,6 +334,19 @@ func (r *run) tagRefs(ctx context.Context, id string, f bundle.ImageFile) error 
 
 func (r *run) loadImages(ctx context.Context) error {
 	s := r.Screen
+	// 先记下这台服务器上已有哪些镜像：回滚时只删这次迁入带来的，原有的一个不删（见 removeImages）。
+	have, err := r.Docker.Images(ctx)
+	if err != nil {
+		return s.StepFailed("读取镜像列表失败", err.Error(), "确认 Docker 运行正常后重新运行")
+	}
+	ids := make([]string, 0, len(have))
+	for _, img := range have {
+		ids = append(ids, img.ID)
+	}
+	if err := r.j.add(Entry{Op: opImages, Names: ids}); err != nil {
+		return s.StepFailed(err.Error(), "", "")
+	}
+	defer r.in("")
 	if r.m.Images.Parts > 0 {
 		// 格式版本 1 的迁移包：所有镜像都在包里，docker load 按里面记的名字加名字。
 		var names []string
@@ -393,6 +426,7 @@ func (r *run) resolveImage(ctx context.Context, ref string) (string, error) {
 		return "", s.StepFailed("镜像 "+ref+" 没有加载成功", "", "")
 	}
 	as := preflight.StripDigest(ref)
+	r.in(r.imageKey(r.m.Images.Refs[ref], []string{ref}))
 	if err := r.noteTags(ctx, []string{as}); err != nil {
 		return "", err
 	}

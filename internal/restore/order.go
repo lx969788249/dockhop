@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
@@ -37,6 +38,9 @@ type unit struct {
 	started bool
 	ready   bool
 	waited  bool // 作为“最好先就绪”的依赖等过它、没等到：后面不再为它等，最后再等一次
+
+	// Compose 项目里的服务 → 它的容器借用网络、--link、--volumes-from 的同一个项目里的服务
+	uses map[string][]string
 
 	// Compose 项目创建时算出来的，启动和等待时还要用
 	cp         compose.Project
@@ -75,10 +79,12 @@ func (u *unit) startAfter() []string {
 	return out
 }
 
-// serviceOrder 是 Compose 项目里的服务按 depends_on 排好的顺序。
+// serviceOrder 是 Compose 项目里的服务按依赖排好的顺序：配置里的 depends_on，加上借用网络、
+// --link、--volumes-from 用到的服务。老版 docker-compose 读不出配置（见 compose.Services），
+// 后面这些从容器的配置就能知道。
 func (u *unit) serviceOrder() []string {
 	return dependencyOrder(u.services, func(svc string) string { return svc },
-		func(svc string) []string { return u.configured[svc].Needs() })
+		func(svc string) []string { return slices.Concat(u.configured[svc].Needs(), u.uses[svc]) })
 }
 
 // units 列出一组服务里的启动单位，并找出它们之间的依赖。
@@ -86,7 +92,7 @@ func (r *run) units(g *group) []*unit {
 	var out []*unit
 	for i := range g.projects {
 		p := &g.projects[i]
-		u := &unit{key: "p:" + p.Name, label: "项目 " + p.Name, project: p}
+		u := &unit{key: "p:" + p.Name, label: "项目 " + p.Name, project: p, uses: map[string][]string{}}
 		for _, it := range r.items {
 			if it.m.Project == p.Name {
 				u.items = append(u.items, it)
@@ -101,10 +107,12 @@ func (r *run) units(g *group) []*unit {
 	}
 	byKey := map[string]*unit{}
 	owner := map[string]*unit{}
+	service := map[string]string{} // 容器名 → 它是 Compose 项目里的哪个服务
 	for _, u := range out {
 		byKey[u.key] = u
 		for _, it := range u.items {
 			owner[it.m.Name] = u
+			service[it.m.Name] = it.m.Service
 		}
 	}
 	networkOwner := r.networkOwners()
@@ -127,6 +135,9 @@ func (r *run) units(g *group) []*unit {
 				name := x.Ref
 				if n := r.nameOfOld(x.Ref); n != "" {
 					name = n
+				}
+				if u.project != nil && owner[name] == u {
+					u.uses[it.m.Service] = append(u.uses[it.m.Service], service[name]) // 见 serviceOrder
 				}
 				if d := dep(owner[name]); d != nil {
 					how := "--volumes-from"

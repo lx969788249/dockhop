@@ -314,7 +314,7 @@ func (r *run) commitPartial(ctx context.Context, ok, failed []*group) error {
 	}
 	var keep, drop []Entry
 	for _, e := range entries {
-		if e.Op == opStart || failedID[e.Group] {
+		if e.Op == opStart || e.Op == opImages || failedID[e.Group] {
 			drop = append(drop, e)
 		} else {
 			keep = append(keep, e)

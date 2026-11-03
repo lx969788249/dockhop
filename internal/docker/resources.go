@@ -26,6 +26,13 @@ func (c *Client) InspectImage(ctx context.Context, ref string) (*Image, error) {
 	return &img, nil
 }
 
+// Images 列出本机的镜像（不包括构建时留下的中间镜像）。
+func (c *Client) Images(ctx context.Context) ([]Image, error) {
+	var list []Image
+	err := c.Get(ctx, "/images/json", nil, &list)
+	return list, err
+}
+
 // RemoveImage 删除镜像。
 func (c *Client) RemoveImage(ctx context.Context, ref string) error {
 	return c.Delete(ctx, "/images/"+ref, url.Values{"noprune": {"0"}})

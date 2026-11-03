@@ -95,6 +95,7 @@ type run struct {
 	vio     *volumeIO
 	targets map[string]bool   // 被替换的已有容器名
 	writers []writer          // 要临时停下的、和迁入的数据共用的已有容器（decide 找出来的）
+	seen    []string          // decide 时和这次迁入有关的已有容器（见 scene），改动之前再核对一次
 	shared  []Entry           // 临时停止的、和迁入的数据共用卷或目录的容器
 	groups  []*group          // 要迁入的服务分成的组（见 groups.go）
 	groupOf map[string]string // 容器、项目、卷、目录、网络 → 所在组

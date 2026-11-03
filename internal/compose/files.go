@@ -185,10 +185,16 @@ func (w *walker) include(inc *yaml.Node, base string) {
 	dir := filepath.Dir(files[0])
 	envFiles := []string{".env"}
 	if inc.Kind == yaml.MappingNode {
-		if pd := stringsOf(inc, "project_directory"); len(pd) == 1 && !strings.Contains(pd[0], "$") {
-			dir = filepath.Clean(pd[0])
-			if !filepath.IsAbs(dir) {
-				dir = filepath.Join(base, dir)
+		if pd := stringsOf(inc, "project_directory"); len(pd) == 1 {
+			if strings.Contains(pd[0], "$") {
+				// 不知道被包含的文件里的相对路径从哪里算起，那些文件可能没找全：和别的带变量的
+				// 路径一样交给调用方提醒。
+				w.unknown[pd[0]] = true
+			} else {
+				dir = filepath.Clean(pd[0])
+				if !filepath.IsAbs(dir) {
+					dir = filepath.Join(base, dir)
+				}
 			}
 		}
 		if ef := stringsOf(inc, "env_file"); len(ef) > 0 {

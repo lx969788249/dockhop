@@ -83,6 +83,25 @@ func TestDeclaredFilesFollowsReferences(t *testing.T) {
 	}
 }
 
+// include 的 project_directory 用变量写时，不知道被包含的文件里的相对路径从哪里算起，那些
+// 文件可能没找全：和别的带变量的路径一样列出来，让用户知道要自己确认。
+func TestDeclaredFilesUnknownProjectDirectory(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, body string) string {
+		p := filepath.Join(root, rel)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		os.WriteFile(p, []byte(body), 0o644)
+		return p
+	}
+	main := write("app/compose.yml", "include:\n  - path: ../common/compose.yml\n    project_directory: ${SHARED_DIR}\nservices:\n  web: {image: alpine}\n")
+	common := write("common/compose.yml", "services:\n  job: {image: alpine, env_file: ./service.env}\n")
+	write("runtime/service.env", "MODE=x\n")
+	files, unknown := DeclaredFiles(Project{Name: "app", WorkingDir: filepath.Join(root, "app"), Files: []string{main}})
+	if !reflect.DeepEqual(files, []string{common}) || !reflect.DeepEqual(unknown, []string{"${SHARED_DIR}"}) {
+		t.Fatalf("要一起迁移的：%v；没法确定的：%v", files, unknown)
+	}
+}
+
 // 同一个目录既是 build 上下文、里面的文件又被 env_file 写到时，只列出目录：
 // 否则打包时同一个文件出现两次，迁入时整个包会被拒绝。
 func TestDeclaredFilesNoOverlap(t *testing.T) {

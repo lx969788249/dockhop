@@ -70,6 +70,22 @@ func TestStartOrderFollowsReferences(t *testing.T) {
 	}
 }
 
+// 同一个 Compose 项目里，asidecar 借用 vpn 的网络（network_mode: service:vpn，容器上记的是
+// container:<vpn 的 ID>）。新服务器只有老版 docker-compose、读不出 depends_on 时，也要先启动 vpn。
+func TestServiceOrderFollowsContainerReferences(t *testing.T) {
+	vpn := oldContainer(t, `{"Name":"/stack-vpn-1","Config":{"Labels":{"com.docker.compose.project":"stack","com.docker.compose.service":"vpn"}}}`)
+	side := oldContainer(t, `{"Name":"/stack-asidecar-1","Config":{"Labels":{"com.docker.compose.project":"stack","com.docker.compose.service":"asidecar"}},
+		"HostConfig":{"NetworkMode":"container:old-vpn"}}`)
+	projects := []bundle.Project{{Name: "stack"}}
+	r := &run{items: []*citem{side, vpn}, projects: projects,
+		m: &bundle.Manifest{Containers: []bundle.Container{{Name: "stack-asidecar-1"}, {Name: "stack-vpn-1", ID: "old-vpn"}}}}
+	u := r.units(&group{projects: projects, items: r.items})[0]
+	u.services = uniqueServices(u.items) // 创建项目时才有（见 createProject）；读不出配置时 configured 为空
+	if got := strings.Join(u.serviceOrder(), " "); got != "vpn asidecar" {
+		t.Fatalf("启动顺序：%s", got)
+	}
+}
+
 // 要先存在的必须先创建：项目 aapp 用的网络是项目 zproxy 建的（Compose 按 zproxy 的文件建它），
 // 项目 bweb 借用独立容器 vpn 的网络，独立容器 sidecar 用 --volumes-from 了 data。借用网络还要求
 // 先就绪才能启动；只要先存在的，启动不用等。

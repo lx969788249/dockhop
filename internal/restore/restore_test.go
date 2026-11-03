@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -32,6 +34,73 @@ func TestCancelWhileChecking(t *testing.T) {
 		Getenv: func(string) string { return "" }}, Options{Link: link, Yes: true})
 	if !errors.Is(err, ui.ErrCancelled) || !strings.Contains(out.String(), "已取消，这台服务器上什么都没有改动") || strings.Contains(out.String(), "✗") {
 		t.Fatalf("应按已取消处理、不显示失败：%v\n%s", err, out.String())
+	}
+}
+
+// 删除上次被强制结束的迁入留下的内容时按 Ctrl+C：和这次迁入失败时的撤销一样做完，不能停在
+// 一半；也不能说成“什么都没有改动”、当作普通的取消（那样日志会被删掉）。删不掉的地方列在
+// 结果里，回滚资料留着，下次运行迁入时接着删。
+func TestCancelDuringRecovery(t *testing.T) {
+	for _, stuck := range []bool{false, true} {
+		t.Run(fmt.Sprintf("删不掉=%v", stuck), func(t *testing.T) {
+			t.Setenv("PATH", t.TempDir()) // 不调用这台机器上真的 docker compose
+			home := t.TempDir()
+			dir := filepath.Join(home, "rollback", "current")
+			j, err := openJournal(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"new-a", "new-b"} {
+				if err := j.add(Entry{Op: opContainer, Name: name}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			j.close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var deleted []string
+			dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+				p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+				switch {
+				case p == "/info":
+					io.WriteString(w, `{"ServerVersion":"29.0.0"}`)
+				case p == "/containers/json":
+					io.WriteString(w, `[]`)
+				case req.Method == http.MethodGet && strings.HasSuffix(p, "/json"):
+					name := strings.TrimSuffix(strings.TrimPrefix(p, "/containers/"), "/json")
+					fmt.Fprintf(w, `{"Id":%q,"Name":"/%s","State":{"Status":"running","Running":true}}`, name, name)
+				case req.Method == http.MethodDelete:
+					cancel() // 删第一个容器时用户按了 Ctrl+C
+					if stuck && p == "/containers/new-a" {
+						return false
+					}
+					deleted = append(deleted, strings.TrimPrefix(p, "/containers/"))
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					return false
+				}
+				return true
+			})
+			link, _ := crypto.NewLink("127.0.0.1", 1)
+			var out bytes.Buffer
+			err = Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: home,
+				Getenv: func(string) string { return "" }}, Options{Link: link, Yes: true})
+			_, statErr := os.Stat(journalPath(dir))
+			text := out.String()
+			if errors.Is(err, ui.ErrCancelled) || !errors.Is(err, ui.ErrReported) || strings.Contains(text, "什么都没有改动") {
+				t.Fatalf("改动过这台服务器，不能按普通的取消处理：%v\n%s", err, text)
+			}
+			if !stuck {
+				if strings.Join(deleted, ",") != "new-b,new-a" || statErr == nil || !strings.Contains(text, "迁入的内容已全部删除") {
+					t.Fatalf("按了 Ctrl+C 也要删完（删了 %v，日志还在：%v）：\n%s", deleted, statErr == nil, text)
+				}
+				return
+			}
+			if statErr != nil || !strings.Contains(text, "迁入的内容没能全部删除") || !strings.Contains(text, "new-a 没能删除") ||
+				!strings.Contains(text, "回滚资料："+dir) {
+				t.Fatalf("删不掉的要列在结果里，回滚资料留着：\n%s", text)
+			}
+		})
 	}
 }
 

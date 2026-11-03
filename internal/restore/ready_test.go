@@ -223,7 +223,8 @@ func TestStartupFailureHidesEnvSecrets(t *testing.T) {
 	var out bytes.Buffer
 	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: rd, Home: root, Getenv: func(string) string { return "" }},
 		dataDir: data, rbDir: filepath.Join(root, "rollback"), undo: &undo{}, anonVolumes: map[string]bundle.Volume{},
-		m: &bundle.Manifest{Containers: []bundle.Container{{Name: "web", Image: "alpine", State: "running"}}}}
+		plan: &bundle.Plan{Containers: []bundle.PlanContainer{{Name: "web"}}},
+		m:    &bundle.Manifest{Containers: []bundle.Container{{Name: "web", Image: "alpine", State: "running"}}}}
 	if err := r.decide(context.Background()); err != nil {
 		t.Fatal(err)
 	}

@@ -520,3 +520,24 @@ func TestComposeFixedIPNotAuto(t *testing.T) {
 		t.Fatalf("跳过项目后，独立容器改为自动分配：%v %+v", err, d)
 	}
 }
+
+// 单独迁入的容器 web 会替换新服务器上同名的 web，不管那个 web 属不属于某个 Compose 项目（迁入时
+// 就是这样做的，见 Counterparts）：它占着的端口会让出来，不算冲突；选择保留它时，和它共用数据卷
+// 的 worker 也要处理，不然迁入会写进它正在用的数据。
+func TestCounterpartsIgnoreTargetProject(t *testing.T) {
+	plan := &bundle.Plan{Containers: []bundle.PlanContainer{
+		{Name: "web", State: "running", Ports: []bundle.PlanPort{{HostPort: "8080", ContainerPort: "80", Proto: "tcp"}}},
+		{Name: "worker", State: "running", Volumes: []string{"shared"}},
+	}, Volumes: []bundle.PlanVolume{{Name: "shared", Driver: "local"}}}
+	tg := testTarget()
+	tg.Containers["web"] = TargetContainer{State: "running", Project: "existing-project", Volumes: []string{"shared"}}
+	tg.Projects["existing-project"] = true
+	tg.DockerPorts = []DockerPort{{Proto: "tcp", Port: "8080", Container: "web"}}
+	if i := find(Evaluate(plan, tg, &Decisions{ReplaceContainers: []string{"web"}}, Options{}), "port"); i != nil {
+		t.Errorf("被替换的 web 让出端口，不算冲突：%+v", i)
+	}
+	r := Evaluate(plan, tg, &Decisions{SkipContainers: []string{"web"}}, Options{})
+	if i := find(r, "skip_with_data"); i == nil || i.Container != "worker" {
+		t.Errorf("保留 web 时，和它共用数据卷的 worker 也要处理：%+v", r.Issues)
+	}
+}

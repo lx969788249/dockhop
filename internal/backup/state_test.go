@@ -126,6 +126,47 @@ func TestRecoverInterruptedKeepsRecordOnDockerError(t *testing.T) {
 	}
 }
 
+// 恢复上次停下的容器时按 Ctrl+C：照样全部恢复，不能让剩下的一直停着。
+func TestRecoverInterruptedFinishesWhenCancelled(t *testing.T) {
+	home := t.TempDir()
+	if err := writeStopped(home, []StoppedContainer{{Name: "db", ID: "db", State: "running"}, {Name: "web", ID: "web", State: "running"}}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	running := map[string]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1.44/containers/"), "/")[0]
+		switch {
+		case r.URL.Path == "/version":
+			w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/json"):
+			w.Write([]byte(`{"Id":"` + id + `","Name":"/` + id + `","State":{"Running":` + strconv.FormatBool(running[id]) + `}}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			cancel() // 启动第一个容器时用户按了 Ctrl+C
+			running[id] = true
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := RecoverInterrupted(ctx, dc, home, ui.New(&out, false, nil), ui.NewPrompter(nil, &out)); err != nil {
+		t.Fatalf("应全部恢复：%v\n%s", err, out.String())
+	}
+	if !running["db"] || !running["web"] {
+		t.Fatalf("两个容器都要启动：%v", running)
+	}
+	if _, err := os.Stat(statePath(home)); !os.IsNotExist(err) {
+		t.Fatal("全部恢复后停机记录应删除")
+	}
+}
+
 // 中断恢复按记录里原来的状态判断：原来暂停、现在却在运行的（停机打包时恢复运行之后、或者恢复时
 // 启动之后被强制结束）要再暂停；已经是原来状态的不动。恢复不了时保留记录，下次接着恢复。
 func TestRecoverInterruptedStates(t *testing.T) {

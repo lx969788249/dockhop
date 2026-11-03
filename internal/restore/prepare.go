@@ -15,6 +15,9 @@ import (
 // prepare 备份要替换的已有服务，临时停下和迁入的数据共用的容器（都是 decide 找出来的）。
 func (r *run) prepare(ctx context.Context) error {
 	s, dc := r.Screen, r.Docker
+	if err := r.recheck(ctx); err != nil {
+		return err
+	}
 	helperBin := ""
 	if dc.Local() {
 		var err error

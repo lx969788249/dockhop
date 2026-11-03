@@ -3,11 +3,14 @@ package restore
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +19,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/transfer"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -195,6 +199,8 @@ func TestLoadImagesChoosesHelper(t *testing.T) {
 				case q.Method == "POST" && strings.HasSuffix(q.URL.Path, "/images/create"):
 					pulled = c.pullOK
 					return c.pullOK
+				case q.Method == "GET" && strings.HasSuffix(q.URL.Path, "/images/json"):
+					w.Write([]byte(`[]`))
 				case q.Method == "GET" && strings.Contains(q.URL.Path, "@sha256:") && !pulled:
 					// 加载的镜像没有仓库清单，按摘要找不到；拉下来以后才有。
 					http.Error(w, `{"message":"No such image"}`, http.StatusNotFound)
@@ -233,4 +239,52 @@ func testJournal(t *testing.T) *Journal {
 	}
 	t.Cleanup(j.close)
 	return j
+}
+
+// 加载镜像时，只有一组服务用的镜像，它的名字记在这一组名下（只保留一部分服务时据此改回去，见
+// commitPartial）；几组都用的算整次迁入共用。加载之前记下已有的镜像，回滚时不删它们。
+func TestImageNamesFollowGroups(t *testing.T) {
+	d := &images{tags: map[string]string{"bad:1": "sha256:old-bad"}, ids: map[string]bool{"sha256:old-bad": true,
+		"sha256:good": true, "sha256:bad": true, "sha256:base": true}}
+	var out bytes.Buffer
+	r := &run{Deps: Deps{Docker: d.docker(t), Screen: ui.New(&out, false, nil)}, imageAs: map[string]string{},
+		m: &bundle.Manifest{Images: bundle.Images{Refs: map[string]string{}}}, images: map[string]imageSource{}}
+	// good、bad 各用自己的镜像；base:1 两个互不相干（分在不同组）的容器都用。
+	for _, x := range [][2]string{{"good", "good:1"}, {"bad", "bad:1"}, {"tool-a", "base:1"}, {"tool-b", "base:1"}} {
+		it := &citem{m: bundle.Container{Name: x[0]}, c: &docker.Container{}}
+		it.c.Config.Image = x[1]
+		r.items = append(r.items, it)
+	}
+	r.buildGroups(nil)
+	for i, ref := range []string{"good:1", "bad:1", "base:1"} {
+		id := "sha256:" + strings.TrimSuffix(ref, ":1")
+		f := bundle.ImageFile{File: fmt.Sprint(i), ID: id, Refs: []string{ref}}
+		r.m.ImageFiles = append(r.m.ImageFiles, f)
+		r.m.Images.Refs[ref] = id
+		r.images[f.File] = imageSource{local: id} // 本机已经有，只加名字
+	}
+	j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.close()
+	r.j = j
+	if err := r.loadImages(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	entries, _ := readJournal(j.dir)
+	got := map[string]string{}
+	for _, e := range entries {
+		switch e.Op {
+		case opTag:
+			got[e.Name] = e.Group
+		case opImages:
+			got["已有"] = strings.Join(slices.Sorted(slices.Values(e.Names)), ",")
+		}
+	}
+	want := map[string]string{"good:1": r.groupOf["c:good"], "bad:1": r.groupOf["c:bad"], "base:1": "",
+		"已有": "sha256:bad,sha256:base,sha256:good,sha256:old-bad"}
+	if !maps.Equal(got, want) || want["good:1"] == want["bad:1"] {
+		t.Fatalf("实际 %v，应为 %v", got, want)
+	}
 }

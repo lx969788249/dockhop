@@ -121,7 +121,8 @@ func RecoverInterrupted(ctx context.Context, dc *docker.Client, home string, scr
 	} else {
 		screen.Println("没有可以输入的终端，直接把它们恢复成原来的状态。")
 	}
-	if failed := restoreStates(ctx, dc, still, screen); len(failed) > 0 {
+	// 一旦开始就做完：被 Ctrl+C 打断的话，有的容器会一直停着（和停机打包时被打断一样，见 pack）。
+	if failed := restoreStates(context.WithoutCancel(ctx), dc, still, screen); len(failed) > 0 {
 		return fmt.Errorf("有 %d 个容器没能恢复：%s。请执行 docker ps -a 检查，用 docker start 手动启动", len(failed), strings.Join(failed, "、"))
 	}
 	screen.Info("已恢复上次迁出时停下的 %d 个容器", len(still))

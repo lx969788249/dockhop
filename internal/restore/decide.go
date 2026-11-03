@@ -101,12 +101,31 @@ func (r *run) decide(ctx context.Context) error {
 	if len(r.items) == 0 {
 		return s.StepFailed("按检查时的选择，没有要迁入的容器了", "", "")
 	}
+	writers, err := r.findWriters(ctx, existing)
+	if err != nil {
+		return err
+	}
+	r.buildGroups(writers)
+	r.writers, r.replaceProjects, r.existingProjects = writers, replaceProjects, projects
+	r.seen = r.scene(existing, writers)
+	return r.checkStoppable(ctx)
+}
 
-	// 新服务器上和要写入的数据（数据卷、挂载目录、Compose 项目的文件）共用的容器：
-	//   - 保留下来的已有服务（检查时选择了保留，或者 --existing skip）：不能覆盖它的数据。
-	//     检查时已经处理过，这里按新服务器现在的情况再确认一次；
-	//   - 其他正在运行的：要先临时停止，否则数据不一致。
-	// 读不到某个容器的配置时，没法确认它有没有在用这些数据，不能当作没有。
+// counterparts 说明新服务器上的已有容器迁入时会怎样：和迁入前检查是同一条规则（见
+// preflight.Counterparts），检查时说会替换的，迁入时才会替换。
+func (r *run) counterparts() preflight.Counterparts {
+	return preflight.CounterpartsOf(r.plan.Containers, &r.d, r.opts.Existing)
+}
+
+// findWriters 找出新服务器上和要写入的数据（数据卷、挂载目录、Compose 项目的文件）共用的已有容器：
+//   - 保留下来的已有服务（检查时选择了保留，或者 --existing skip）：不能覆盖它的数据。
+//     检查时已经处理过，这里按新服务器现在的情况再确认一次；
+//   - 其他正在运行的：要先临时停止，否则数据不一致。
+//
+// 读不到某个容器的配置时，没法确认它有没有在用这些数据，不能当作没有。
+func (r *run) findWriters(ctx context.Context, existing []docker.ContainerSummary) ([]writer, error) {
+	s := r.Screen
+	match := r.counterparts()
 	volumes, dirs := r.writeSet()
 	self, _ := os.Hostname()
 	ignore := map[string]bool{}
@@ -116,30 +135,78 @@ func (r *run) decide(ctx context.Context) error {
 	var writers []writer
 	for _, c := range existing {
 		name, project := c.Name(), c.Labels["com.docker.compose.project"]
-		kept := slices.Contains(r.d.SkipContainers, name) || slices.Contains(r.d.SkipProjects, project)
+		kept := match.Kept(name, project)
 		if !kept && c.State != "running" && c.State != "paused" && c.State != "restarting" {
 			continue
 		}
-		if r.targets[name] || slices.Contains(replaceProjects, project) || ignore[name] || (len(self) >= 12 && strings.HasPrefix(c.ID, self)) {
+		if match.Replaced(name, project) || ignore[name] || (len(self) >= 12 && strings.HasPrefix(c.ID, self)) {
 			continue
 		}
-		full, _, err := dc.InspectContainer(ctx, c.ID)
+		full, _, err := r.Docker.InspectContainer(ctx, c.ID)
 		switch {
 		case docker.IsNotFound(err):
 			continue // 刚好被删掉了
 		case err != nil:
-			return s.StepFailed("读不到新服务器上的容器 "+name+"，没法确认它有没有在用要写入的数据（还没有改动任何东西）", err.Error(), "确认 Docker 运行正常后重新运行")
+			return nil, s.StepFailed("读不到新服务器上的容器 "+name+"，没法确认它有没有在用要写入的数据（还没有改动已有的服务和数据）", err.Error(), "确认 Docker 运行正常后重新运行")
 		case !usesData(full, volumes, dirs):
 			continue
 		case kept:
-			return s.StepFailed("保留的已有容器 "+name+" 和要迁入的容器共用数据，迁入会覆盖它正在用的数据（还没有改动任何东西）", "",
+			return nil, s.StepFailed("保留的已有容器 "+name+" 和要迁入的容器共用数据，迁入会覆盖它正在用的数据（还没有改动已有的服务和数据）", "",
 				"重新运行迁入，检查时把共用数据的容器一起跳过，或者替换这个已有的容器")
 		}
 		writers = append(writers, writer{summary: c, full: full})
 	}
-	r.buildGroups(writers)
-	r.writers, r.replaceProjects, r.existingProjects = writers, replaceProjects, projects
-	return r.checkStoppable(ctx)
+	return writers, nil
+}
+
+// scene 是新服务器上和这次迁入有关的已有容器：要替换的（名字、ID），要临时停下的、和迁入的
+// 数据共用的（名字、ID、状态）。decide 时记下，改动之前再核对一次（见 recheck）。
+func (r *run) scene(existing []docker.ContainerSummary, writers []writer) []string {
+	match := r.counterparts()
+	var out []string
+	for _, c := range existing {
+		if match.Replaced(c.Name(), c.Labels["com.docker.compose.project"]) {
+			out = append(out, c.Name()+" "+c.ID)
+		}
+	}
+	for _, w := range writers {
+		state := stateOf(w.full)
+		if state == "restarting" {
+			state = "running" // 一直在重启的容器两种状态来回变，恢复时也一样处理（见 restoreState）
+		}
+		out = append(out, w.summary.Name()+" "+w.summary.ID+" "+state)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// recheck 在改动已有的服务之前，再看一次新服务器上和这次迁入有关的容器。decide 之后加载镜像
+// 可能花了好一会儿，这期间有容器新建、启动、停下，或者被重建（例如被 Watchtower 更新了），再按
+// decide 时的样子停容器、备份就不对了：新启动的共用数据的容器没停下，数据写进去时它还在用。
+// 有变化就停下，重新运行会按新服务器现在的样子重新检查。
+func (r *run) recheck(ctx context.Context) error {
+	s := r.Screen
+	existing, err := r.Docker.Containers(ctx, true)
+	if err != nil {
+		return s.StepFailed("读取容器列表失败", err.Error(), "")
+	}
+	writers, err := r.findWriters(ctx, existing)
+	if err != nil {
+		return err
+	}
+	now := r.scene(existing, writers)
+	var changed []string
+	for _, e := range append(slices.Clone(r.seen), now...) {
+		if slices.Contains(r.seen, e) != slices.Contains(now, e) {
+			changed = append(changed, strings.Fields(e)[0])
+		}
+	}
+	if len(changed) > 0 {
+		slices.Sort(changed)
+		return s.StepFailed("新服务器上的容器 "+strings.Join(slices.Compact(changed), "、")+" 在检查之后有了变化，为了安全没有动已有的服务和数据", "",
+			"重新运行迁入，会按新服务器现在的样子重新检查")
+	}
+	return nil
 }
 
 // checkStoppable 确认迁入时要停下的已有容器都能停下、之后再原样恢复（规则见

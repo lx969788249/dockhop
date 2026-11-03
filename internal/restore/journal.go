@@ -36,6 +36,7 @@ const (
 	opNetwork    Op = "network"     // 新建网络（Name）
 	opContainer  Op = "container"   // 新建容器（Name）
 	opHelper     Op = "helper"      // 新建临时容器（Name），用完就删
+	opImages     Op = "images"      // 加载镜像之前这台服务器上已有的镜像（Names：镜像 ID），回滚时这些一个不删
 	opTag        Op = "tag"         // 镜像名要改为指向迁入的镜像（Name；ID：原来指向的镜像，为空表示原来没有这个名字）
 	opComposeUp  Op = "compose_up"  // 启动 Compose 项目（Name、Networks：启动前已有的项目网络）
 	opCommit     Op = "commit"      // 已提交：新服务都验证通过，不再撤销
