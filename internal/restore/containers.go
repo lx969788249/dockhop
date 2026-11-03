@@ -3,16 +3,24 @@ package restore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
+	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/spec"
 )
+
+// 创建容器：独立容器按原始配置创建，Compose 项目的容器交给 Compose 创建，再放回容器里的改动和
+// 匿名卷的数据；网络按迁移记录创建。这里只创建、不启动，先后顺序由 startup.go 安排。
 
 // citem 是要迁入的一个容器。
 type citem struct {
@@ -297,60 +305,142 @@ func (r *run) transplantAnonymous(ctx context.Context, it *citem, newID string) 
 	return nil
 }
 
-func sleep(ctx context.Context, d time.Duration) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(d):
-		return nil
+// createProject 用 Compose 创建项目的容器（不启动），放回匿名卷的数据和容器里的改动。
+func (r *run) createProject(ctx context.Context, u *unit) error {
+	if r.tool == nil {
+		return errors.New("新服务器没有安装 docker compose")
 	}
+	p := u.project
+	members := u.items
+	// -f 按旧服务器上的原样写法传（在项目目录里运行），容器标签里记的配置文件才和原来一样。
+	files := p.ConfigArgs
+	if len(files) == 0 {
+		files = p.ConfigFiles
+	}
+	cp := compose.Project{Name: p.Name, WorkingDir: p.WorkingDir, Files: append([]string(nil), files...)}
+	// 旧版本镜像、改名的 digest 镜像、删掉了文件的镜像：用一个临时的覆盖文件按服务指定镜像，
+	// 不改用户自己的文件。
+	override := map[string]map[string]string{}
+	for _, svc := range uniqueServices(members) {
+		reps := replicas(members, svc)
+		img, err := r.serviceImage(ctx, p.Name, svc, reps)
+		if err != nil {
+			return err
+		}
+		if img != reps[0].c.Config.Image {
+			override[svc] = map[string]string{"image": img}
+		}
+	}
+	if len(override) > 0 {
+		path := filepath.Join(r.workdir, "dockhop-override-"+p.Name+".yml")
+		b, _ := json.Marshal(map[string]any{"services": override}) // JSON 也是合法的 YAML
+		if err := os.WriteFile(path, b, 0o600); err != nil {
+			return err
+		}
+		cp.Files = append(cp.Files, path)
+	}
+	nets, _ := r.Docker.Networks(ctx)
+	var before []string
+	for _, n := range nets {
+		if full, err := r.Docker.InspectNetwork(ctx, n.ID); err == nil && full.Labels["com.docker.compose.project"] == p.Name {
+			before = append(before, full.Name)
+		}
+	}
+	if err := r.j.add(Entry{Op: opComposeUp, Name: p.Name, Names: before}); err != nil {
+		return err
+	}
+	// 一个服务可能有多个副本（deploy.replicas、--scale）：按旧服务器上的个数创建，
+	// 再按副本编号一一对应，每个副本的匿名卷和容器里的改动放进对应的新容器。
+	// 只在个数和配置文件里写的不一样时才加 --scale：有的 Compose 版本（例如 2.17）会把它
+	// 算进记在容器上的配置摘要，之后用户自己 docker compose up 时就会重建容器。
+	services := uniqueServices(members)
+	args := append([]string{"up", "--no-start"}, r.tool.PullMissing(ctx)...)
+	configured, err := r.tool.Services(ctx, cp)
+	if err != nil {
+		r.Log.Printf("读不出 Compose 项目 %s 配置里的副本个数：%v", p.Name, err)
+	}
+	for _, svc := range services {
+		want, have := len(replicas(members, svc)), 1
+		if c, ok := configured[svc]; ok {
+			have = c.Replicas()
+		}
+		if want != have {
+			args = append(args, "--scale", fmt.Sprintf("%s=%d", svc, want))
+		}
+	}
+	if err := r.tool.Exec(ctx, cp, r.Log.Printf, append(args, services...)...); err != nil {
+		return err
+	}
+	list, err := r.Docker.ContainersByLabel(ctx, "com.docker.compose.project="+p.Name)
+	if err != nil {
+		return err
+	}
+	for _, svc := range services {
+		old := replicas(members, svc)
+		var created []docker.ContainerSummary
+		for _, c := range list {
+			if c.Labels["com.docker.compose.service"] == svc {
+				created = append(created, c)
+			}
+		}
+		sort.SliceStable(created, func(i, j int) bool {
+			return replicaNumber(created[i].Labels) < replicaNumber(created[j].Labels)
+		})
+		if len(created) != len(old) {
+			return fmt.Errorf("服务 %s 在旧服务器上有 %d 个容器，新服务器上创建出了 %d 个", svc, len(old), len(created))
+		}
+		for i, it := range old {
+			it.newID = created[i].ID
+		}
+	}
+	for _, it := range members {
+		if err := r.transplantAnonymous(ctx, it, it.newID); err != nil {
+			return err
+		}
+		if err := r.applyChanges(ctx, it); err != nil {
+			return err
+		}
+	}
+	u.cp, u.services, u.configured = cp, services, configured
+	return nil
 }
 
-// dependencyOrder 按依赖排序，被依赖的排在前面（例如被借用网络、--link、--volumes-from
-// 的容器先创建）。deps 返回一项依赖的其他项的名字。循环依赖时按原来的顺序。
-func dependencyOrder[T any](items []T, name func(T) string, deps func(T) []string) []T {
-	in := map[string]bool{}
+// replicas 是服务 svc 在旧服务器上的容器，按副本编号排好。
+func replicas(items []*citem, svc string) []*citem {
+	var out []*citem
 	for _, it := range items {
-		in[name(it)] = true
-	}
-	done := map[string]bool{}
-	var out []T
-	pending := append([]T(nil), items...)
-	for len(pending) > 0 {
-		var next []T
-		progressed := false
-		for _, it := range pending {
-			blocked := false
-			for _, dep := range deps(it) {
-				if dep != name(it) && in[dep] && !done[dep] {
-					blocked = true
-				}
-			}
-			if blocked {
-				next = append(next, it)
-				continue
-			}
+		if it.m.Service == svc {
 			out = append(out, it)
-			done[name(it)] = true
-			progressed = true
 		}
-		if !progressed {
-			return append(out, next...)
-		}
-		pending = next
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return replicaNumber(out[i].c.Config.Labels) < replicaNumber(out[j].c.Config.Labels)
+	})
 	return out
 }
 
-// containerDeps 是容器依赖的其他容器（借用网络、--link、--volumes-from），nameOf 把引用的
-// ID 换成名字（认不出的原样保留）。
-func containerDeps(c *docker.Container, nameOf func(string) string) []string {
+// replicaNumber 是 Compose 给容器记的副本编号（com.docker.compose.container-number）。
+func replicaNumber(labels map[string]string) int {
+	n, _ := strconv.Atoi(labels["com.docker.compose.container-number"])
+	return n
+}
+
+func uniqueServices(items []*citem) []string {
 	var out []string
-	for _, ref := range spec.Dependencies(c) {
-		if n := nameOf(ref); n != "" {
-			ref = n
+	for _, it := range items {
+		out = append(out, it.m.Service)
+	}
+	return uniq(out)
+}
+
+func uniq(list []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, v := range list {
+		if v != "" && !seen[v] {
+			seen[v] = true
+			out = append(out, v)
 		}
-		out = append(out, ref)
 	}
 	return out
 }

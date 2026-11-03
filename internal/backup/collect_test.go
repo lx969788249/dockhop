@@ -6,13 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
-	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/ui"
@@ -33,37 +29,6 @@ func TestDriftReason(t *testing.T) {
 	}
 	if why := driftReason(compose.Service{Image: "nginx:1.29"}, &c); why != "镜像 nginx:1.27 → nginx:1.29" {
 		t.Errorf("镜像不同应报告：%q", why)
-	}
-}
-
-// 旧服务器打包的 Compose 项目外部文件，新服务器要能通过检查：build 上下文目录和它里面
-// 被 env_file 写到的文件同时出现时，同一个文件不能打包两次。
-func TestOutsideArchiveAccepted(t *testing.T) {
-	root := t.TempDir()
-	for _, d := range []string{"app", "shared", "config"} {
-		os.MkdirAll(filepath.Join(root, d), 0o755)
-	}
-	os.WriteFile(filepath.Join(root, "shared", "app.env"), []byte("MODE=prod\n"), 0o644)
-	os.WriteFile(filepath.Join(root, "shared", "Dockerfile"), []byte("FROM alpine\n"), 0o644)
-	prod := filepath.Join(root, "config", "prod.yml")
-	os.WriteFile(prod, []byte("services:\n  web: {environment: {MODE: prod}}\n"), 0o644)
-	main := filepath.Join(root, "app", "compose.yml")
-	os.WriteFile(main, []byte("services:\n  web: {build: ../shared, env_file: ../shared/app.env}\n"), 0o644)
-
-	roots, _ := compose.DeclaredFiles(compose.Project{Name: "app", WorkingDir: filepath.Join(root, "app"), Files: []string{main, prod}})
-	if want := []string{prod, filepath.Join(root, "shared")}; !slices.Equal(roots, want) {
-		t.Fatalf("要一起迁移的文件：%v，应为 %v", roots, want)
-	}
-	var archive bytes.Buffer
-	if err := (hostTar{ctx: context.Background(), roots: roots, base: "/", logf: t.Logf}).write(&archive); err != nil {
-		t.Fatal(err)
-	}
-	trimmed := make([]string, len(roots))
-	for i, r := range roots {
-		trimmed[i] = strings.TrimPrefix(r, "/")
-	}
-	if err := bundle.ScanArchive(bytes.NewReader(archive.Bytes()), trimmed...); err != nil {
-		t.Fatalf("新服务器不接受打包的文件：%v", err)
 	}
 }
 

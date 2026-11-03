@@ -3,8 +3,6 @@ package restore
 import (
 	"bytes"
 	"context"
-	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -15,325 +13,10 @@ import (
 	"time"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
+	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/docker"
-	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
-
-// oldContainer 按 docker inspect 的样子造一个旧服务器上的容器。
-func oldContainer(t *testing.T, raw string) *citem {
-	t.Helper()
-	var c docker.Container
-	if err := json.Unmarshal([]byte(raw), &c); err != nil {
-		t.Fatal(err)
-	}
-	return &citem{m: bundle.Container{Name: c.ShortName(), Project: c.Config.Labels["com.docker.compose.project"],
-		Service: c.Config.Labels["com.docker.compose.service"]}, c: &c, raw: json.RawMessage(raw)}
-}
-
-// 1Panel 装的应用是各自的 Compose 项目，接在同一个 1panel-network 上。Halo 的启动参数里写着
-// 数据库的服务名 postgresql：PostgreSQL 要先启动，等它就绪后再启动 Halo；Nginx Proxy Manager
-// 和它们没关系，不用等。
-func TestStartOrderFollowsReferences(t *testing.T) {
-	halo := oldContainer(t, `{"Name":"/halo","Config":{"Labels":{"com.docker.compose.project":"halo","com.docker.compose.service":"halo"},
-		"Env":["JVM_OPTS=","PATH=/usr/local/sbin:/usr/local/bin"],
-		"Cmd":["--spring.r2dbc.url=r2dbc:pool:postgresql://postgresql:5432/halo","--spring.r2dbc.password=secret-pass","--spring.sql.init.platform=postgresql"]},
-		"NetworkSettings":{"Networks":{"1panel-network":{"Aliases":["halo"],"DNSNames":["halo","0123456789ab"]}}}}`)
-	npm := oldContainer(t, `{"Name":"/1Panel-nginx-proxy-manager-Xy12","Config":{"Labels":{"com.docker.compose.project":"nginx-proxy-manager","com.docker.compose.service":"nginx-proxy-manager"},
-		"Env":["DB_SQLITE_FILE=/data/database.sqlite"],"Cmd":null},
-		"NetworkSettings":{"Networks":{"1panel-network":{"Aliases":["nginx-proxy-manager"]}}}}`)
-	pg := oldContainer(t, `{"Name":"/1Panel-postgresql-Ab12","Config":{"Labels":{"com.docker.compose.project":"postgresql","com.docker.compose.service":"postgresql"},
-		"Env":["POSTGRES_USER=user_ab12","POSTGRES_PASSWORD=pg-pass","PGDATA=/var/lib/postgresql/18/docker"],"Cmd":["postgres"]},
-		"NetworkSettings":{"Networks":{"1panel-network":{"Aliases":["postgresql","1Panel-postgresql-Ab12"],"DNSNames":["1Panel-postgresql-Ab12","postgresql","fedcba987654"]}}}}`)
-	// 独立容器：环境变量里写着 Halo 的地址，但不在同一个网络上，按名字本来就连不上，不算。
-	probe := oldContainer(t, `{"Name":"/probe","Config":{"Env":["TARGET=http://halo:8090"]},"NetworkSettings":{"Networks":{"bridge":{}}}}`)
-	// 独立容器：环境变量里写着数据库的容器名（大小写不同也算）。
-	backup := oldContainer(t, `{"Name":"/pg-backup","Config":{"Env":["PGHOST=1panel-postgresql-ab12"]},
-		"NetworkSettings":{"Networks":{"1panel-network":{"Aliases":null}}}}`)
-
-	projects := []bundle.Project{{Name: "halo"}, {Name: "nginx-proxy-manager"}, {Name: "postgresql"}}
-	r := &run{items: []*citem{halo, npm, pg, probe, backup}, projects: projects, m: &bundle.Manifest{}}
-	units := r.units(&group{projects: projects, items: r.items})
-	deps := depsOf(units)
-	want := map[string]string{
-		"p:halo":                "p:postgresql 最好先就绪（halo 的启动命令里写着 postgresql）",
-		"p:nginx-proxy-manager": "",
-		"p:postgresql":          "",
-		"c:probe":               "",
-		"c:pg-backup":           "p:postgresql 最好先就绪（pg-backup 的环境变量 PGHOST 里写着 1panel-postgresql-ab12）",
-	}
-	for k, w := range want {
-		if deps[k] != w {
-			t.Errorf("%s 用到：%q，应为 %q", k, deps[k], w)
-		}
-	}
-	if got := orderOf(units, (*unit).startAfter); got != "p:nginx-proxy-manager p:postgresql c:probe c:pg-backup p:halo" {
-		t.Errorf("启动顺序：%s", got)
-	}
-	// 猜出来的依赖不影响创建的先后。
-	if got := orderOf(units, (*unit).createAfter); got != "p:halo p:nginx-proxy-manager p:postgresql c:probe c:pg-backup" {
-		t.Errorf("创建顺序：%s", got)
-	}
-	if why := deps["p:halo"]; strings.Contains(why, "secret-pass") {
-		t.Errorf("理由里不应有启动参数的值：%s", why)
-	}
-}
-
-// 要先存在的必须先创建：项目 aapp 用的网络是项目 zproxy 建的（Compose 按 zproxy 的文件建它），
-// 项目 bweb 借用独立容器 vpn 的网络，独立容器 sidecar 用 --volumes-from 了 data。借用网络还要求
-// 先就绪才能启动；只要先存在的，启动不用等。
-func TestCreateOrderFollowsExistence(t *testing.T) {
-	data := t.TempDir()
-	os.MkdirAll(filepath.Join(data, "networks"), 0o700)
-	os.WriteFile(filepath.Join(data, "networks", "proxynet.json"),
-		[]byte(`{"Name":"proxynet","Labels":{"com.docker.compose.project":"zproxy","com.docker.compose.network":"proxy"}}`), 0o600)
-	app := oldContainer(t, `{"Name":"/aapp-app-1","Config":{"Labels":{"com.docker.compose.project":"aapp","com.docker.compose.service":"app"}},
-		"NetworkSettings":{"Networks":{"proxynet":{}}}}`)
-	proxy := oldContainer(t, `{"Name":"/zproxy-proxy-1","Config":{"Labels":{"com.docker.compose.project":"zproxy","com.docker.compose.service":"proxy"}},
-		"NetworkSettings":{"Networks":{"proxynet":{}}}}`)
-	web := oldContainer(t, `{"Name":"/bweb-web-1","Config":{"Labels":{"com.docker.compose.project":"bweb","com.docker.compose.service":"web"}},
-		"HostConfig":{"NetworkMode":"container:vpn"}}`)
-	vpn := oldContainer(t, `{"Name":"/vpn","NetworkSettings":{"Networks":{"bridge":{}}}}`)
-	sidecar := oldContainer(t, `{"Name":"/sidecar","HostConfig":{"VolumesFrom":["data:ro"]}}`)
-	store := oldContainer(t, `{"Name":"/data"}`)
-	projects := []bundle.Project{{Name: "aapp"}, {Name: "bweb"}, {Name: "zproxy"}}
-	r := &run{items: []*citem{app, proxy, web, sidecar, store, vpn}, projects: projects, dataDir: data,
-		m: &bundle.Manifest{Networks: []string{"proxynet"}}}
-	units := r.units(&group{projects: projects, items: r.items})
-	deps := depsOf(units)
-	want := map[string]string{
-		"p:aapp":    "p:zproxy 要先存在（aapp-app-1 接在 Compose 项目 zproxy 建的网络 proxynet 上）",
-		"p:bweb":    "c:vpn 要先就绪（bweb-web-1 用借用网络（或 --link）连着 vpn）",
-		"c:sidecar": "c:data 要先存在（sidecar 用--volumes-from连着 data）",
-	}
-	for k, w := range want {
-		if deps[k] != w {
-			t.Errorf("%s 用到：%q，应为 %q", k, deps[k], w)
-		}
-	}
-	if got := orderOf(units, (*unit).createAfter); got != "p:zproxy c:data c:vpn p:aapp p:bweb c:sidecar" {
-		t.Errorf("创建顺序：%s", got)
-	}
-	if got := orderOf(units, (*unit).startAfter); got != "p:aapp p:zproxy c:sidecar c:data c:vpn p:bweb" {
-		t.Errorf("启动顺序：%s", got)
-	}
-}
-
-func depsOf(units []*unit) map[string]string {
-	out := map[string]string{}
-	for _, u := range units {
-		var parts []string
-		for _, d := range u.deps {
-			kind := "要先存在"
-			switch {
-			case d.ready:
-				kind = "要先就绪"
-			case d.prefer:
-				kind = "最好先就绪"
-			}
-			parts = append(parts, d.on.key+" "+kind+"（"+strings.Join(d.why, "；")+"）")
-		}
-		out[u.key] = strings.Join(parts, "；")
-	}
-	return out
-}
-
-func orderOf(units []*unit, after func(*unit) []string) string {
-	var keys []string
-	for _, u := range dependencyOrder(units, unitKey, after) {
-		keys = append(keys, u.key)
-	}
-	return strings.Join(keys, " ")
-}
-
-// 假 Docker 上的一个容器：每次查询按顺序给出下一个样子，最后一个样子一直保持。
-func fakeContainer(t *testing.T, logs string, states ...string) (*docker.Client, *bytes.Buffer, *run) {
-	t.Helper()
-	var mu sync.Mutex
-	n := 0
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-		switch {
-		case strings.HasSuffix(req.URL.Path, "/containers/new-app/json"):
-			mu.Lock()
-			s := states[min(n, len(states)-1)]
-			n++
-			mu.Unlock()
-			io.WriteString(w, s)
-		case strings.HasSuffix(req.URL.Path, "/containers/new-app/logs"):
-			io.WriteString(w, logs)
-		default:
-			return false
-		}
-		return true
-	})
-	root := t.TempDir()
-	log, err := logging.Open(filepath.Join(root, "logs"), "in", &logging.Redactor{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { log.Finish(logging.Failed, true) })
-	var out bytes.Buffer
-	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: &logging.Redactor{},
-		Getenv: func(k string) string {
-			if k == "DOCKHOP_TEST_STARTUP_GRACE" {
-				return "1s"
-			}
-			return ""
-		}}}
-	return dc, &out, r
-}
-
-func logText(t *testing.T, r *run) string {
-	t.Helper()
-	b, err := os.ReadFile(r.Log.Path())
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(b)
-}
-
-const healthyAfterFailures = `{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true,"Health":{"Status":"%s","FailingStreak":%d,"Log":[%s]}},
-	"Config":{"Healthcheck":{"Test":["CMD","curl","-f","http://localhost:8090/"],"Interval":30000000000,"Timeout":5000000000,"StartPeriod":30000000000,"Retries":5}}}`
-
-// 健康检查中途没通过、显示不健康都接着等，通过了就算就绪；每次检查的结果记进日志，
-// 每秒一次的查询不记。
-func TestWaitReadyFollowsHealthcheck(t *testing.T) {
-	fail1 := `{"Start":"2026-11-03T01:00:01Z","End":"2026-11-03T01:00:02Z","ExitCode":7,"Output":"curl: (7) Failed to connect to localhost port 8090"}`
-	fail2 := `{"Start":"2026-11-03T01:00:31Z","End":"2026-11-03T01:00:32Z","ExitCode":22,"Output":"curl: (22) The requested URL returned error: 503"}`
-	ok := `{"Start":"2026-11-03T01:01:01Z","End":"2026-11-03T01:01:02Z","ExitCode":0,"Output":""}`
-	_, _, r := fakeContainer(t, "",
-		fmt.Sprintf(healthyAfterFailures, "starting", 0, ""),
-		fmt.Sprintf(healthyAfterFailures, "starting", 1, fail1),
-		fmt.Sprintf(healthyAfterFailures, "unhealthy", 2, fail1+","+fail2),
-		fmt.Sprintf(healthyAfterFailures, "healthy", 0, fail1+","+fail2+","+ok))
-	it := &citem{m: bundle.Container{Name: "app"}, newID: "new-app", startedAt: time.Now()}
-	if err := r.waitReady(context.Background(), it); err != nil {
-		t.Fatalf("健康检查通过了应算就绪：%v", err)
-	}
-	text := logText(t, r)
-	for _, w := range []string{
-		"健康检查（启动后 30 秒内不算，之后每 30 秒查一次（每次最多 5 秒），连续 5 次没通过算不健康），最多等 3 分 55 秒",
-		"容器 app 健康检查没通过（退出码 7）：curl: (7) Failed to connect to localhost port 8090",
-		"容器 app 健康检查没通过（退出码 22）：curl: (22) The requested URL returned error: 503",
-		"容器 app：不健康", "容器 app 健康检查通过", "容器 app 就绪：健康检查通过",
-	} {
-		if !strings.Contains(text, w) {
-			t.Errorf("日志里缺少「%s」：\n%s", w, text)
-		}
-	}
-	if strings.Count(text, "Failed to connect") != 1 {
-		t.Errorf("同一次健康检查只记一次：\n%s", text)
-	}
-	if strings.Contains(text, "Docker 接口：GET") {
-		t.Errorf("每秒一次的查询不应记进日志：\n%s", text)
-	}
-}
-
-// 容器退出了、Docker 不再重启它：马上失败。报错里是最能说明问题的那一行（不是调用栈），
-// 按名字找不到别的服务时，建议里说出是哪个名字；容器最后的输出完整记进日志。
-func TestWaitReadyExitedExplains(t *testing.T) {
-	logs := strings.Join([]string{
-		"2026-11-03 01:10:43.123 ERROR 7 --- [main] o.s.boot.SpringApplication : Application run failed",
-		"java.net.UnknownHostException: Failed to resolve 'postgresql' [A(1)] after 2 queries",
-		"\tat io.netty.resolver.dns.DnsResolveContext.finishResolve(DnsResolveContext.java:1139)",
-		"\t... 33 common frames omitted",
-		"Caused by: io.netty.resolver.dns.DnsErrorCauseException: Query failed with NXDOMAIN",
-		"\tat io.netty.resolver.dns.DnsResolveContext.onResponse(..)(Unknown Source)",
-	}, "\n")
-	_, _, r := fakeContainer(t, logs,
-		`{"Id":"new-app","Name":"/app","RestartCount":0,"State":{"Status":"exited","ExitCode":1}}`)
-	start := time.Now()
-	err := r.waitReady(context.Background(), &citem{m: bundle.Container{Name: "app"}, newID: "new-app", startedAt: time.Now()})
-	if err == nil || time.Since(start) > 5*time.Second {
-		t.Fatalf("退出了应马上失败：%v（%s）", err, time.Since(start))
-	}
-	want := "容器 app 启动后马上退出了（退出码 1），最后的输出：Caused by: io.netty.resolver.dns.DnsErrorCauseException: Query failed with NXDOMAIN"
-	if err.Error() != want {
-		t.Errorf("报错：%s\n应为：%s", err, want)
-	}
-	if hint := groupHint(err); !strings.Contains(hint, "按名字找不到它要连的 postgresql") {
-		t.Errorf("建议应说出找不到的名字：%s", hint)
-	}
-	if text := logText(t, r); !strings.Contains(text, "Failed to resolve 'postgresql'") {
-		t.Errorf("容器最后的输出应完整记进日志：\n%s", text)
-	}
-}
-
-// 没有健康检查的容器一直在重启：等到时间才失败（它要连的服务可能还没起来），报错里说明重启了
-// 几次；每次重启记进日志。
-func TestWaitReadyRestartLoop(t *testing.T) {
-	minHealthWait = 3 * time.Second
-	t.Cleanup(func() { minHealthWait = 60 * time.Second })
-	var states []string
-	for i := 1; i <= 6; i++ {
-		states = append(states, fmt.Sprintf(`{"Id":"new-app","Name":"/app","RestartCount":%d,"State":{"Status":"restarting","ExitCode":1}}`, i))
-	}
-	_, _, r := fakeContainer(t, "nc: bad address 'db'", states...)
-	err := r.waitReady(context.Background(), &citem{m: bundle.Container{Name: "app"}, newID: "new-app", startedAt: time.Now()})
-	if err == nil || !strings.Contains(err.Error(), "没能稳定运行（等了 3 秒，最后的状态：正在重启，自动重启了") ||
-		!strings.Contains(err.Error(), "最后的输出：nc: bad address 'db'") {
-		t.Fatalf("报错：%v", err)
-	}
-	if text := logText(t, r); !strings.Contains(text, "容器 app 退出了（退出码 1），Docker 正在自动重启它（第 2 次）") {
-		t.Errorf("日志里应记下重启：\n%s", text)
-	}
-}
-
-// 稳定运行就算就绪：Docker 记的启动时间已经过了等待的时间，不用再等。
-func TestWaitReadyStableRunning(t *testing.T) {
-	started := time.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339Nano)
-	_, _, r := fakeContainer(t, "", `{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true,"StartedAt":"`+started+`"}}`)
-	start := time.Now()
-	if err := r.waitReady(context.Background(), &citem{m: bundle.Container{Name: "app"}, newID: "new-app"}); err != nil {
-		t.Fatal(err)
-	}
-	if time.Since(start) > 500*time.Millisecond {
-		t.Errorf("已经稳定运行了，不用再等：%s", time.Since(start))
-	}
-}
-
-func TestKeyLine(t *testing.T) {
-	cases := []struct{ logs, want string }{
-		{"Starting...\nListening on :8080", "Listening on :8080"},
-		{"Error: getaddrinfo ENOTFOUND db\n    at GetAddrInfoReqWrap.onlookup [as oncomplete] (node:dns:107:26)", "Error: getaddrinfo ENOTFOUND db"},
-		{"panic: dial tcp: lookup db on 127.0.0.11:53: no such host\n\ngoroutine 1 [running]:\nmain.main()\n\t/app/main.go:12 +0x1d",
-			"panic: dial tcp: lookup db on 127.0.0.11:53: no such host"},
-		{"Traceback (most recent call last):\n  File \"/app/main.py\", line 3, in <module>\n    connect()\nConnectionRefusedError: [Errno 111] Connection refused",
-			"ConnectionRefusedError: [Errno 111] Connection refused"},
-		{"", ""},
-	}
-	for _, c := range cases {
-		if got := keyLine(c.logs); got != c.want {
-			t.Errorf("keyLine(%q) = %q，应为 %q", c.logs, got, c.want)
-		}
-	}
-	if got := keyLine(strings.Repeat("错", 300)); len([]rune(got)) != 161 {
-		t.Errorf("太长时截断：%d", len([]rune(got)))
-	}
-}
-
-func TestUnresolvedHost(t *testing.T) {
-	cases := map[string]string{
-		"java.net.UnknownHostException: Failed to resolve 'postgresql' [A(1)] after 2 queries": "postgresql",
-		"java.net.UnknownHostException: mysql: Name or service not known":                      "mysql",
-		"Error: getaddrinfo ENOTFOUND redis":                                                   "redis",
-		`psql: error: could not translate host name "db" to address: Name does not resolve`:    "db",
-		"dial tcp: lookup gitea-db on 127.0.0.11:53: no such host":                             "gitea-db",
-		"nc: bad address 'dmtest_1Panel-postgresql-AbCd'":                                      "dmtest_1Panel-postgresql-AbCd",
-		"ERROR 2005 (HY000): Unknown MySQL server host 'mariadb' (-2)":                         "mariadb",
-		"php_network_getaddresses: getaddrinfo for mysql failed: Name or service not known":    "mysql",
-		"Connection refused": "",
-		"bad address 'old'\nlater: bad address 'newest-name'": "newest-name",
-	}
-	for logs, want := range cases {
-		if got := unresolvedHost(logs); got != want {
-			t.Errorf("unresolvedHost(%q) = %q，应为 %q", logs, got, want)
-		}
-	}
-	if h := unresolvedHint("halo", "Failed to resolve 'api.example.com'"); !strings.Contains(h, "解析不了域名 api.example.com") {
-		t.Errorf("外面的域名：%s", h)
-	}
-}
 
 // 猜出来的依赖等不到时不拦着：接着启动用到它的，它最后再等一次（完整的时间再多 1 分钟）。
 // Docker 要求的依赖等不到时，用到它的不启动。
@@ -360,31 +43,78 @@ func TestWaitBeforeSoftAndHard(t *testing.T) {
 	}
 }
 
-// 同一个 Compose 服务的副本只能用同一个镜像：镜像里只删每个副本都删过的文件，只有部分副本删过
-// 的明确提示会重新出现；新增和修改的文件各写各的，不放进镜像。
-func TestServiceImageKeepsReplicasApart(t *testing.T) {
-	rep := func(name string, deleted ...string) *citem {
-		c := &docker.Container{}
-		c.Config.Image = "app:1"
-		return &citem{m: bundle.Container{Name: name, Changes: &bundle.Changes{Deleted: deleted}}, c: c}
-	}
-	a, b := rep("stack-web-1", "/etc/a", "/etc/common"), rep("stack-web-2", "/etc/common", "/etc/b")
-	var out bytes.Buffer
-	r := &run{Deps: Deps{Screen: ui.New(&out, false, nil)}, imageAs: map[string]string{}, vio: &volumeIO{}}
-	img, err := r.serviceImage(context.Background(), "stack", "web", []*citem{a, b})
+// 同一个服务一个副本在运行、一个停着：docker compose start web 会把两个都启动，所以要按
+// 容器只启动原来在运行的那个；它依赖的 db 先启动、就绪后再启动它。
+func TestStartProjectKeepsReplicaStates(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, "bin")
+	os.MkdirAll(bin, 0o700)
+	cmdlog := filepath.Join(home, "compose.log")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_COMPOSE_LOG", cmdlog)
+	os.WriteFile(filepath.Join(bin, "docker"), []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_COMPOSE_LOG"
+case " $* " in
+ *" version "*) echo 2.38.0 ;;
+ *" config "*) echo '{"services":{"web":{"image":"alpine","scale":2,"depends_on":{"db":{"condition":"service_healthy"}}},"db":{"image":"alpine"}}}' ;;
+esac
+`), 0o700)
+	tool, err := compose.Detect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 这里没有能删除文件的程序（Docker 不在本机）：照原镜像，并且说明。
-	if img != "app:1" || a.img != img || b.img != img {
-		t.Errorf("镜像：%q（%q、%q）", img, a.img, b.img)
-	}
-	for _, w := range []string{"容器 stack-web-1 里删除过的 1 个文件在新服务器上会重新出现", "容器 stack-web-2 里删除过的 1 个文件"} {
-		if !strings.Contains(out.String(), w) {
-			t.Errorf("应提示「%s」：\n%s", w, out.String())
+	var mu sync.Mutex
+	var started []string
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		switch {
+		case p == "/networks":
+			io.WriteString(w, `[]`)
+		case p == "/containers/json":
+			io.WriteString(w, `[{"Id":"new-web-1","Labels":{"com.docker.compose.service":"web","com.docker.compose.container-number":"1"}},`+
+				`{"Id":"new-web-2","Labels":{"com.docker.compose.service":"web","com.docker.compose.container-number":"2"}},`+
+				`{"Id":"new-db-1","Labels":{"com.docker.compose.service":"db","com.docker.compose.container-number":"1"}}]`)
+		case strings.HasSuffix(p, "/start"):
+			mu.Lock()
+			started = append(started, strings.TrimSuffix(strings.TrimPrefix(p, "/containers/"), "/start"))
+			mu.Unlock()
+			w.WriteHeader(204)
+		case strings.HasSuffix(p, "/json"):
+			io.WriteString(w, `{"Id":"x","State":{"Status":"running","Running":true},"Config":{"Image":"alpine"}}`)
+		default:
+			return false
 		}
+		return true
+	})
+	member := func(name, svc, number string, running bool) *citem {
+		c := &docker.Container{}
+		c.Config.Image = "alpine"
+		c.Config.Labels = map[string]string{"com.docker.compose.container-number": number}
+		c.State.Running = running
+		return &citem{m: bundle.Container{Name: name, Project: "stack", Service: svc}, c: c}
 	}
-	if got := intersect([]string{"/a", "/b", "/c"}, []string{"/c", "/a"}); strings.Join(got, ",") != "/a,/c" {
-		t.Errorf("每个副本都删过的：%v", got)
+	j, err := openJournal(filepath.Join(home, "rollback"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.close()
+	var out bytes.Buffer
+	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: home, Getenv: func(k string) string {
+		if k == "DOCKHOP_TEST_STARTUP_GRACE" {
+			return "0s"
+		}
+		return ""
+	}}, tool: tool, j: j, workdir: home, items: []*citem{
+		member("stack-web-1", "web", "1", true), member("stack-web-2", "web", "2", false), member("stack-db-1", "db", "1", true)}}
+	u := &unit{key: "p:stack", project: &bundle.Project{Name: "stack", WorkingDir: home}, items: r.items}
+	if err := r.createProject(context.Background(), u); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.startProject(context.Background(), u); err != nil {
+		t.Fatal(err)
+	}
+	log, _ := os.ReadFile(cmdlog)
+	if strings.Join(started, ",") != "new-db-1,new-web-1" || strings.Contains(string(log), " start") {
+		t.Fatalf("启动了 %v；compose 命令：\n%s", started, log)
 	}
 }

@@ -168,3 +168,69 @@ func TestImageSources(t *testing.T) {
 		t.Errorf("记下的镜像名：%s", got)
 	}
 }
+
+// 每种镜像都要给出能用来建容器的名字，恢复数据卷的临时容器靠它：以前按摘要固定的镜像
+// 在线补齐成功后没给名字，只有这种镜像又有数据卷时，迁入在恢复数据卷时失败。
+func TestLoadImagesChoosesHelper(t *testing.T) {
+	digest := "alpine@sha256:" + strings.Repeat("a", 64)
+	cases := []struct {
+		name   string
+		refs   []string
+		pullOK bool
+		want   string
+	}{
+		{"只有按摘要固定的、在线补齐", []string{digest}, true, digest},
+		{"只有按摘要固定的、用迁移包里的", []string{digest}, false, "alpine:pinned-aaaaaaaaaaaa"},
+		{"混合", []string{"nginx:1.27", digest}, true, digest},
+		{"只有普通的", []string{"nginx:1.27"}, true, "nginx:1.27"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pulled := false
+			dc, _ := faultyDocker(t, func(w http.ResponseWriter, q *http.Request) bool {
+				switch {
+				case q.Method == "POST" && strings.HasSuffix(q.URL.Path, "/images/load"):
+					io.Copy(io.Discard, q.Body)
+					w.Write([]byte(`{"stream":"Loaded image"}`))
+				case q.Method == "POST" && strings.HasSuffix(q.URL.Path, "/images/create"):
+					pulled = c.pullOK
+					return c.pullOK
+				case q.Method == "GET" && strings.Contains(q.URL.Path, "@sha256:") && !pulled:
+					// 加载的镜像没有仓库清单，按摘要找不到；拉下来以后才有。
+					http.Error(w, `{"message":"No such image"}`, http.StatusNotFound)
+				case q.Method == "GET" && strings.HasSuffix(q.URL.Path, "/json"):
+					w.Write([]byte(`{"Id":"sha256:` + strings.Repeat("b", 64) + `"}`))
+				case q.Method == "POST" && strings.HasSuffix(q.URL.Path, "/tag"):
+					w.WriteHeader(http.StatusCreated)
+				default:
+					return false
+				}
+				return true
+			})
+			refs := map[string]string{}
+			for _, ref := range c.refs {
+				refs[ref] = "sha256:" + strings.Repeat("b", 64)
+			}
+			var out bytes.Buffer
+			r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, dataDir: t.TempDir(), imageAs: map[string]string{},
+				m: &bundle.Manifest{Images: bundle.Images{Refs: refs}}, j: testJournal(t)}
+			if err := r.loadImages(context.Background()); err != nil {
+				t.Fatalf("%v\n%s", err, out.String())
+			}
+			if r.helperImage != c.want {
+				t.Errorf("临时容器用的镜像：%q，期望 %q", r.helperImage, c.want)
+			}
+		})
+	}
+}
+
+// testJournal 是测试用的事务日志，测试结束时关闭。
+func testJournal(t *testing.T) *Journal {
+	t.Helper()
+	j, err := openJournal(filepath.Join(t.TempDir(), "rollback"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(j.close)
+	return j
+}

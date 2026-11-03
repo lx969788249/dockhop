@@ -3,52 +3,59 @@ package backup
 import (
 	"bytes"
 	"context"
-	"regexp"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
-func TestPortText(t *testing.T) {
-	if got := portText(8080, 8080); got != "端口 8080" {
-		t.Errorf("没换端口：%q", got)
+// 迁出拿到锁之后，以前被强制结束时留下的工作目录都是遗留的，删掉；迁入的不动。
+func TestDropStaleOutWork(t *testing.T) {
+	home := t.TempDir()
+	for _, p := range []string{"work/out-old/bundle", "work/in-x/bundle"} {
+		full := filepath.Join(home, p)
+		os.MkdirAll(filepath.Dir(full), 0o700)
+		os.WriteFile(full, []byte("x"), 0o600)
 	}
-	if got := portText(8080, 8081); got != "端口 8081（8080 被占用）" {
-		t.Errorf("换了端口：%q", got)
+	dropStale(home)
+	if _, err := os.Stat(filepath.Join(home, "work", "out-old")); !os.IsNotExist(err) {
+		t.Errorf("遗留的迁出工作目录应删掉：%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "work", "in-x", "bundle")); err != nil {
+		t.Errorf("迁入的不应动：%v", err)
 	}
 }
 
-// 交给用户的下一步：只有链接一样东西要复制；两条必须照做的提醒是橙色、不加粗
-// （有的终端里加粗的中文会显示成乱码）；除了链接，每行在 80 列的终端里都不折行。
-func TestInstructions(t *testing.T) {
-	link, err := crypto.NewLink("127.0.0.1", 8080)
+// 检查环境时按 Ctrl+C：还没改动任何东西，按“已取消”处理（日志、目录都不留），不显示被打断的
+// 那一步“失败”了。被打断的那一步返回什么错误都有可能，看的是用户有没有按 Ctrl+C。
+func TestCancelWhileChecking(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/version":
+			w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
+		case strings.HasSuffix(r.URL.Path, "/info"):
+			cancel() // 读取 Docker 信息时用户按了 Ctrl+C
+			<-r.Context().Done()
+		default:
+			http.Error(w, `{"message":"x"}`, http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	r := &run{Deps: Deps{Screen: ui.New(&out, true, nil), Prompt: ui.NewPrompter(strings.NewReader(""), &out)}}
-	text := r.instructions(context.Background(), link)
-
-	if strings.Count(text, link.String()) != 1 || strings.Contains(text, "dockhop.run) in") {
-		t.Errorf("要复制的只能有链接一样：\n%s", text)
-	}
-	// 一行命令要写 https://：不写的话 curl 先走明文 HTTP，以 root 运行的脚本可能被路上的人改掉。
-	for _, want := range []string{"\033[33m⚠ 请不要关闭这个窗口\033[0m", "\033[33m⚠ 请放行 TCP 8080 端口\033[0m", "选择「2. 迁入」",
-		"bash <(curl -fsSL https://dockhop.run)"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("缺少 %q：\n%s", want, text)
-		}
-	}
-	if strings.Contains(text, "\033[1") {
-		t.Errorf("不应加粗：%q", text)
-	}
-	plain := regexp.MustCompile("\033\\[[0-9;]*m").ReplaceAllString(text, "")
-	for _, line := range strings.Split(plain, "\n") {
-		// 按 79 列算：⚠ 在有的终端里占两列。
-		if line != link.String() && ui.Truncate(line, 79) != line {
-			t.Errorf("这一行在 80 列的终端里会折行：%q", line)
-		}
+	err = Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: t.TempDir(),
+		Getenv: func(string) string { return "" }}, Options{})
+	if !errors.Is(err, ui.ErrCancelled) || !strings.Contains(out.String(), "已取消，这台服务器上什么都没有改动") || strings.Contains(out.String(), "✗") {
+		t.Fatalf("应按已取消处理、不显示失败：%v\n%s", err, out.String())
 	}
 }

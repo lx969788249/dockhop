@@ -332,3 +332,12 @@ func unresolvedHint(name, logs string) string {
 	}
 	return fmt.Sprintf("容器 %s 按名字找不到它要连的 %s：这个服务没有一起迁过来、没能启动，或者不在同一个 Docker 网络里", name, host)
 }
+
+func sleep(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}

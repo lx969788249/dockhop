@@ -3,7 +3,6 @@ package backup
 import (
 	"bytes"
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -212,50 +211,5 @@ func TestRecoverInterruptedKeepsBrokenRecord(t *testing.T) {
 	}
 	if len(started()) != 0 {
 		t.Errorf("不应启动任何容器：%v", started())
-	}
-}
-
-// 迁出拿到锁之后，以前被强制结束时留下的工作目录都是遗留的，删掉；迁入的不动。
-func TestDropStaleOutWork(t *testing.T) {
-	home := t.TempDir()
-	for _, p := range []string{"work/out-old/bundle", "work/in-x/bundle"} {
-		full := filepath.Join(home, p)
-		os.MkdirAll(filepath.Dir(full), 0o700)
-		os.WriteFile(full, []byte("x"), 0o600)
-	}
-	dropStale(home)
-	if _, err := os.Stat(filepath.Join(home, "work", "out-old")); !os.IsNotExist(err) {
-		t.Errorf("遗留的迁出工作目录应删掉：%v", err)
-	}
-	if _, err := os.Stat(filepath.Join(home, "work", "in-x", "bundle")); err != nil {
-		t.Errorf("迁入的不应动：%v", err)
-	}
-}
-
-// 检查环境时按 Ctrl+C：还没改动任何东西，按“已取消”处理（日志、目录都不留），不显示被打断的
-// 那一步“失败”了。被打断的那一步返回什么错误都有可能，看的是用户有没有按 Ctrl+C。
-func TestCancelWhileChecking(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/version":
-			w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
-		case strings.HasSuffix(r.URL.Path, "/info"):
-			cancel() // 读取 Docker 信息时用户按了 Ctrl+C
-			<-r.Context().Done()
-		default:
-			http.Error(w, `{"message":"x"}`, http.StatusInternalServerError)
-		}
-	}))
-	defer srv.Close()
-	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out bytes.Buffer
-	err = Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: t.TempDir(),
-		Getenv: func(string) string { return "" }}, Options{})
-	if !errors.Is(err, ui.ErrCancelled) || !strings.Contains(out.String(), "已取消，这台服务器上什么都没有改动") || strings.Contains(out.String(), "✗") {
-		t.Fatalf("应按已取消处理、不显示失败：%v\n%s", err, out.String())
 	}
 }

@@ -15,8 +15,9 @@
 //	transaction.go  事务的开始、提交、回滚，上次中断的补救（日志 journal.go，撤销 rollback.go）
 //	prepare.go      改动前的准备：停下共用数据的容器，把要替换的服务改名备份
 //	data.go         恢复数据卷、目录、Compose 项目文件（文件操作 files.go，读写数据卷 volumes.go）
-//	containers.go   创建容器
-//	startup.go      启动服务：顺序和依赖（等就绪 ready.go）
+//	containers.go   创建容器（独立容器、Compose 项目的容器）和网络
+//	startup.go      启动服务：一组一组地按顺序创建、启动，等就绪（ready.go）
+//	order.go        启动顺序：找出服务之间的依赖，排出先后
 //	groups.go       服务分组，只保留一部分
 //	report.go       结果摘要
 package restore
