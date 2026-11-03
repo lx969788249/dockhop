@@ -3,8 +3,9 @@
 # 上一样的文件。国内服务器从 Gitee 下载程序快得多（run.sh 会先比较 Gitee 和 GitHub 的速度）。
 # 从 GitHub 的服务器往 Gitee 上传很慢（实测每秒十几到几十 KB，还会断），所以文件按给出的顺序
 # 上传（run.sh 要用的压缩包放在前面）；Gitee 上已经有的不再重传，失败了重新运行就能接着传。
-# Gitee 上每个仓库的附件合计不能超过 1GB，所以只保留最近 10 个版本。
-#   GITEE_TOKEN=私人令牌 scripts/gitee-release.sh 标签 文件……
+# Gitee 上每个仓库的附件合计不能超过 1GB，所以只保留最近 10 个版本。NOTES 是发布页上的更新说明
+# （和 GitHub 上的一样），没有时只放一个指向 GitHub 的链接。
+#   GITEE_TOKEN=私人令牌 [NOTES=更新说明] scripts/gitee-release.sh 标签 文件……
 set -euo pipefail
 
 repo="lx969788249/dockhop" # Gitee 上的仓库，和 run.sh 里的 GITEE 地址一致
@@ -19,9 +20,11 @@ git push --force "https://${repo%%/*}:${token}@gitee.com/${repo}.git" HEAD:refs/
 
 id="$(curl -sS "${api}/releases/tags/${tag}?access_token=${token}" | jq -r '.id? // empty' 2>/dev/null || true)"
 if [[ -z "$id" ]]; then
+  # 更新说明里可能有 ; @ < 这些 -F 会特殊处理的字符，用 --form-string 原样发送。
+  body="${NOTES:-和 GitHub 上的 ${tag} 相同：https://github.com/lx969788249/dockhop/releases/tag/${tag}}"
   id="$(curl -fsS -X POST "${api}/releases" -F "access_token=${token}" -F "tag_name=${tag}" \
     -F "name=DockHop ${tag#v}" -F "target_commitish=$(git rev-list -n 1 "$tag")" \
-    -F "body=和 GitHub 上的 ${tag} 相同：https://github.com/lx969788249/dockhop/releases/tag/${tag}" | jq -r .id)"
+    --form-string "body=${body}" | jq -r .id)"
 fi
 
 # have 文件：Gitee 上已经有这个文件，大小也对得上。大小不对的（没传完整）删掉。

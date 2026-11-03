@@ -34,8 +34,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # 更新说明写在附注标签里：第一行是一句话摘要，空一行之后的部分放到发布页上，后面接着
+          # GitHub 生成的“完整改动”链接。轻量标签没有说明（读出来的会是提交说明），只放链接。
+          if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" = tag ]; then
+            git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME"
+          fi >"$RUNNER_TEMP/notes.md"
           gh release create "$GITHUB_REF_NAME" dist/dockhop-linux-* dist/SHA256SUMS dist/run.sh \
-            --title "DockHop ${GITHUB_REF_NAME#v}" --generate-notes
+            --title "DockHop ${GITHUB_REF_NAME#v}" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes
       - name: 更新 main 上的 run.sh
         run: |
           git checkout main

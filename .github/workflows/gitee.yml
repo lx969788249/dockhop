@@ -35,7 +35,8 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           gh release download "$TAG" -D dist
+          notes="$(gh release view "$TAG" --json body --jq .body)" # 更新说明和 GitHub 上的一样
           # 先传 run.sh 要用的压缩包，再传其他文件。
           files=(dist/*.gz)
           for f in dist/*; do [[ "$f" == *.gz ]] || files+=("$f"); done
-          scripts/gitee-release.sh "$TAG" "${files[@]}"
+          NOTES="$notes" scripts/gitee-release.sh "$TAG" "${files[@]}"
