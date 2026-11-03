@@ -136,7 +136,7 @@ func Run(args []string, env Env) int {
 		cmd, rest = rest[0], rest[1:]
 	}
 	env.Args = args
-	env.screen = ui.New(env.Stderr, env.TTY, nil)
+	env.screen = ui.New(env.Stderr, env.TTY, nil).WithContext(env.Context)
 	env.screen.SetWidth(env.Width)
 	env.screen.SetBanner(ui.Banner(env.Version, env.TTY))
 	env.prompt = ui.NewPrompter(env.Input, env.Stderr).WithContext(env.Context)

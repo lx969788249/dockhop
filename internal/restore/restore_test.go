@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -585,5 +586,25 @@ func TestDropStale(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(home, p)); (err == nil) != keep {
 			t.Errorf("%s：留着=%v，应为 %v", p, err == nil, keep)
 		}
+	}
+}
+
+// 检查环境时按 Ctrl+C：还没改动新服务器，按“已取消”处理，不显示被打断的那一步“失败”了。
+func TestCancelWhileChecking(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if strings.HasSuffix(r.URL.Path, "/info") {
+			cancel() // 读取 Docker 信息时用户按了 Ctrl+C
+			<-r.Context().Done()
+			return true
+		}
+		return false
+	})
+	link, _ := crypto.NewLink("127.0.0.1", 1)
+	var out bytes.Buffer
+	err := Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: t.TempDir(),
+		Getenv: func(string) string { return "" }}, Options{Link: link, Yes: true})
+	if !errors.Is(err, ui.ErrCancelled) || !strings.Contains(out.String(), "已取消，这台服务器上什么都没有改动") || strings.Contains(out.String(), "✗") {
+		t.Fatalf("应按已取消处理、不显示失败：%v\n%s", err, out.String())
 	}
 }

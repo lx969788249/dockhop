@@ -1743,8 +1743,9 @@ func (r *run) cleanFiles(success bool) {
 }
 
 func (r *run) report(ctx context.Context, err error) error {
-	// 还没改动新服务器就取消了（例如回答问题时按 Ctrl+C）：不用摆出一整块失败结果。
-	if ui.Canceled(err) && r.j == nil {
+	// 还没改动新服务器就取消了（回答问题、检查、下载时按 Ctrl+C）：不用摆出一整块失败结果。
+	// 按没按 Ctrl+C 看 ctx：被打断的那一步返回什么错误都有可能。
+	if (ui.Canceled(err) || ctx.Err() != nil) && r.j == nil {
 		msg := "\n已取消，这台服务器上什么都没有改动。"
 		if r.downloaded {
 			msg += "已经下载的部分留着，用同一个链接重新迁入会接着下载。"
@@ -1858,13 +1859,13 @@ func (r *run) report(ctx context.Context, err error) error {
 	return ErrReported
 }
 
-// fail 记录失败原因（显示在结果摘要里）并结束当前步骤。
+// fail 记录失败原因（显示在结果摘要里）并结束当前步骤；被 Ctrl+C 打断时只写日志（见 StepFailed）。
 func fail(s *ui.Screen, reason, detail, hint string) error {
 	msg := reason
 	if detail != "" && detail != reason {
 		msg += "：" + detail
 	}
-	s.Error(msg, hint)
+	s.StepFailed(msg, hint)
 	return ErrReported
 }
 

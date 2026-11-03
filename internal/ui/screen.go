@@ -7,6 +7,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -60,6 +61,7 @@ type Screen struct {
 	banner   string   // 最上面的程序名字，清屏后重新显示
 	kept     []string // 清屏重画时要留下的行：步骤结果、警告、说明
 	asked    bool     // 当前步骤里问过问题
+	ctx      context.Context
 }
 
 // New 创建屏幕输出。tty 为 true 时使用颜色并原地刷新进度。
@@ -68,6 +70,12 @@ func New(out io.Writer, tty bool, log Logger) *Screen {
 		log = nopLogger{}
 	}
 	return &Screen{out: out, tty: tty, log: log, now: time.Now}
+}
+
+// WithContext 设置用户按 Ctrl+C 时取消的 context，见 StepFailed。
+func (s *Screen) WithContext(ctx context.Context) *Screen {
+	s.ctx = ctx
+	return s
 }
 
 // SetLogger 设置日志：日志要等任务开始、知道写在哪里之后才有。
@@ -303,6 +311,17 @@ func (s *Screen) Error(reason, hint string) {
 	}
 	s.clearLine()
 	s.keep(s.color(red, "✗") + " " + reason)
+}
+
+// StepFailed 报告当前步骤失败，和 Error 一样。只是用户已经按了 Ctrl+C（WithContext 给的 context
+// 已取消）时，这一步是被打断的，失败只是结果：只写进日志，不显示、不算失败原因，结果里会说
+// 已取消或已中断。被打断以后还得让用户知道的问题（例如停下的容器没能恢复）用 Error。
+func (s *Screen) StepFailed(reason, hint string) {
+	if s.ctx != nil && s.ctx.Err() != nil {
+		s.log.Printf("被打断：%s", reason)
+		return
+	}
+	s.Error(reason, hint)
 }
 
 // Problem 显示一个没法继续的问题和建议，用在不会再有结果摘要的地方

@@ -388,3 +388,21 @@ func TestBanner(t *testing.T) {
 		t.Errorf("终端里应显示 logo、版本和一句话介绍：%q", got)
 	}
 }
+
+// 按了 Ctrl+C 之后，被打断的那一步失败只写日志：不显示、不算失败原因。没按时和 Error 一样。
+func TestStepFailedWhenInterrupted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var out bytes.Buffer
+	s := New(&out, false, nil).WithContext(ctx)
+	s.StepFailed("读取 Docker 信息失败", "")
+	if s.Failure() == nil || !strings.Contains(out.String(), "✗ 读取 Docker 信息失败") {
+		t.Fatalf("没打断时应显示失败：%q", out.String())
+	}
+	out.Reset()
+	s = New(&out, false, nil).WithContext(ctx)
+	cancel()
+	s.StepFailed("读取 Docker 信息失败：context canceled", "")
+	if s.Failure() != nil || out.Len() != 0 {
+		t.Fatalf("被打断时不应显示失败：%q", out.String())
+	}
+}

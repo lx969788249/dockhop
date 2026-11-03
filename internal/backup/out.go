@@ -789,8 +789,9 @@ func (r *run) removeTempTags() {
 
 // report 打印结果摘要。
 func (r *run) report(ctx context.Context, err error) error {
-	// 还在回答问题时取消（Ctrl+C、Ctrl+D）：什么都没做，不用摆出一整块失败结果。
-	if ui.Canceled(err) && r.toRestore == 0 && r.server == nil {
+	// 还没改动就取消了（回答问题时按 Ctrl+C、Ctrl+D，或者检查、打包时按 Ctrl+C）：什么都没做，
+	// 不用摆出一整块失败结果。按没按 Ctrl+C 看 ctx：被打断的那一步返回什么错误都有可能。
+	if (ui.Canceled(err) || ctx.Err() != nil) && r.toRestore == 0 && r.server == nil {
 		r.Screen.Println("\n已取消，这台服务器上什么都没有改动。")
 		return ui.ErrCancelled
 	}
@@ -847,14 +848,14 @@ func (r *run) report(ctx context.Context, err error) error {
 	return ErrReported
 }
 
-// fail 记录失败原因（显示在结果摘要里）并结束当前步骤。
+// fail 记录失败原因（显示在结果摘要里）并结束当前步骤；被 Ctrl+C 打断时只写日志（见 StepFailed）。
 func fail(s *ui.Screen, reason, detail, hint string) error {
 	msg := reason
 	if detail != "" && detail != reason {
 		msg += "：" + detail
 	}
 	if s != nil {
-		s.Error(msg, hint)
+		s.StepFailed(msg, hint)
 	}
 	return ErrReported
 }
