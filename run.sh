@@ -4,8 +4,9 @@
 #
 # 判断 CPU 架构 → 下载对应的程序 → 核对 SHA-256 → 运行 → 删除。
 # 程序的校验值写在这个脚本里（发布时自动生成），从哪里下载都能确认没被篡改。
-# 程序同时发布在 Gitee 和 GitHub 上：先同时各试 2 秒，从快的那个下载（国内服务器一般是 Gitee，
-# 海外的一般是 GitHub）；太慢或失败时换另一个，能接着下载就接着下载。
+# 程序同时发布在 Gitee 和 GitHub 上：dockhop.run 返回这个脚本时按访问者在不在中国大陆填上先用哪个
+# （中国大陆是 Gitee，其他地方是 GitHub），直接从那里下载；从别处拿到的这个脚本没有填，先同时各试
+# 2 秒，从快的那个下载。太慢或失败时换另一个，能接着下载就接着下载。
 # 设置了 DOCKHOP_MIRROR=镜像站地址 时只用这个镜像站。
 set -euo pipefail
 
@@ -18,6 +19,9 @@ GITHUB="https://github.com/lx969788249/dockhop/releases/download"
 # 成功完成迁移的次数：dockhop.run 返回这个脚本时填上，交给程序在菜单里显示（从国内访问
 # dockhop.run 常常要好几秒，程序自己再去问就来不及了）。从别处下载的这个脚本里是空的。
 COUNT=""
+# 先从哪里下载（gitee 或 github）：dockhop.run 返回这个脚本时按访问者在不在中国大陆填上，省得先花
+# 2 秒比速度。从别处下载的这个脚本里是空的。
+PREFER=""
 
 fail() {
   printf '✗ %s\n' "$1" >&2
@@ -171,10 +175,10 @@ download() {
   fi
 }
 
-printf '正在下载 DockHop %s（%s）……\n' "$VERSION" "$arch" >&2
-
-# 有两个地址时，先同时各下载 2 秒比一比，快的排在前面（没下载成功的算 0）。
-if ((${#sources[@]} == 2)) && [[ "$getter" == curl ]]; then
+# race：两个地址同时各下载 2 秒比一比，快的排在前面（没下载成功的算 0）。没有 curl 时不比。
+race() {
+  local i
+  [[ "$getter" == curl ]] || return 0
   for i in 0 1; do
     curl -sL --connect-timeout 2 -m 2 -o /dev/null -w '%{http_code} %{speed_download}\n' \
       "${sources[i]}/v${VERSION}/${name}${gz}" >"${tmp}/speed${i}" 2>/dev/null &
@@ -183,6 +187,17 @@ if ((${#sources[@]} == 2)) && [[ "$getter" == curl ]]; then
   if awk '{ s[FILENAME] = ($1 ~ /^2/) ? $2 + 0 : 0 } END { exit !(s[ARGV[2]] + 0 > s[ARGV[1]] + 0) }' "${tmp}/speed0" "${tmp}/speed1"; then
     sources=("${sources[1]}" "${sources[0]}")
   fi
+}
+
+printf '正在下载 DockHop %s（%s）……\n' "$VERSION" "$arch" >&2
+
+# 有两个地址时决定先后：dockhop.run 填了 PREFER 就按它，没填时比一比。
+if ((${#sources[@]} == 2)); then
+  case "$PREFER" in
+    gitee) ;;
+    github) sources=("$GITHUB" "$GITEE") ;;
+    *) race ;;
+  esac
 fi
 
 bad_sum=""

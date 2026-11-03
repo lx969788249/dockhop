@@ -1,8 +1,8 @@
 // dockhop.run：一行命令 bash <(curl -fsSL https://dockhop.run) 用的短地址。
 //
 // curl、wget 来访问时，直接返回仓库 main 分支上的 run.sh（在 Cloudflare 上缓存 5 分钟），并填上
-// 成功完成迁移的次数；浏览器来访问时，跳到 GitHub 上的项目页。程序本身由 run.sh 从 Gitee 或
-// GitHub 下载，不经过这里。
+// 成功完成迁移的次数和先从哪里下载程序；浏览器来访问时，跳到 GitHub 上的项目页。程序本身由 run.sh
+// 从 Gitee 或 GitHub 下载，不经过这里。
 //
 // /count 是成功完成迁移的次数（D1 里只存这一个数字）：程序开头的菜单显示它（通过一行命令运行时
 // 用 run.sh 里填好的，直接运行程序时来这里读）；迁入成功时程序发一个空的 POST，次数加 1。
@@ -49,6 +49,14 @@ export default {
     let script = await upstream.text();
     if (n !== null) {
       script = script.replace(/^COUNT=""$/m, `COUNT="${n}"`);
+    }
+    // 先从哪里下载程序：中国大陆先用 Gitee，其他地方（包括香港、澳门、台湾）先用 GitHub，省得
+    // run.sh 先花 2 秒比速度。国家是 Cloudflare 本来就给每个请求标好的，不另外查，也不记录；
+    // 不知道（XX）或者经过 Tor（T1）时不填，run.sh 照旧比一比。
+    const country = request.cf?.country ?? "";
+    const prefer = country === "CN" ? "gitee" : /^[A-Z]{2}$/.test(country) && country !== "XX" ? "github" : "";
+    if (prefer) {
+      script = script.replace(/^PREFER=""$/m, `PREFER="${prefer}"`);
     }
     return new Response(script, {
       headers: {

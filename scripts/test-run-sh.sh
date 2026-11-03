@@ -56,10 +56,12 @@ out="$(DOCKHOP_MIRROR="http://127.0.0.1:1" bash "${dist}/run.sh" version 2>&1)" 
 grep -Fq "DOCKHOP_MIRROR" <<<"$out"
 echo "✓ 下载失败时提示可以换镜像站"
 
-# both Gitee 用的服务 GitHub 用的服务：把 run.sh 里的这两个地址换成本地的下载服务再运行。
+# both Gitee 用的服务 GitHub 用的服务 [先用哪个]：把 run.sh 里的这两个地址换成本地的下载服务，
+# 像 dockhop.run 那样填上先用哪个（gitee 或 github，不给时不填），再运行。
 both() {
   sed -e "s#^GITEE=.*#GITEE=\"http://127.0.0.1:${port}/$1\"#" \
-    -e "s#^GITHUB=.*#GITHUB=\"http://127.0.0.1:${port}/$2\"#" "${dist}/run.sh" >"${work}/both.sh"
+    -e "s#^GITHUB=.*#GITHUB=\"http://127.0.0.1:${port}/$2\"#" \
+    -e "s#^PREFER=.*#PREFER=\"${3:-}\"#" "${dist}/run.sh" >"${work}/both.sh"
   : >"${work}/server.log"
   DOCKHOP_MIRROR="" bash "${work}/both.sh" version 2>&1
 }
@@ -68,7 +70,22 @@ out="$(both slow full)"
 grep -Fq "DockHop ${version}（linux/" <<<"$out"
 [[ "$(grep -c '"GET /slow/' "${work}/server.log")" == 1 ]] # 只有比速度时的一次
 [[ "$(grep -c '"GET /full/' "${work}/server.log")" == 2 ]]
-echo "✓ 先比一比两个地址，从快的那个下载"
+echo "✓ 没有指定先用哪个时，先比一比两个地址，从快的那个下载"
+
+out="$(both slow full github)"
+grep -Fq "DockHop ${version}（linux/" <<<"$out"
+[[ "$(grep -c '"GET /slow/' "${work}/server.log")" == 0 ]] # 不比速度
+[[ "$(grep -c '"GET /full/' "${work}/server.log")" == 1 ]]
+out="$(both full slow gitee)"
+grep -Fq "DockHop ${version}（linux/" <<<"$out"
+[[ "$(grep -c '"GET /slow/' "${work}/server.log")" == 0 ]]
+[[ "$(grep -c '"GET /full/' "${work}/server.log")" == 1 ]]
+echo "✓ dockhop.run 指定了先用哪个时直接从那里下载，不比速度"
+
+out="$(both full cut github)"
+grep -Fq "DockHop ${version}（linux/" <<<"$out"
+grep -Fq "改从 127.0.0.1:${port} 下载" <<<"$out"
+echo "✓ 指定的地址下载失败时换另一个"
 
 out="$(both cut slow)"
 grep -Fq "DockHop ${version}（linux/" <<<"$out"

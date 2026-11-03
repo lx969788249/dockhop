@@ -201,7 +201,7 @@ sequenceDiagram
 |---|---|---|
 | `DOCKHOP_HOME` | `~/.dockhop` | 日志、中断记录、回滚资料和工作文件（迁移包、下载的文件）都放在这里。系统盘不够大时，在命令前面加上 `DOCKHOP_HOME=/大一点的盘/dockhop` |
 | `DOCKHOP_NO_STATS` | — | 设为 `1` 时不统计、也不在菜单里显示成功完成迁移的次数（也认 `DO_NOT_TRACK=1`），见下面的常见问题 |
-| `DOCKHOP_MIRROR` | Gitee 和 GitHub Releases，先比一比，用快的 | 一行命令下载程序用的镜像站（设置后只用它）；程序的校验值写在 `run.sh` 里，从镜像站下载也能确认没被改动 |
+| `DOCKHOP_MIRROR` | Gitee 和 GitHub Releases：中国大陆先用 Gitee，其他地方先用 GitHub，太慢时换另一个 | 一行命令下载程序用的镜像站（设置后只用它）；程序的校验值写在 `run.sh` 里，从镜像站下载也能确认没被改动 |
 
 完整说明见 `dockhop --help`。
 
