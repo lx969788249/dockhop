@@ -119,7 +119,7 @@ func TestInLinkMessages(t *testing.T) {
 func TestMenu(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
 	r := runCLI(t, "1\n", nil)
-	if !strings.Contains(r.stderr, "1) 迁出\n") || !strings.Contains(r.stderr, "2) 迁入\n") || strings.Contains(r.stderr, "3) ") {
+	if !strings.Contains(r.stderr, "1. 迁出\n") || !strings.Contains(r.stderr, "2. 迁入\n") || strings.Contains(r.stderr, "3. ") {
 		t.Fatalf("菜单文字不对：%q", r.stderr)
 	}
 	if r.code != ExitFailed || !strings.Contains(r.stderr, "连不上 Docker") || !strings.Contains(r.stderr, "systemctl start docker") {
@@ -138,7 +138,7 @@ func TestMenuClearsScreen(t *testing.T) {
 	if !strings.HasPrefix(out, clearScreen) || strings.Count(out, clearScreen) != 2 {
 		t.Fatalf("开始时和选完菜单后应各清屏一次：%q", out)
 	}
-	if after := out[strings.LastIndex(out, clearScreen):]; strings.Contains(after, "1) 迁出") {
+	if after := out[strings.LastIndex(out, clearScreen):]; strings.Contains(after, "1. 迁出") {
 		t.Errorf("选完之后屏幕上不应再有菜单：%q", after)
 	}
 }

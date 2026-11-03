@@ -76,7 +76,7 @@ func TestMenuShowsCount(t *testing.T) {
 			url = "http://127.0.0.1:1/count"
 		}
 		out, took := menu(url)
-		if strings.Contains(out, "已成功完成迁移") || !strings.Contains(out, "1) 迁出") || took > 2500*time.Millisecond {
+		if strings.Contains(out, "已成功完成迁移") || !strings.Contains(out, "1. 迁出") || took > 2500*time.Millisecond {
 			t.Errorf("%s：不应显示次数，菜单照常出来（用时 %s）：%q", c, took, out)
 		}
 	}

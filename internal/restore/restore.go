@@ -1897,7 +1897,7 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 	s.Hold()
 	s.Println(fmt.Sprintf("上次迁入（%s）没有完成就被结束了，新服务器上还留着它的 %d 处改动。", when, changes))
 	if r.Prompt.Interactive() {
-		c, err := r.Prompt.Choose([]string{"删除上次迁入的内容，回到上次迁入之前的样子（推荐）", "保留现在的样子，只删除回滚资料", "退出，我先自己检查"}, 1)
+		c, err := r.Prompt.Choose([]string{"删除上次迁入的内容，回到上次迁入之前的样子（推荐）", "保留现在的样子，只删除回滚资料", "退出，我先自己检查"})
 		if err != nil {
 			return err
 		}

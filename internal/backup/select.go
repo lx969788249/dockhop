@@ -276,7 +276,7 @@ func chooseUnits(inv *inventory, include []string, screen *ui.Screen, prompt *ui
 	panels := false
 	width := len(strconv.Itoa(len(inv.units)))
 	for i, u := range inv.units {
-		line := fmt.Sprintf("    %*d) %s", width, i+1, u.label())
+		line := fmt.Sprintf("    %*d. %s", width, i+1, u.label())
 		for _, t := range u.tags() {
 			line += "  [" + t + "]"
 		}

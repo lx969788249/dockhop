@@ -201,7 +201,7 @@ func TestRedrawAfterQuestions(t *testing.T) {
 	s.End("Docker 29")
 	s.Begin(2, 6, "选择要迁移的服务")
 	s.Hold()
-	s.Println("    1) web")
+	s.Println("    1. web")
 	s.Warn("自动加入 db")
 	s.End("web")
 	screen := out.String()[strings.LastIndex(out.String(), clearScreen)+len(clearScreen):]
@@ -317,7 +317,7 @@ func TestPromptCancel(t *testing.T) {
 	p := NewPrompter(r, io.Discard).WithContext(ctx)
 	done := make(chan error, 1)
 	go func() {
-		_, err := p.Choose([]string{"a", "b"}, 1)
+		_, err := p.Choose([]string{"a", "b"})
 		done <- err
 	}()
 	cancel()
@@ -354,24 +354,27 @@ func TestFormat(t *testing.T) {
 
 func TestPrompter(t *testing.T) {
 	var out bytes.Buffer
-	p := NewPrompter(strings.NewReader("9\nabc\n2\n\nn\n"), &out)
-	n, err := p.Choose([]string{"改用空闲端口 8361（推荐）", "取消"}, 1)
+	p := NewPrompter(strings.NewReader("9\nabc\n2\n\n1\nn\n"), &out)
+	n, err := p.Choose([]string{"改用空闲端口 8361（推荐）", "取消"})
 	if err != nil || n != 2 {
 		t.Fatalf("Choose = %d, %v", n, err)
 	}
-	if !strings.Contains(out.String(), "请输入 1 到 2 之间的数字。") {
-		t.Fatalf("输入无效时应提示：%q", out.String())
+	if !strings.HasPrefix(out.String(), "  1. 改用空闲端口 8361（推荐）\n  2. 取消\n  请输入数字：") ||
+		!strings.Contains(out.String(), "请输入 1 到 2 之间的数字。") || strings.Contains(out.String(), "[") {
+		t.Fatalf("选项、提示的样子不对，或输入无效时没有提示：%q", out.String())
 	}
-	n, err = p.Choose([]string{"a", "b"}, 1)
-	if err != nil || n != 1 {
-		t.Fatalf("直接回车应选默认：%d, %v", n, err)
+	// 没有默认值：直接回车不算，提示后等着输入序号。
+	out.Reset()
+	n, err = p.Choose([]string{"a", "b"})
+	if err != nil || n != 1 || !strings.Contains(out.String(), "请输入 1 到 2 之间的数字。") {
+		t.Fatalf("直接回车不应替用户选：%d, %v, %q", n, err, out.String())
 	}
 	ok, err := p.Confirm("现在启动它们吗？", true)
 	if err != nil || ok {
 		t.Fatalf("Confirm = %v, %v", ok, err)
 	}
 	none := NewPrompter(nil, &out)
-	if _, err := none.Choose([]string{"a"}, 1); !errors.Is(err, ErrNotInteractive) {
+	if _, err := none.Choose([]string{"a"}); !errors.Is(err, ErrNotInteractive) {
 		t.Fatalf("不能交互时应返回 ErrNotInteractive：%v", err)
 	}
 }

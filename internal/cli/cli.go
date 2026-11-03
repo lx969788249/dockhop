@@ -183,7 +183,7 @@ func menu(env *Env) error {
 	if n > 0 {
 		env.screen.Println(" 已成功完成迁移：" + env.screen.Green(strconv.Itoa(n)) + " 次\n")
 	}
-	choice, err := env.prompt.Choose([]string{"迁出", "迁入"}, 1)
+	choice, err := env.prompt.Choose([]string{"迁出", "迁入"})
 	if err != nil {
 		return err
 	}

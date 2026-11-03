@@ -159,7 +159,7 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 			return 1, nil
 		}
 		r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", n, total, i.Title))
-		return r.Prompt.Choose(options, 1)
+		return r.Prompt.Choose(options)
 	}
 	skipProject := func(reason string) {
 		d.SkipProjects = add(d.SkipProjects, i.Project)
@@ -180,7 +180,7 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 			}
 			r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", n, total, i.Title))
 			r.Screen.Println("  Compose 项目的端口写在它的配置文件里。请停掉占用端口的程序，或在新服务器上修改 " + i.Project + " 的配置文件中的端口。")
-			c, err := r.Prompt.Choose([]string{"我已处理好，重新检查（推荐）", "暂时跳过 " + i.Project + " 项目，继续迁移其他容器", "取消迁入"}, 1)
+			c, err := r.Prompt.Choose([]string{"我已处理好，重新检查（推荐）", "暂时跳过 " + i.Project + " 项目，继续迁移其他容器", "取消迁入"})
 			if err != nil {
 				return err
 			}
@@ -299,7 +299,7 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 				return errCancel
 			}
 			r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", n, total, i.Title))
-			c, err := r.Prompt.Choose([]string{"我已处理好，重新检查（推荐）", "暂时跳过 " + i.Project + " 项目，继续迁移其他容器", "取消迁入"}, 1)
+			c, err := r.Prompt.Choose([]string{"我已处理好，重新检查（推荐）", "暂时跳过 " + i.Project + " 项目，继续迁移其他容器", "取消迁入"})
 			if err != nil {
 				return err
 			}
@@ -343,7 +343,7 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 			return errCancel
 		}
 		r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", n, total, i.Title))
-		c, err := r.Prompt.Choose([]string{"取消迁入，我先处理这个数据卷（推荐）", "保留已有的数据卷，不写入迁移过来的数据"}, 1)
+		c, err := r.Prompt.Choose([]string{"取消迁入，我先处理这个数据卷（推荐）", "保留已有的数据卷，不写入迁移过来的数据"})
 		if err != nil {
 			return err
 		}
@@ -369,7 +369,7 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 			return errCancel
 		}
 		r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", n, total, i.Title))
-		c, err := r.Prompt.Choose([]string{"我先清理磁盘，然后重新检查（推荐）", "换一个目录存放下载文件", "取消迁入"}, 1)
+		c, err := r.Prompt.Choose([]string{"我先清理磁盘，然后重新检查（推荐）", "换一个目录存放下载文件", "取消迁入"})
 		if err != nil {
 			return err
 		}
@@ -396,7 +396,7 @@ func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
 			return errCancel
 		}
 		r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", n, total, i.Title))
-		c, err := r.Prompt.Choose([]string{"我先处理，然后重新检查（推荐）", "取消迁入"}, 1)
+		c, err := r.Prompt.Choose([]string{"我先处理，然后重新检查（推荐）", "取消迁入"})
 		if err != nil {
 			return err
 		}
