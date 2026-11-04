@@ -81,7 +81,7 @@ func (e *Env) dockhopHome() string {
 	return filepath.Join(home, ".dockhop")
 }
 
-const helpText = `DockHop：一条链接，把 Docker 服务连同数据从旧服务器迁到新服务器。
+const helpText = `DockHop：只需两步，完整迁移你的 Docker。
 
 用法：
   dockhop                     显示菜单

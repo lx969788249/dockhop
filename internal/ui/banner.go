@@ -12,7 +12,7 @@ const logo = `  ____             _    _   _
 const clearScreen = "\033[H\033[2J"
 
 // Tagline 是一句话介绍。
-const Tagline = "一条链接，把 Docker 服务连同数据迁到新服务器"
+const Tagline = "只需两步，完整迁移你的 Docker"
 
 // Banner 是程序开头的名字和版本。终端里显示字符画 logo；输出到日志、管道时只写一行，
 // 不让字符画混进日志。

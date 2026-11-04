@@ -1,4 +1,4 @@
-// DockHop：一条链接，把 Docker 服务连同数据从旧服务器迁到新服务器。
+// DockHop：只需两步，完整迁移你的 Docker。
 package main
 
 import (
