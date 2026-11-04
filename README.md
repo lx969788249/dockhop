@@ -5,7 +5,7 @@
   <img alt="DockHop" src="docs/images/logo-light.png" width="420">
 </picture>
 
-**一条链接，完整迁移你的docker**
+**只需两步，完整迁移你的docker**
 
 镜像、数据卷、挂载目录、端口、环境变量、网络、Compose 项目，连容器里没挂载出来的改动也一起迁移；
 全程加密传输、边下载边校验，迁入失败或被中断都会自动删除迁入的内容，新服务器回到迁入前的样子。
