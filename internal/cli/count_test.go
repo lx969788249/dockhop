@@ -95,6 +95,13 @@ func TestMenuShowsCount(t *testing.T) {
 	if out, _ := menu("http://127.0.0.1:1/count"); strings.Contains(out, "已协助完成迁移") {
 		t.Errorf("关了统计时不应显示：%q", out)
 	}
+	// 次数还少（不到 shownFrom）时不显示，满了显示真实的次数。
+	for n, shown := range map[string]bool{"19": false, "20": true} {
+		vars = map[string]string{"DOCKHOP_COUNT": n}
+		if out, _ := menu("http://127.0.0.1:1/count"); strings.Contains(out, "已协助完成迁移：") != shown {
+			t.Errorf("次数 %s：显示=%v，应为 %v：%q", n, !shown, shown, out)
+		}
+	}
 
 	// 迁入成功时加一：在后台带着版本号发一个空的 POST，wait 等它发完。
 	wait := countMigration(&Env{Version: "1.1.2", Count: srv.URL + "?case=ok", Context: t.Context(), Getenv: func(string) string { return "" }})
