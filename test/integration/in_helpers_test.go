@@ -90,6 +90,9 @@ func (m *migration) waitOutSuccess(t *testing.T) {
 	if !strings.Contains(m.out.out(), "新服务器已迁入成功") {
 		t.Errorf("迁出应显示新服务器已迁入成功：\n%s", m.out.out())
 	}
+	if strings.Contains(m.out.out(), "接下来") {
+		t.Errorf("迁移完成后不再列“接下来”要做的事：\n%s", m.out.out())
+	}
 }
 
 func mustContain(t *testing.T, out string, wants ...string) {

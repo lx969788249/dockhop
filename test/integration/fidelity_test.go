@@ -160,7 +160,10 @@ volumes:
 	if code != 0 {
 		t.Fatalf("迁入应成功，退出码 %d", code)
 	}
-	mustContain(t, out, "[6/6] 启动服务 ✓", "✅ 迁入完成", "接下来：")
+	mustContain(t, out, "[6/6] 启动服务 ✓", "✅ 迁入完成")
+	if strings.Contains(out, "接下来") {
+		t.Error("迁入成功后不再列“接下来”要做的事")
+	}
 	// 容器里的改动一起迁入是正常情况，只写日志，不在屏幕上当成警告。
 	if strings.Contains(out, "里没挂载出来的改动已一起迁入") || !strings.Contains(readLogs(home), "里没挂载出来的改动已一起迁入") {
 		t.Error("容器里的改动迁入的说明应只写在日志里")

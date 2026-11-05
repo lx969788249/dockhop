@@ -96,11 +96,6 @@ func (r *run) report(ctx context.Context, err error) error {
 		if len(r.done) > 0 {
 			lines = append(lines, "上次已经迁入："+strings.Join(r.done, "、"))
 		}
-		rep.Next = []string{
-			"确认服务都正常（docker ps 可以查看容器）",
-			"用域名访问的，把域名解析改到这台服务器",
-			"确认没问题后，再停掉旧服务器上的服务（DockHop 不会删除旧服务器上的任何东西）",
-		}
 		status.Result = "success"
 	case r.partial:
 		ok, failed := r.splitGroups()

@@ -41,11 +41,6 @@ func (r *run) report(ctx context.Context, err error) error {
 	switch {
 	case success && r.status == "success":
 		rep.Result = "✅ 迁移完成，新服务器已迁入成功"
-		rep.Next = []string{
-			"到新服务器上确认服务都正常",
-			"用域名访问的，把域名解析改到新服务器",
-			"确认没问题后，再停掉这台服务器上的服务（DockHop 不会删除它们）",
-		}
 	case success:
 		switch r.status {
 		case "partial":
