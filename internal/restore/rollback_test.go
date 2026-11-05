@@ -550,7 +550,12 @@ func (d *images) docker(t *testing.T) *docker.Client {
 			b, _ := json.Marshal(map[string]any{"Id": id, "RepoTags": namesOf(id)})
 			w.Write(b)
 		case req.Method == "POST" && strings.HasSuffix(ref, "/tag"):
-			d.tags[req.URL.Query().Get("repo")+":"+req.URL.Query().Get("tag")] = strings.TrimSuffix(ref, "/tag")
+			id := strings.TrimSuffix(ref, "/tag")
+			if !d.ids[id] {
+				http.Error(w, `{"message":"No such image"}`, 404)
+				return true
+			}
+			d.tags[req.URL.Query().Get("repo")+":"+req.URL.Query().Get("tag")] = id
 			w.WriteHeader(201)
 		case req.Method == "DELETE" && d.ids[ref]:
 			if len(namesOf(ref)) > 1 {
@@ -580,6 +585,8 @@ func (d *images) docker(t *testing.T) *docker.Client {
 // 回滚时镜像名改回迁入前的样子，只删这次迁入带来的镜像。迁入的镜像和这台服务器上原有的一模
 // 一样（例如原来就拉过、另有名字指向它），或者两个镜像名互相换了指向，都不能删原有的镜像：
 // 以前改回一个名字就按 ID 删它原来指向的镜像，会删掉原有的镜像，后面的名字也改不回去了。
+// 删掉镜像最后一个名字时 Docker 会连镜像一起删，所以原来没有的名字也一样：先删它会删掉后面
+// 要改回去的名字正要用的镜像；它是原有的、本来没有名字的镜像仅剩的名字时，删了镜像就没了。
 func TestRollbackKeepsImagesThatWereThere(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -601,6 +608,18 @@ func TestRollbackKeepsImagesThatWereThere(t *testing.T) {
 			map[string]string{"app:1": "sha256:new", "app:latest": "sha256:new"},
 			[]Entry{{Op: opTag, Name: "app:1", ID: "sha256:old"}, {Op: opTag, Name: "app:latest"}},
 			map[string]string{"app:1": "sha256:old"}, "sha256:new"},
+		{"新名字加在要改回去的镜像上", []string{"sha256:Y"},
+			map[string]string{"a:1": "sha256:Y", "c:1": "sha256:Z"},
+			[]Entry{{Op: opTag, Name: "c:1", ID: "sha256:Y"}, {Op: opTag, Name: "a:1"}},
+			map[string]string{"c:1": "sha256:Y"}, "sha256:Z"},
+		{"原有的镜像本来没有名字", []string{"sha256:cached"},
+			map[string]string{"app:1": "sha256:cached"},
+			[]Entry{{Op: opTag, Name: "app:1"}},
+			map[string]string{"app:1": "sha256:cached"}, ""},
+		{"原有的镜像另有名字", []string{"sha256:cached"},
+			map[string]string{"app:1": "sha256:cached", "cache:stable": "sha256:cached"},
+			[]Entry{{Op: opTag, Name: "app:1"}},
+			map[string]string{"cache:stable": "sha256:cached"}, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

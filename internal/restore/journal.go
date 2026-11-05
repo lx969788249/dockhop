@@ -25,7 +25,7 @@ type Op string
 const (
 	opStart      Op = "start"       // 事务开始：记下进程号和时间
 	opStop       Op = "stop"        // 临时停止了新服务器上已有的容器（Name、ID、State）
-	opRename     Op = "rename"      // 已有的同名独立容器改名备份（Name、ID、Backup、State、Networks）
+	opRename     Op = "rename"      // 已有的同名容器改名备份（Name、ID、Backup、State、Networks）
 	opComposeOld Op = "compose_old" // 已有的同名 Compose 项目，即将停止并删除（Name、Old）
 	opOldImages  Op = "old_images"  // 上一条里的容器已经存成回滚镜像，接下来删除容器（Name、Images）
 	opVolume     Op = "volume"      // 写入数据卷（Name、Existed、Backup）

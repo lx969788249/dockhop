@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
@@ -180,31 +179,19 @@ func (r *run) scan() error {
 	return nil
 }
 
-// checkCompose 在改动新服务器之前，用新服务器上的 docker compose 把每个 Compose 项目的
-// 配置文件读一遍。老版本读不懂新写法时在这里就停下，不用等到替换掉已有的服务、写完
+// checkCompose 在改动新服务器之前，用新服务器上的 docker compose 把要迁入的每个 Compose 项目（decide
+// 定下的）的配置文件读一遍。老版本读不懂新写法时在这里就停下，不用等到替换掉已有的服务、写完
 // 数据之后才发现。
 func (r *run) checkCompose(ctx context.Context) error {
 	s := r.Screen
-	var list []bundle.Project
-	for _, p := range r.m.Projects {
-		if slices.Contains(r.d.SkipProjects, p.Name) {
-			continue
-		}
-		if r.opts.Existing == "skip" {
-			if cur, err := r.Docker.ContainersByLabel(ctx, "com.docker.compose.project="+p.Name); err == nil && len(cur) > 0 {
-				continue // 会按 --existing skip 保留新服务器上已有的
-			}
-		}
-		list = append(list, p)
-	}
-	if len(list) == 0 {
+	if len(r.projects) == 0 {
 		return nil
 	}
 	if r.tool == nil {
 		return s.StepFailed("新服务器没有安装 Docker Compose，没法启动 Compose 项目（还没有改动新服务器）", "",
 			"安装 Docker Compose（Docker 官方源的 docker-compose-plugin）后重新运行，迁移包已经下载好，不用重新下载")
 	}
-	for _, p := range list {
+	for _, p := range r.projects {
 		s.Note("检查 Compose 项目 " + p.Name + " 的配置文件")
 		if err := r.checkProject(ctx, p); err != nil {
 			hint := "检查这个项目的配置文件在新服务器的 docker compose " + r.tool.Version + " 上能不能用"

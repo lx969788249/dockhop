@@ -33,7 +33,7 @@ func testPlan() *bundle.Plan {
 func testTarget() *Target {
 	return &Target{
 		Arch: "x86_64", DockerVersion: "29.2.1", DockerRoot: "/var/lib/docker", HasCompose: true, Local: true,
-		Runtimes: map[string]bool{"runc": true}, Containers: map[string]TargetContainer{}, Projects: map[string]bool{},
+		Runtimes: map[string]bool{"runc": true}, Containers: map[string]TargetContainer{},
 		Volumes: map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{},
 		ListenersOK: true, Exists: func(string) bool { return true },
 		Disk: func(string) (host.Disk, error) { return host.Disk{Path: "/", Free: 100 << 30, Dev: 1}, nil },
@@ -103,7 +103,6 @@ func TestEvaluatePorts(t *testing.T) {
 	d := &Decisions{Ports: []PortChange{{PortRef: *ports[0].Port, NewPort: "8080"}}}
 	tg.DockerPorts = []DockerPort{{Proto: "tcp", Port: "3000", Container: "site-app-1"}}
 	tg.Containers["site-app-1"] = TargetContainer{Project: "site"}
-	tg.Projects["site"] = true
 	r = Evaluate(testPlan(), tg, d, Options{Existing: "replace"})
 	if find(r, "port") != nil {
 		t.Errorf("不应再有端口问题：%+v", r.Issues)
@@ -138,7 +137,7 @@ func TestEvaluateHostIP(t *testing.T) {
 func TestEvaluateExisting(t *testing.T) {
 	tg := testTarget()
 	tg.Containers["web"] = TargetContainer{}
-	tg.Projects["site"] = true
+	tg.Containers["site-app-1"] = TargetContainer{Project: "site"}
 	if got := kinds(Evaluate(testPlan(), tg, &Decisions{}, Options{}), Ask); strings.Join(got, ",") != "existing_container,existing_project" {
 		t.Errorf("不写 --existing 时应询问：%v", got)
 	}
@@ -531,7 +530,6 @@ func TestCounterpartsIgnoreTargetProject(t *testing.T) {
 	}, Volumes: []bundle.PlanVolume{{Name: "shared", Driver: "local"}}}
 	tg := testTarget()
 	tg.Containers["web"] = TargetContainer{State: "running", Project: "existing-project", Volumes: []string{"shared"}}
-	tg.Projects["existing-project"] = true
 	tg.DockerPorts = []DockerPort{{Proto: "tcp", Port: "8080", Container: "web"}}
 	if i := find(Evaluate(plan, tg, &Decisions{ReplaceContainers: []string{"web"}}, Options{}), "port"); i != nil {
 		t.Errorf("被替换的 web 让出端口，不算冲突：%+v", i)
@@ -539,5 +537,104 @@ func TestCounterpartsIgnoreTargetProject(t *testing.T) {
 	r := Evaluate(plan, tg, &Decisions{SkipContainers: []string{"web"}}, Options{})
 	if i := find(r, "skip_with_data"); i == nil || i.Container != "worker" {
 		t.Errorf("保留 web 时，和它共用数据卷的 worker 也要处理：%+v", r.Issues)
+	}
+}
+
+// 单独迁入的容器 web 和新服务器上 Compose 项目 site 里的容器同名，迁移包里也有 site：已有的 web
+// 跟着 site 走，不单独问（以前两个都问，选了“替换 web、保留 site”时，检查按保留算、平白给 web
+// 换了端口，迁入却把它改名备份了）。保留 site 时 web 的名字被占着，不迁入，也不检查它的端口；
+// 替换 site 时 web 随项目替换，让出端口和固定 IP。
+func TestCounterpartsFollowProject(t *testing.T) {
+	tg := testTarget()
+	tg.Containers["web"] = TargetContainer{State: "running", Project: "site"}
+	tg.Containers["site-old-1"] = TargetContainer{State: "running", Project: "site"}
+	tg.DockerPorts = []DockerPort{{Proto: "tcp", Port: "80", Container: "web"}}
+	tg.Networks["appnet"] = TargetNetwork{Driver: "bridge", Subnets: []string{"172.20.0.0/16"}, IPs: map[string]string{"172.20.0.10": "site-old-1"}}
+	if got := kinds(Evaluate(testPlan(), tg, &Decisions{}, Options{}), Ask); strings.Join(got, ",") != "existing_project" {
+		t.Errorf("已有的 web 跟着 site 走，只问 site：%v", got)
+	}
+	r := Evaluate(testPlan(), tg, &Decisions{SkipProjects: []string{"site"}}, Options{})
+	i := find(r, "existing_container")
+	if len(kinds(r, Ask)) != 0 || r.Containers != 1 || i == nil || i.Level != Info || !strings.Contains(i.Title, "属于保留的 Compose 项目 site") {
+		t.Errorf("保留 site 时 web 不迁入、不检查它（迁入 %d 个）：%+v", r.Containers, r.Issues)
+	}
+	r = Evaluate(testPlan(), tg, &Decisions{ReplaceProjects: []string{"site"}}, Options{})
+	if len(r.Issues) != 0 || r.Containers != 3 {
+		t.Errorf("替换 site 时 web 随项目替换，端口和固定 IP 都让出来：%+v", r.Issues)
+	}
+}
+
+// --existing skip 保留下来的已有服务，迁移包里和它对应的部分不迁入：不检查它们的端口等（以前照样
+// 检查，同名的服务占着自己的端口就报冲突，项目的端口 --yes 也处理不了，迁入就停下了）。
+func TestSkipPolicyChecksOnlyMigrated(t *testing.T) {
+	tg := testTarget()
+	tg.Containers["web"] = TargetContainer{State: "running"}
+	tg.Containers["site-app-1"] = TargetContainer{State: "running", Project: "site"}
+	tg.DockerPorts = []DockerPort{{Proto: "tcp", Port: "80", Container: "web"}, {Proto: "tcp", Port: "3000", Container: "site-app-1"}}
+	r := Evaluate(testPlan(), tg, &Decisions{}, Options{Existing: "skip"})
+	if len(kinds(r, Ask)) != 0 || len(kinds(r, Info)) != 2 || r.Containers != 1 {
+		t.Errorf("只迁入、只检查 old（迁入 %d 个）：%+v", r.Containers, r.Issues)
+	}
+}
+
+// Compose 项目 site 里写了 container_name: nginx 的容器，和新服务器上无关的已有容器 nginx 同名（独立容器，
+// 或者属于迁移包里没有的项目）：Compose 创建容器时名字冲突，迁入失败、整体回滚。已有的 nginx 跟着 site 走
+// （见 Counterparts）：问 site；替换 site 时它一起替换，让出端口；保留 site、--existing skip 时 site 不迁入，
+// 不检查它；--existing fail 时停下（以前这些都发现不了，还把它占着的端口当成冲突）。
+func TestCounterpartsFollowNamedProject(t *testing.T) {
+	p := testPlan()
+	p.Containers = append(p.Containers, bundle.PlanContainer{Name: "nginx", Project: "site", State: "running", Image: "nginx",
+		Ports: []bundle.PlanPort{{HostPort: "443", ContainerPort: "443", Proto: "tcp"}}})
+	for _, owner := range []string{"", "proxy"} {
+		tg := testTarget()
+		tg.Containers["nginx"] = TargetContainer{State: "running", Project: owner}
+		tg.DockerPorts = []DockerPort{{Proto: "tcp", Port: "443", Container: "nginx"}}
+		r := Evaluate(p, tg, &Decisions{}, Options{})
+		if i := find(r, "existing_project"); strings.Join(kinds(r, Ask), ",") != "existing_project" || i.Project != "site" || !strings.Contains(i.Title, "容器 nginx") {
+			t.Errorf("已有的 nginx（所属项目 %q）跟着 site 走，只问 site：%+v", owner, r.Issues)
+		}
+		if r := Evaluate(p, tg, &Decisions{ReplaceProjects: []string{"site"}}, Options{}); len(r.Issues) != 0 || r.Containers != 4 {
+			t.Errorf("替换 site 时已有的 nginx 一起替换，让出端口（所属项目 %q）：%+v", owner, r.Issues)
+		}
+		for name, c := range map[string]struct {
+			d *Decisions
+			o Options
+		}{"保留 site": {&Decisions{SkipProjects: []string{"site"}}, Options{}}, "--existing skip": {&Decisions{}, Options{Existing: "skip"}}} {
+			if r := Evaluate(p, tg, c.d, c.o); len(kinds(r, Ask)) != 0 || r.Containers != 2 {
+				t.Errorf("%s：site 不迁入，不检查它（所属项目 %q，迁入 %d 个）：%+v", name, owner, r.Containers, r.Issues)
+			}
+		}
+		if got := kinds(Evaluate(p, tg, &Decisions{}, Options{Existing: "fail"}), Stop); strings.Join(got, ",") != "existing_project" {
+			t.Errorf("--existing fail 时应停下（所属项目 %q）：%v", owner, got)
+		}
+	}
+}
+
+// 已有的 nginx 属于新服务器上的 Compose 项目 proxy，迁移包里也有 proxy：它跟着 proxy 走（见 Counterparts）。
+// 替换 proxy 时名字空出来，site 照常迁入；保留 proxy 时名字被占着，site 也不迁入（以前照样迁入，Compose
+// 创建容器时名字冲突，整体回滚）。不迁入的 site 在新服务器上的 db 跟着保留下来，单独迁入的 db 名字被占着，
+// 也不迁入。
+func TestCounterpartsNameHeldByKeptProject(t *testing.T) {
+	p := testPlan()
+	p.Containers = append(p.Containers, bundle.PlanContainer{Name: "nginx", Project: "site", State: "running"},
+		bundle.PlanContainer{Name: "proxy-app-1", Project: "proxy", State: "running"}, bundle.PlanContainer{Name: "db", State: "running"})
+	tg := testTarget()
+	tg.Containers["nginx"] = TargetContainer{State: "running", Project: "proxy"}
+	tg.Containers["db"] = TargetContainer{State: "running", Project: "site"}
+	r := Evaluate(p, tg, &Decisions{SkipProjects: []string{"proxy"}}, Options{})
+	var infos []string
+	for _, i := range r.Issues {
+		if i.Kind == "existing_container" && i.Level == Info {
+			infos = append(infos, i.Title)
+		}
+	}
+	want := "新服务器上已有同名容器 nginx，它属于保留的 Compose 项目 proxy，不迁入 Compose 项目 site|" +
+		"新服务器上已有同名容器 db，它属于保留的 Compose 项目 site，不迁入这个容器"
+	if len(kinds(r, Ask)) != 0 || r.Containers != 2 || strings.Join(infos, "|") != want {
+		t.Errorf("保留 proxy 时 site、db 都不迁入（迁入 %d 个）：%+v", r.Containers, r.Issues)
+	}
+	r = Evaluate(p, tg, &Decisions{ReplaceProjects: []string{"proxy", "site"}}, Options{})
+	if len(r.Issues) != 0 || r.Containers != 6 {
+		t.Errorf("替换 proxy、site 时名字都空出来（迁入 %d 个）：%+v", r.Containers, r.Issues)
 	}
 }

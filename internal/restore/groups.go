@@ -145,6 +145,15 @@ func (r *run) buildGroups(writers []writer) {
 			}
 		}
 	}
+	// 替换的 Compose 项目里有和迁入的容器同名的已有容器时（见 preflight.Counterparts），迁入的
+	// 容器用的是它空出来的名字：只撤销项目时要把它放回去，名字得先空出来，所以在同一组。
+	for _, p := range r.replaceProjects {
+		for _, c := range r.existingProjects[p] {
+			if names[c.Name()] {
+				uf.union("c:"+c.Name(), "p:"+p)
+			}
+		}
+	}
 	// 写到同一处的必须在同一组：路径相同或者互相包含都算（项目目录、项目目录以外的文件、
 	// 挂载目录和指向它的软链接）。不然只删除其中一组时，会删掉或换回另一组还在用的文件。
 	type place struct{ key, path string }

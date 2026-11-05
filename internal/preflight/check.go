@@ -153,51 +153,135 @@ func (d *Decisions) ReuseExisting(network string) bool {
 // AutoSubnetFor 表示网络是否改为让 Docker 自动选择网段。
 func (d *Decisions) AutoSubnetFor(network string) bool { return slices.Contains(d.AutoSubnet, network) }
 
-// Counterparts 说明新服务器上的已有容器在迁入时会怎样，迁入前检查和迁入（restore）都按它判断：
-// 迁移包里的 Compose 项目对应新服务器上同名项目的全部容器；单独迁入的容器对应同名的已有容器，
-// 不管那个已有容器属不属于某个 Compose 项目。对应的部分迁入，就替换它（迁入前停下、改名备份，
-// 失败时放回）；对应的部分跳过（检查时选择跳过，或者 --existing skip），就保留它。
+// Counterparts 说明新服务器上的已有容器在迁入时会怎样、迁移包里的哪些部分因此不迁入，迁入前检查和
+// 迁入（restore）都按它判断。迁移包按一起迁入的单位分成几部分：每个 Compose 项目是一部分，每个单独
+// 迁入的容器是一部分。每个已有容器只跟着其中一部分走：
+//   - 它属于迁移包里也有的 Compose 项目时，跟着这个项目，即使迁移包里还有和它同名的容器：项目替换时
+//     它随项目一起替换，名字空出来给同名的容器；
+//   - 否则跟着迁移包里和它同名的容器所在的部分：单独迁入的容器，或者这个容器所在的 Compose 项目
+//     （Compose 按原来的名字创建容器，例如写了 container_name 的），不管它是独立容器还是属于别的
+//     Compose 项目。
+//
+// 跟着的部分迁入，就替换它（迁入前停下、备份，失败时放回）；跟着的部分不迁入（检查时选择跳过，或者
+// --existing skip），就保留它。迁移包里的容器要用的名字被保留下来的已有容器占着时（它跟着别的部分），
+// 这个容器所在的部分也不迁入。
 type Counterparts struct {
-	projects   map[string]bool // 迁移包里的 Compose 项目 → 是否跳过
-	standalone map[string]bool // 单独迁入的容器 → 是否跳过
-	skipAll    bool            // --existing skip：同名的都保留
+	part    map[string]string // 迁移包里的容器 → 所在的部分（见 unitName）
+	follows map[string]string // 新服务器上的已有容器 → 跟着的部分；没有对应的部分时不在里面
+	project map[string]string // 新服务器上的已有容器 → 所属的 Compose 项目，独立容器为空
+	there   map[string]bool   // 新服务器上有已有容器跟着的部分
+	out     map[string]bool   // 不迁入的部分
 }
 
-// CounterpartsOf 按迁移包里的容器和用户的选择（existing 是 --existing）建立 Counterparts。
-func CounterpartsOf(containers []bundle.PlanContainer, d *Decisions, existing string) Counterparts {
-	c := Counterparts{projects: map[string]bool{}, standalone: map[string]bool{}, skipAll: existing == "skip"}
-	for _, pc := range containers {
+// CounterpartsOf 按迁移包里的容器、新服务器上的已有容器（名字 → 所属的 Compose 项目）和用户的
+// 选择（policy 是 --existing）建立 Counterparts。
+func CounterpartsOf(plan []bundle.PlanContainer, existing map[string]string, d *Decisions, policy string) Counterparts {
+	c := Counterparts{part: map[string]string{}, follows: map[string]string{}, project: existing,
+		there: map[string]bool{}, out: map[string]bool{}}
+	projects := map[string]bool{} // 迁移包里的 Compose 项目
+	for _, pc := range plan {
+		u := unitName(pc)
+		c.part[pc.Name] = u
 		if pc.Project != "" {
-			c.projects[pc.Project] = slices.Contains(d.SkipProjects, pc.Project)
-		} else {
-			c.standalone[pc.Name] = slices.Contains(d.SkipContainers, pc.Name)
+			projects[pc.Project] = true
+		}
+		if pc.Project != "" && slices.Contains(d.SkipProjects, pc.Project) || pc.Project == "" && slices.Contains(d.SkipContainers, pc.Name) {
+			c.out[u] = true
+		}
+	}
+	for name, p := range existing {
+		u := c.part[name]
+		if projects[p] {
+			u = projectUnit(p)
+		}
+		if u != "" {
+			c.follows[name], c.there[u] = u, true
+		}
+	}
+	if policy == "skip" {
+		for u := range c.there {
+			c.out[u] = true
+		}
+	}
+	// 名字被保留下来的已有容器占着的部分不迁入；它在新服务器上对应的已有容器也就保留下来，可能又占着
+	// 别的部分要用的名字，所以一直算到没有变化。
+	for changed := true; changed; {
+		changed = false
+		for name, u := range c.part {
+			if h := c.Holder(name); h != "" && c.out[h] && !c.out[u] {
+				c.out[u], changed = true, true
+			}
 		}
 	}
 	return c
 }
 
-// Of 返回已有容器（名字 name，所属的 Compose 项目 project，独立容器为空）在迁移包里对应的部分，
-// 例如“Compose 项目 blog”“容器 web”，没有时为空；以及那部分是不是跳过了。
-func (c Counterparts) Of(name, project string) (unit string, skipped bool) {
-	if skip, ok := c.projects[project]; ok && project != "" {
-		return "Compose 项目 " + project, skip || c.skipAll
-	}
-	if skip, ok := c.standalone[name]; ok {
-		return "容器 " + name, skip || c.skipAll
-	}
-	return "", false
+// Of 返回已有容器 name 跟着迁移包里的哪一部分，例如“Compose 项目 blog”“容器 web”，没有时为空；
+// 以及那部分是不是不迁入。
+func (c Counterparts) Of(name string) (unit string, skipped bool) {
+	unit = c.follows[name]
+	return unit, unit != "" && c.out[unit]
 }
 
-// Replaced 表示迁入时会替换这个已有容器。
-func (c Counterparts) Replaced(name, project string) bool {
-	unit, skipped := c.Of(name, project)
+// Replaced 表示迁入时会替换已有容器 name。
+func (c Counterparts) Replaced(name string) bool {
+	unit, skipped := c.Of(name)
 	return unit != "" && !skipped
 }
 
-// Kept 表示这个已有容器按选择保留，迁移包里对应的部分不迁入。
-func (c Counterparts) Kept(name, project string) bool {
-	unit, skipped := c.Of(name, project)
+// Kept 表示已有容器 name 保留下来：它跟着的部分不迁入。
+func (c Counterparts) Kept(name string) bool {
+	unit, skipped := c.Of(name)
 	return unit != "" && skipped
+}
+
+// Holder 返回占着迁移包里的容器 name 要用的名字、跟着迁移包里另一部分的已有容器跟着的那部分（只会是
+// 它所属的 Compose 项目），没有时为空。那部分迁入时它随着替换，名字空出来（两者分在同一组）；不迁入时
+// 名字被占着，name 所在的部分也不迁入。
+func (c Counterparts) Holder(name string) string {
+	if u, ok := c.part[name]; ok && c.follows[name] != u {
+		return c.follows[name]
+	}
+	return ""
+}
+
+// ExistingFor 说明新服务器上跟着迁移包里的 Compose 项目 project 的已有容器，例如“同名的 Compose 项目
+// blog”“容器 nginx，和 Compose 项目 blog 里的容器同名”；没有时为空。
+func (c Counterparts) ExistingFor(project string) string {
+	same := false
+	var named []string // 不属于这个项目、和它里面的容器同名的
+	for name, u := range c.follows {
+		switch p := c.project[name]; {
+		case u != projectUnit(project):
+		case p == project:
+			same = true
+		case p != "":
+			named = append(named, name+"（属于 Compose 项目 "+p+"）")
+		default:
+			named = append(named, name)
+		}
+	}
+	slices.Sort(named)
+	list := strings.Join(named, "、")
+	switch {
+	case same && len(named) > 0:
+		return "同名的 Compose 项目 " + project + "，还有容器 " + list + " 和它里面的容器同名"
+	case same:
+		return "同名的 Compose 项目 " + project
+	case len(named) > 0:
+		return "容器 " + list + "，和 Compose 项目 " + project + " 里的容器同名"
+	}
+	return ""
+}
+
+// migrates 表示迁移包里的容器 pc 所在的部分迁入。
+func (c Counterparts) migrates(pc bundle.PlanContainer) bool { return !c.out[c.part[pc.Name]] }
+
+// keeps 表示迁移包里的容器 pc 是新服务器上保留下来的服务在旧服务器上的样子：它所在的部分在新服务器
+// 上有对应的已有容器、不迁入，或者和它同名的已有容器保留下来了（名字被占着）。
+func (c Counterparts) keeps(pc bundle.PlanContainer) bool {
+	u := c.part[pc.Name]
+	return c.there[u] && c.out[u] || c.Kept(pc.Name)
 }
 
 // Options 是检查的选项。
@@ -222,19 +306,23 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 	res := &Result{}
 	addIssue := func(i Issue) { res.Issues = append(res.Issues, i) }
 
+	// 要迁入的容器：去掉选择跳过的，以及因为新服务器上的已有容器不迁入的（见 Counterparts）。
+	existing := map[string]string{}
+	for name, tc := range t.Containers {
+		existing[name] = tc.Project
+	}
+	match := CounterpartsOf(plan.Containers, existing, d, o.Existing)
 	var containers []bundle.PlanContainer
 	for _, c := range plan.Containers {
-		if !d.SkippedContainer(c) {
+		if !d.SkippedContainer(c) && match.migrates(c) {
 			containers = append(containers, c)
 		}
 	}
 	res.Containers = len(containers)
-	planNames := map[string]bool{}
 	usedVolumes := map[string]bool{}
 	usedBinds := map[string]bool{}
 	hasProject := false
 	for _, c := range containers {
-		planNames[c.Name] = true
 		for _, v := range c.Volumes {
 			usedVolumes[v] = true
 		}
@@ -322,15 +410,30 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 	res.NeedBytes = diskIssues(plan, t, d, o, usedVolumes, usedBinds, addIssue)
 
 	// ---------- 已有的同名容器、Compose 项目、数据卷 ----------
-	for _, c := range containers {
-		if c.Project != "" {
+	// 按 --existing skip 保留、不迁入的也要说一声，所以看的是选择跳过的之外的全部。
+	held := map[string]bool{} // 里面的容器要用的名字被保留下来的已有容器占着、不迁入的 Compose 项目
+	for _, c := range plan.Containers {
+		if d.SkippedContainer(c) {
+			continue
+		}
+		if h := match.Holder(c.Name); h != "" {
+			// 同名的已有容器跟着另一个 Compose 项目 h 走（见 Counterparts），不单独问：h 替换时名字空出来，
+			// 保留时名字被占着，c 所在的部分也不迁入。
+			if match.Kept(c.Name) {
+				what := "这个容器"
+				if c.Project != "" {
+					what, held[c.Project] = " Compose 项目 "+c.Project, true
+				}
+				addIssue(Issue{Level: Info, Kind: "existing_container", Container: c.Name, Project: c.Project,
+					Title: fmt.Sprintf("新服务器上已有同名容器 %s，它属于保留的 %s，不迁入%s", c.Name, h, what)})
+			}
+			continue
+		}
+		if c.Project != "" || slices.Contains(d.ReplaceContainers, c.Name) {
 			continue
 		}
 		tc, ok := t.Containers[c.Name]
 		if !ok {
-			continue
-		}
-		if slices.Contains(d.ReplaceContainers, c.Name) {
 			continue
 		}
 		switch o.Existing {
@@ -354,31 +457,28 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 			}
 		}
 	}
-	for _, p := range projectNames(containers) {
-		if !t.Projects[p] {
-			continue
-		}
-		if slices.Contains(d.ReplaceProjects, p) {
+	for _, p := range projectNames(plan.Containers) {
+		what := match.ExistingFor(p)
+		if what == "" || held[p] || slices.Contains(d.SkipProjects, p) || slices.Contains(d.ReplaceProjects, p) {
 			continue
 		}
 		switch o.Existing {
 		case "fail":
 			addIssue(Issue{Level: Stop, Kind: "existing_project", Project: p,
-				Title: "新服务器上已经有同名的 Compose 项目 " + p + "（--existing fail 不允许替换）",
-				Hint:  "删除这个项目的容器，或者去掉 --existing fail"})
+				Title: "新服务器上已经有" + what + "（--existing fail 不允许替换）",
+				Hint:  "删除或改名新服务器上的这些容器，或者去掉 --existing fail"})
 		case "replace":
 			addIssue(Issue{Level: Info, Kind: "existing_project", Project: p,
-				Title: "新服务器上已有同名的 Compose 项目 " + p + "，会被替换（迁入失败时放回原来的）"})
+				Title: "新服务器上已有" + what + "，会被替换（迁入失败时放回原来的）"})
 		case "skip":
 			addIssue(Issue{Level: Info, Kind: "existing_project", Project: p,
-				Title: "新服务器上已有同名的 Compose 项目 " + p + "，保留它、不迁入这个项目"})
+				Title: "新服务器上已有" + what + "，保留它、不迁入这个项目"})
 		default:
 			addIssue(Issue{Level: Ask, Kind: "existing_project", Project: p,
-				Title: "新服务器上已经有同名的 Compose 项目 " + p})
+				Title: "新服务器上已经有" + what})
 		}
 	}
-	match := CounterpartsOf(plan.Containers, d, o.Existing)
-	keptDataIssues(plan, t, d, o, match, addIssue)
+	keptDataIssues(plan, t, d, containers, match, addIssue)
 	for _, v := range plan.Volumes {
 		if !usedVolumes[v.Name] || d.KeepVolume(v.Name) || spec.IsAnonymousVolume(v.Name) {
 			continue
@@ -396,7 +496,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		}
 	}
 
-	networkIssues(plan, t, d, containers, planNames, addIssue)
+	networkIssues(plan, t, d, containers, match, addIssue)
 	portIssues(t, d, containers, match, addIssue)
 
 	// ---------- digest 固定的镜像 ----------
@@ -414,23 +514,10 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 	return res
 }
 
-// keptDataIssues 找出和保留下来的已有服务共用数据的容器。保留的服务（检查时选择了保留，
-// 或者 --existing skip）不迁入，但共用数据的其他容器迁入时会写入它的卷和目录，等于没保住
+// keptDataIssues 找出要迁入的容器（containers）里和保留下来的已有服务共用数据的。保留的服务（检查时
+// 选择了保留，或者 --existing skip）不迁入，但共用数据的其他容器迁入时会写入它的卷和目录，等于没保住
 // 它的数据。保留的服务用到的数据按新服务器上它实际挂载的、加上旧服务器上同名服务挂载的算。
-func keptDataIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, match Counterparts, addIssue func(Issue)) {
-	keptProject := func(p string) bool {
-		return t.Projects[p] && (slices.Contains(d.SkipProjects, p) || o.Existing == "skip")
-	}
-	keptContainer := func(name string) bool {
-		_, ok := t.Containers[name]
-		return ok && (slices.Contains(d.SkipContainers, name) || o.Existing == "skip")
-	}
-	kept := func(c bundle.PlanContainer) bool {
-		if c.Project != "" {
-			return keptProject(c.Project)
-		}
-		return keptContainer(c.Name)
-	}
+func keptDataIssues(plan *bundle.Plan, t *Target, d *Decisions, containers []bundle.PlanContainer, match Counterparts, addIssue func(Issue)) {
 	type owner struct{ path, who string }
 	keptVolumes := map[string]string{} // 卷名 → 谁在用
 	var keptBinds []owner
@@ -447,12 +534,12 @@ func keptDataIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, match
 		}
 	}
 	for _, c := range plan.Containers {
-		if kept(c) {
+		if match.keeps(c) {
 			use(unitName(c), c.Volumes, c.Binds)
 		}
 	}
 	for name, tc := range t.Containers {
-		if unit, skipped := match.Of(name, tc.Project); unit != "" && skipped {
+		if unit, skipped := match.Of(name); unit != "" && skipped {
 			use(unit, tc.Volumes, tc.Binds)
 		}
 	}
@@ -473,8 +560,8 @@ func keptDataIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, match
 		return "", ""
 	}
 	reported := map[string]bool{}
-	for _, c := range plan.Containers {
-		if d.SkippedContainer(c) || kept(c) || reported[unitName(c)] {
+	for _, c := range containers {
+		if reported[unitName(c)] {
 			continue
 		}
 		who, what := shared(c)
@@ -491,10 +578,12 @@ func keptDataIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, match
 // unitName 是迁移时的单位：Compose 项目里的容器跟着项目走。
 func unitName(c bundle.PlanContainer) string {
 	if c.Project != "" {
-		return "Compose 项目 " + c.Project
+		return projectUnit(c.Project)
 	}
 	return "容器 " + c.Name
 }
+
+func projectUnit(project string) string { return "Compose 项目 " + project }
 
 func diskIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, usedVolumes, usedBinds map[string]bool, addIssue func(Issue)) int64 {
 	if t.Disk == nil {
@@ -550,7 +639,7 @@ func diskIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, usedVolum
 	return need
 }
 
-func networkIssues(plan *bundle.Plan, t *Target, d *Decisions, containers []bundle.PlanContainer, planNames map[string]bool, addIssue func(Issue)) {
+func networkIssues(plan *bundle.Plan, t *Target, d *Decisions, containers []bundle.PlanContainer, match Counterparts, addIssue func(Issue)) {
 	used := map[string]bool{}
 	for _, c := range containers {
 		for _, n := range c.Networks {
@@ -613,8 +702,9 @@ func networkIssues(plan *bundle.Plan, t *Target, d *Decisions, containers []bund
 			if n.IP == "" || d.AutoIPFor(c.Name, n.Name) {
 				continue
 			}
+			// 迁入前会替换的已有容器（见 Counterparts）让出 IP。
 			holder := t.Networks[n.Name].IPs[n.IP]
-			if holder != "" && holder != c.Name && !planNames[holder] {
+			if holder != "" && !match.Replaced(holder) {
 				addIssue(Issue{Level: Ask, Kind: "ip_conflict", Container: c.Name, Project: c.Project, Network: n.Name,
 					Title: fmt.Sprintf("网络 %s 中的 IP %s 已被容器 %s 使用，%s需要它", n.Name, n.IP, holder, who(c))})
 			}
@@ -648,8 +738,6 @@ func portIssues(t *Target, d *Decisions, containers []bundle.PlanContainer, matc
 			}
 		}
 	}
-	// 迁入前会停下、改名备份的已有容器（见 Counterparts）让出端口。
-	releases := func(name string) bool { return match.Replaced(name, t.Containers[name].Project) }
 	requested := map[string][]binding{} // 协议/端口 → 迁移包里要用它的容器
 	for _, c := range containers {
 		if c.NetworkMode == "host" || strings.HasPrefix(c.NetworkMode, "container:") {
@@ -680,7 +768,8 @@ func portIssues(t *Target, d *Decisions, containers []bundle.PlanContainer, matc
 				continue
 			}
 			requested[key] = append(requested[key], binding{ip: ip, container: c.Name})
-			if holder := portHolder(t, p.Proto, ip, port, releases); holder != "" {
+			// 迁入前会替换的已有容器（见 Counterparts）让出端口。
+			if holder := portHolder(t, p.Proto, ip, port, match.Replaced); holder != "" {
 				addIssue(Issue{Level: Ask, Kind: "port", Container: c.Name, Project: c.Project, Port: &ref,
 					Title:   fmt.Sprintf("端口 %s 已被%s占用，%s需要使用它", port, ui.CJKSpaced(holder), who(c)),
 					Suggest: suggest(p.Proto, port, taken)})

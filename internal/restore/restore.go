@@ -102,7 +102,7 @@ type run struct {
 
 	replaceProjects  []string                             // 要替换的已有同名 Compose 项目
 	existingProjects map[string][]docker.ContainerSummary // 新服务器上已有的 Compose 项目 → 它的容器
-	noted            map[string]bool                      // 已经在事务日志里记下原来指向的镜像名（见 noteTags）
+	noted            map[string]bool                      // 已经在事务日志里记下原来指向的镜像名（见 noteTag）
 
 	done []string // 同一个链接上次已经迁入、这次跳过的服务
 
@@ -194,10 +194,10 @@ func (r *run) steps(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := r.checkCompose(ctx); err != nil {
+	if err := r.decide(ctx); err != nil {
 		return err
 	}
-	if err := r.decide(ctx); err != nil {
+	if err := r.checkCompose(ctx); err != nil {
 		return err
 	}
 	s.End(summary)

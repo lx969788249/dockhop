@@ -24,7 +24,6 @@ type Target struct {
 	Compose       string // 新服务器上 Compose 的版本
 	Local         bool
 	Containers    map[string]TargetContainer
-	Projects      map[string]bool
 	Volumes       map[string]*docker.Volume
 	Networks      map[string]TargetNetwork
 	DockerPorts   []DockerPort // 已有容器对外开放的端口
@@ -66,8 +65,8 @@ func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, e
 		Arch: info.Architecture, DockerVersion: info.ServerVersion, DockerRoot: info.DockerRootDir,
 		MemTotal: info.MemTotal, HasCompose: compose != "", Compose: compose, Local: dc.Local(),
 		Runtimes: map[string]bool{}, VolumePlugins: map[string]bool{},
-		Containers: map[string]TargetContainer{}, Projects: map[string]bool{},
-		Volumes: map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{},
+		Containers: map[string]TargetContainer{},
+		Volumes:    map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{},
 		Exists: func(p string) bool { _, err := os.Stat(p); return err == nil },
 		Disk:   host.DiskOf,
 	}
@@ -96,9 +95,6 @@ func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, e
 			}
 		}
 		t.Containers[c.Name()] = tc
-		if proj != "" {
-			t.Projects[proj] = true
-		}
 		for _, p := range c.Ports {
 			if p.PublicPort > 0 {
 				t.DockerPorts = append(t.DockerPorts, DockerPort{Proto: p.Type, IP: p.IP, Port: strconv.Itoa(p.PublicPort), Container: c.Name()})

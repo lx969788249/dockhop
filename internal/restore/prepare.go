@@ -41,7 +41,8 @@ func (r *run) prepare(ctx context.Context) error {
 		stopped++
 	}
 
-	// 已有的同名独立容器：停止、改名备份、断开网络（释放固定 IP），失败时改回来。
+	// 和迁入的容器同名、不随 Compose 项目一起备份的已有容器（见 decide）：停止、改名备份、断开网络
+	// （释放固定 IP），失败时改回来。
 	backedUp := 0
 	for _, it := range r.items {
 		if !r.targets[it.m.Name] {

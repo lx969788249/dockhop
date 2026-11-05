@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -163,9 +162,11 @@ func (r *run) loadImageFiles(ctx context.Context) error {
 		label := fmt.Sprintf("加载镜像 %d/%d", i+1, len(files))
 		src := r.images[f.File]
 		// 不管从哪里来，最后都会给它加上原来的名字（加载的文件里也带着这些名字）。
-		r.in(r.imageKey(f.ID, f.Refs))
-		if err := r.noteTags(ctx, f.Refs); err != nil {
-			return err
+		for _, ref := range f.Refs {
+			r.in(r.imageKey(f.ID, ref))
+			if err := r.noteTag(ctx, ref); err != nil {
+				return err
+			}
 		}
 		var err error
 		switch {
@@ -272,48 +273,57 @@ func (r *run) loadImageFile(ctx context.Context, label string, f bundle.ImageFil
 	return nil
 }
 
-// imageKey 返回用到这个镜像（镜像 ID 是 id，或者镜像名在 refs 里）的容器所在的组（见 in）：
-// 只有一组服务用它时，它的名字跟着这一组走，只保留一部分服务时，没保留的那组用的名字也要改回去；
-// 几组都用它时为空，算整次迁入共用的。
-func (r *run) imageKey(id string, refs []string) string {
-	key := ""
-	for _, it := range r.items {
-		if (id == "" || it.m.ImageID != id) && !slices.Contains(refs, it.c.Config.Image) {
-			continue
-		}
-		k := "c:" + it.m.Name
-		if key != "" && r.groupOf[k] != r.groupOf[key] {
-			return ""
-		}
-		key = k
+// imageKey 返回一个镜像名跟着哪一组走（见 in）：只保留一部分服务时，没保留的组单独用的名字要
+// 改回去，几组都用的留着。按名字算，不按镜像：用这个名字的容器（容器配置里写的镜像是 ref）在哪一组，
+// 名字就跟着哪一组；没有容器用它时（同一个镜像的别的名字），跟着用这个镜像（ID 是 id）的容器。这些
+// 容器不止一组时为空，算整次迁入共用的。两组用同一个镜像的不同名字时各归各的，按镜像算的话，没保留
+// 的那组的名字也会被当成共用的留下来。
+func (r *run) imageKey(id, ref string) string {
+	if key, used := r.usersKey(func(it *citem) bool { return it.c.Config.Image == ref }); used {
+		return key
 	}
+	key, _ := r.usersKey(func(it *citem) bool { return id != "" && it.m.ImageID == id })
 	return key
 }
 
-// noteTags 在镜像名被改动之前（加名字，或者 docker load 按文件里记的名字加名字），把它们
-// 原来指向哪个镜像记进事务日志：迁入失败时改回去，原来没有的名字删掉（见 undoTag）。
+// usersKey 返回符合 match 的容器所在的组（其中一个容器的键），它们不止一组时为空；used 表示有
+// 这样的容器。
+func (r *run) usersKey(match func(*citem) bool) (key string, used bool) {
+	for _, it := range r.items {
+		if !match(it) {
+			continue
+		}
+		k := "c:" + it.m.Name
+		if used && r.groupOf[k] != r.groupOf[key] {
+			return "", true
+		}
+		key, used = k, true
+	}
+	return key, used
+}
+
+// noteTag 在镜像名 name 被改动之前（加名字，或者 docker load 按文件里记的名字加名字），把它
+// 原来指向哪个镜像记进事务日志：迁入失败时改回去，原来没有的名字删掉（见 undoTags）。
 // 按摘要的引用（名字@sha256:…）不是名字，不会被改动。
-func (r *run) noteTags(ctx context.Context, refs []string) error {
+func (r *run) noteTag(ctx context.Context, name string) error {
+	if strings.Contains(name, "@sha256:") || r.noted[name] {
+		return nil
+	}
+	id := ""
+	img, err := r.Docker.InspectImage(ctx, name)
+	switch {
+	case err == nil:
+		id = img.ID
+	case !docker.IsNotFound(err):
+		return r.Screen.StepFailed("读不到新服务器上的镜像 "+name, err.Error(), "确认 Docker 运行正常后重新运行")
+	}
+	if err := r.j.add(Entry{Op: opTag, Name: name, ID: id}); err != nil {
+		return r.Screen.StepFailed(err.Error(), "", "")
+	}
 	if r.noted == nil {
 		r.noted = map[string]bool{}
 	}
-	for _, ref := range refs {
-		if strings.Contains(ref, "@sha256:") || r.noted[ref] {
-			continue
-		}
-		id := ""
-		img, err := r.Docker.InspectImage(ctx, ref)
-		switch {
-		case err == nil:
-			id = img.ID
-		case !docker.IsNotFound(err):
-			return r.Screen.StepFailed("读不到新服务器上的镜像 "+ref, err.Error(), "确认 Docker 运行正常后重新运行")
-		}
-		if err := r.j.add(Entry{Op: opTag, Name: ref, ID: id}); err != nil {
-			return r.Screen.StepFailed(err.Error(), "", "")
-		}
-		r.noted[ref] = true
-	}
+	r.noted[name] = true
 	return nil
 }
 
@@ -354,8 +364,11 @@ func (r *run) loadImages(ctx context.Context) error {
 			names = append(names, ref)
 		}
 		sort.Strings(names)
-		if err := r.noteTags(ctx, names); err != nil {
-			return err
+		for _, name := range names {
+			r.in(r.imageKey(r.m.Images.Refs[name], name))
+			if err := r.noteTag(ctx, name); err != nil {
+				return err
+			}
 		}
 		rc := bundle.OpenStream(r.dataDir, "images", r.m.Images.Parts)
 		p := s.StartProgress("加载镜像", r.m.Images.Bytes, "镜像较大时需要几分钟")
@@ -425,9 +438,10 @@ func (r *run) resolveImage(ctx context.Context, ref string) (string, error) {
 	if id == "" {
 		return "", s.StepFailed("镜像 "+ref+" 没有加载成功", "", "")
 	}
+	// 用 ref 的容器会改用名字 as 创建，名字跟着它们走。
 	as := preflight.StripDigest(ref)
-	r.in(r.imageKey(r.m.Images.Refs[ref], []string{ref}))
-	if err := r.noteTags(ctx, []string{as}); err != nil {
+	r.in(r.imageKey(r.m.Images.Refs[ref], ref))
+	if err := r.noteTag(ctx, as); err != nil {
 		return "", err
 	}
 	repo, tag := splitTag(as)

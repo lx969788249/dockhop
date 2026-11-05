@@ -110,7 +110,8 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 
 	// 第 2 遍：数据。
 	u.screen.Note("删除这次写入的网络、文件、目录和数据卷，放回原有的")
-	var brought, had []string // 镜像名改回去之前指向的镜像，加载镜像之前已有的镜像
+	var tags []Entry // 改动过的镜像名，最后一起改回去（见 undoTags）
+	var had []string // 加载镜像之前已有的镜像
 	for i := len(entries) - 1; i >= 0; i-- {
 		e := entries[i]
 		switch e.Op {
@@ -148,14 +149,12 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		case opVolume:
 			u.undoVolume(ctx, e, note)
 		case opTag:
-			if id := u.undoTag(ctx, e, note); id != "" {
-				brought = append(brought, id)
-			}
+			tags = append(tags, e)
 		case opImages:
 			had = e.Names
 		}
 	}
-	u.removeImages(ctx, brought, had)
+	u.undoTags(ctx, tags, had, note)
 	if u.fail("rollback-data") {
 		note("（测试）模拟数据没能放回")
 	}
@@ -240,37 +239,60 @@ func nameIn(ids map[string]string) func(string) string {
 	}
 }
 
-// undoTag 把镜像名改回迁入前指向的镜像，原来没有的名字删掉（它是镜像最后一个名字、又没有
-// 容器在用时，Docker 会连镜像一起删）。返回改回去之前这个名字指向的镜像，等名字都改回去之后
-// 再看它要不要删（见 removeImages）：现在删，后面要改回去的名字可能正好要用它；没改动时为空。
-func (u *undo) undoTag(ctx context.Context, e Entry, note func(string, ...any)) string {
-	cur, err := u.dc.InspectImage(ctx, e.Name)
-	switch {
-	case docker.IsNotFound(err):
+// undoTags 把镜像名改回迁入前的样子（tags 是日志里改动过的镜像名，按撤销的顺序）：原来指向别的
+// 镜像的改回去，原来没有的删掉；再删掉这次迁入带来的、已经没有名字的镜像。加载镜像之前这台服务器
+// 上就有的镜像（had）一个不删。
+//
+// 删掉镜像最后一个名字时，Docker 会连镜像一起删（有容器在用时不让删），所以：
+//  1. 先把原来指向别的镜像的名字全部改回去。要是先删原来没有的名字，它指向的镜像可能被一起删掉，
+//     而后面要改回去的名字原来正指向它（迁入时一个名字挪走、另一个新名字加到了它上面）；
+//  2. 再删原来没有的名字。它是原有的镜像唯一的名字时不删（那个镜像原来没有名字，迁入时用上了它、
+//     加了这个名字）：删了名字，镜像就没了；
+//  3. 最后看名字改回去之前指向的镜像，没有名字了、又不是原有的，删掉（见 removeImages）。
+func (u *undo) undoTags(ctx context.Context, tags []Entry, had []string, note func(string, ...any)) {
+	var brought []string // 名字改回去之前指向的镜像
+	for _, e := range tags {
 		if e.ID == "" {
-			return "" // 已经删掉了（之前撤销过）
+			continue
 		}
-	case err != nil:
-		note("读不到镜像 %s：%v", e.Name, err)
-		return ""
-	case cur.ID == e.ID:
-		return "" // 还指向原来的镜像（没来得及改，或者之前撤销过）
+		cur, err := u.dc.InspectImage(ctx, e.Name)
+		switch {
+		case docker.IsNotFound(err):
+		case err != nil:
+			note("读不到镜像 %s：%v", e.Name, err)
+			continue
+		case cur.ID == e.ID:
+			continue // 还指向原来的镜像（没来得及改，或者之前撤销过）
+		}
+		repo, tag := splitTag(e.Name)
+		if err := u.dc.TagImage(ctx, e.ID, repo, tag); err != nil {
+			note("镜像名 %s 没能改回原来的镜像：%v", e.Name, err)
+			continue
+		}
+		if cur != nil {
+			brought = append(brought, cur.ID)
+		}
 	}
-	if e.ID == "" {
+	for _, e := range tags {
+		if e.ID != "" {
+			continue
+		}
+		cur, err := u.dc.InspectImage(ctx, e.Name)
+		switch {
+		case docker.IsNotFound(err):
+			continue // 已经删掉了（之前撤销过）
+		case err != nil:
+			note("读不到镜像 %s：%v", e.Name, err)
+			continue
+		case slices.Contains(had, cur.ID) && len(cur.RepoTags) <= 1:
+			u.logf("回滚：镜像名 %s 是原有的镜像 %s 唯一的名字，删掉名字 Docker 会连镜像一起删，保留", e.Name, cur.ID)
+			continue
+		}
 		if err := u.dc.RemoveImage(ctx, e.Name); err != nil && !docker.IsNotFound(err) {
 			u.logf("回滚：镜像名 %s 有容器在用，保留：%v", e.Name, err)
 		}
-		return ""
 	}
-	repo, tag := splitTag(e.Name)
-	if err := u.dc.TagImage(ctx, e.ID, repo, tag); err != nil {
-		note("镜像名 %s 没能改回原来的镜像：%v", e.Name, err)
-		return ""
-	}
-	if cur == nil {
-		return ""
-	}
-	return cur.ID
+	u.removeImages(ctx, brought, had)
 }
 
 // removeImages 删掉这次迁入带来的镜像：镜像名都改回去之后，它们原来指向的这些镜像（ids）没有

@@ -170,7 +170,7 @@ func TestPartialRollbackRestoresImageNames(t *testing.T) {
 	}
 	r.items[0].c.Config.Image, r.items[1].c.Config.Image = "base:1", "base:1" // 两组都用 base:1
 	r.buildGroups(nil)
-	if r.imageKey("sha256:src-bad", []string{"bad:1"}) != "c:bad" || r.imageKey("sha256:src-base", []string{"base:1"}) != "" {
+	if r.imageKey("sha256:src-bad", "bad:1") != "c:bad" || r.imageKey("sha256:src-base", "base:1") != "" {
 		t.Fatal("只有一组用的镜像跟着那一组，两组都用的算共用")
 	}
 	d := &images{tags: map[string]string{"good:1": "sha256:new-good", "bad:1": "sha256:new-bad", "base:1": "sha256:new-base"},
@@ -185,7 +185,7 @@ func TestPartialRollbackRestoresImageNames(t *testing.T) {
 		j.add(e)
 	}
 	for _, x := range []struct{ id, ref, was string }{{"sha256:src-good", "good:1", ""}, {"sha256:src-bad", "bad:1", "sha256:old-bad"}, {"sha256:src-base", "base:1", ""}} {
-		r.in(r.imageKey(x.id, []string{x.ref}))
+		r.in(r.imageKey(x.id, x.ref))
 		j.add(Entry{Op: opTag, Name: x.ref, ID: x.was})
 	}
 	ok, bad := r.groupByID(r.groupOf["c:good"]), r.groupByID(r.groupOf["c:bad"])

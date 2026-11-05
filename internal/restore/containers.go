@@ -179,7 +179,7 @@ func (r *run) imageWithout(ctx context.Context, base string, deleted []string, n
 	if len(tag) > 128 {
 		tag = tag[:128]
 	}
-	if err := r.noteTags(ctx, []string{"dockhop-image:" + tag}); err != nil {
+	if err := r.noteTag(ctx, "dockhop-image:"+tag); err != nil {
 		return "", err
 	}
 	if _, err := dc.CommitWithConfig(ctx, id, "dockhop-image", tag, commitCfg); err != nil {

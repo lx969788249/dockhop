@@ -41,22 +41,41 @@ func (r *run) decide(ctx context.Context) error {
 		policy = "replace" // 检查时已经问过
 	}
 
-	// 要迁入的内容：去掉检查时选择跳过的，以及 --existing skip 时已经有的。
+	// 要迁入的内容：去掉检查时选择跳过的，--existing skip 时新服务器上已经有对应的，以及要用的名字被
+	// 保留下来的已有容器占着的（见 preflight.Counterparts）。
+	match := r.counterparts(existing)
+	// held 说明 Compose 项目 project 为什么不迁入：它里面的容器要用的名字被保留下来的已有容器占着；
+	// 不是这样时为空。
+	held := func(project string) string {
+		for _, mc := range r.m.Containers {
+			if h := match.Holder(mc.Name); mc.Project == project && h != "" && match.Kept(mc.Name) {
+				return "新服务器上的同名容器 " + mc.Name + " 属于保留的 " + h
+			}
+		}
+		return ""
+	}
 	r.targets = map[string]bool{}
 	var replaceProjects []string
 	for _, p := range r.m.Projects {
 		if slices.Contains(r.d.SkipProjects, p.Name) {
 			continue
 		}
-		if len(projects[p.Name]) > 0 {
+		if why := held(p.Name); why != "" {
+			r.d.SkipProjects = append(r.d.SkipProjects, p.Name)
+			r.d.Skipped = append(r.d.Skipped, preflight.Skip{Project: p.Name, Reason: why})
+			continue
+		}
+		if what := match.ExistingFor(p.Name); what != "" {
 			switch policy {
 			case "skip":
 				r.d.SkipProjects = append(r.d.SkipProjects, p.Name)
-				r.d.Skipped = append(r.d.Skipped, preflight.Skip{Project: p.Name, Reason: "新服务器上已有同名项目，按 --existing skip 保留"})
+				r.d.Skipped = append(r.d.Skipped, preflight.Skip{Project: p.Name, Reason: "新服务器上已有" + what + "，按 --existing skip 保留"})
 				continue
 			case "fail":
-				return s.StepFailed("新服务器上已经有同名的 Compose 项目 "+p.Name+"（--existing fail 不允许替换），没有改动任何东西", "", "删除这个项目的容器，或者去掉 --existing fail")
+				return s.StepFailed("新服务器上已经有"+what+"（--existing fail 不允许替换），没有改动任何东西", "", "删除或改名新服务器上的这些容器，或者去掉 --existing fail")
 			}
+		}
+		if len(projects[p.Name]) > 0 {
 			replaceProjects = append(replaceProjects, p.Name)
 		}
 		r.projects = append(r.projects, p)
@@ -77,17 +96,25 @@ func (r *run) decide(ctx context.Context) error {
 		for _, v := range logging.EnvSecrets(c.Config.Env) {
 			r.Redactor.AddSecret(v)
 		}
-		inProject := mc.Project != "" && r.projectRestored(mc.Project)
-		if !inProject {
-			if _, ok := byName[mc.Name]; ok {
-				switch policy {
-				case "skip":
-					r.d.SkipContainers = append(r.d.SkipContainers, mc.Name)
-					r.d.Skipped = append(r.d.Skipped, preflight.Skip{Container: mc.Name, Reason: "新服务器上已有同名容器，按 --existing skip 保留"})
-					continue
-				case "fail":
-					return s.StepFailed("新服务器上已经有同名容器 "+mc.Name+"（--existing fail 不允许替换），没有改动任何东西", "", "删除这个容器，或者去掉 --existing fail")
-				}
+		if x, ok := byName[mc.Name]; ok {
+			switch h := match.Holder(mc.Name); {
+			case h != "" && match.Kept(mc.Name):
+				// 名字被跟着 h 保留下来的已有容器占着。Compose 项目里的容器不会到这里：整个项目上面已经跳过。
+				r.d.SkipContainers = append(r.d.SkipContainers, mc.Name)
+				r.d.Skipped = append(r.d.Skipped, preflight.Skip{Container: mc.Name, Reason: "新服务器上的同名容器属于保留的 " + h})
+				continue
+			case h != "":
+				// 同名的已有容器随 h 一起替换（见 backupProject），名字空出来，不用另外备份。
+			case mc.Project != "" && x.Labels["com.docker.compose.project"] == mc.Project:
+				// 它属于要替换的同名 Compose 项目，随项目一起备份。
+			case policy == "skip":
+				r.d.SkipContainers = append(r.d.SkipContainers, mc.Name)
+				r.d.Skipped = append(r.d.Skipped, preflight.Skip{Container: mc.Name, Reason: "新服务器上已有同名容器，按 --existing skip 保留"})
+				continue
+			case policy == "fail":
+				return s.StepFailed("新服务器上已经有同名容器 "+mc.Name+"（--existing fail 不允许替换），没有改动任何东西", "", "删除这个容器，或者去掉 --existing fail")
+			default:
+				// 它跟着这个容器（单独迁入的），或者这个容器所在的 Compose 项目：停下、改名备份，名字空出来。
 				r.targets[mc.Name] = true
 			}
 		}
@@ -105,16 +132,20 @@ func (r *run) decide(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	r.buildGroups(writers)
 	r.writers, r.replaceProjects, r.existingProjects = writers, replaceProjects, projects
+	r.buildGroups(writers)
 	r.seen = r.scene(existing, writers)
 	return r.checkStoppable(ctx)
 }
 
 // counterparts 说明新服务器上的已有容器迁入时会怎样：和迁入前检查是同一条规则（见
 // preflight.Counterparts），检查时说会替换的，迁入时才会替换。
-func (r *run) counterparts() preflight.Counterparts {
-	return preflight.CounterpartsOf(r.plan.Containers, &r.d, r.opts.Existing)
+func (r *run) counterparts(existing []docker.ContainerSummary) preflight.Counterparts {
+	projects := map[string]string{}
+	for _, c := range existing {
+		projects[c.Name()] = c.Labels["com.docker.compose.project"]
+	}
+	return preflight.CounterpartsOf(r.plan.Containers, projects, &r.d, r.opts.Existing)
 }
 
 // findWriters 找出新服务器上和要写入的数据（数据卷、挂载目录、Compose 项目的文件）共用的已有容器：
@@ -125,7 +156,7 @@ func (r *run) counterparts() preflight.Counterparts {
 // 读不到某个容器的配置时，没法确认它有没有在用这些数据，不能当作没有。
 func (r *run) findWriters(ctx context.Context, existing []docker.ContainerSummary) ([]writer, error) {
 	s := r.Screen
-	match := r.counterparts()
+	match := r.counterparts(existing)
 	volumes, dirs := r.writeSet()
 	self, _ := os.Hostname()
 	ignore := map[string]bool{}
@@ -134,12 +165,12 @@ func (r *run) findWriters(ctx context.Context, existing []docker.ContainerSummar
 	}
 	var writers []writer
 	for _, c := range existing {
-		name, project := c.Name(), c.Labels["com.docker.compose.project"]
-		kept := match.Kept(name, project)
+		name := c.Name()
+		kept := match.Kept(name)
 		if !kept && c.State != "running" && c.State != "paused" && c.State != "restarting" {
 			continue
 		}
-		if match.Replaced(name, project) || ignore[name] || (len(self) >= 12 && strings.HasPrefix(c.ID, self)) {
+		if match.Replaced(name) || ignore[name] || (len(self) >= 12 && strings.HasPrefix(c.ID, self)) {
 			continue
 		}
 		full, _, err := r.Docker.InspectContainer(ctx, c.ID)
@@ -162,10 +193,10 @@ func (r *run) findWriters(ctx context.Context, existing []docker.ContainerSummar
 // scene 是新服务器上和这次迁入有关的已有容器：要替换的（名字、ID），要临时停下的、和迁入的
 // 数据共用的（名字、ID、状态）。decide 时记下，改动之前再核对一次（见 recheck）。
 func (r *run) scene(existing []docker.ContainerSummary, writers []writer) []string {
-	match := r.counterparts()
+	match := r.counterparts(existing)
 	var out []string
 	for _, c := range existing {
-		if match.Replaced(c.Name(), c.Labels["com.docker.compose.project"]) {
+		if match.Replaced(c.Name()) {
 			out = append(out, c.Name()+" "+c.ID)
 		}
 	}

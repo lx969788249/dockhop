@@ -241,26 +241,34 @@ func testJournal(t *testing.T) *Journal {
 	return j
 }
 
-// 加载镜像时，只有一组服务用的镜像，它的名字记在这一组名下（只保留一部分服务时据此改回去，见
-// commitPartial）；几组都用的算整次迁入共用。加载之前记下已有的镜像，回滚时不删它们。
+// 加载镜像时，镜像名记在用它的那组名下（只保留一部分服务时据此改回去，见 commitPartial）；
+// 几组都用的算整次迁入共用。看的是名字，不是镜像：两组用同一个镜像的不同名字时各归各的，
+// 没有容器用的名字跟着用这个镜像的容器。加载之前记下已有的镜像，回滚时不删它们。
 func TestImageNamesFollowGroups(t *testing.T) {
 	d := &images{tags: map[string]string{"bad:1": "sha256:old-bad"}, ids: map[string]bool{"sha256:old-bad": true,
-		"sha256:good": true, "sha256:bad": true, "sha256:base": true}}
+		"sha256:good": true, "sha256:bad": true, "sha256:base": true, "sha256:pair": true}}
 	var out bytes.Buffer
 	r := &run{Deps: Deps{Docker: d.docker(t), Screen: ui.New(&out, false, nil)}, imageAs: map[string]string{},
 		m: &bundle.Manifest{Images: bundle.Images{Refs: map[string]string{}}}, images: map[string]imageSource{}}
-	// good、bad 各用自己的镜像；base:1 两个互不相干（分在不同组）的容器都用。
-	for _, x := range [][2]string{{"good", "good:1"}, {"bad", "bad:1"}, {"tool-a", "base:1"}, {"tool-b", "base:1"}} {
-		it := &citem{m: bundle.Container{Name: x[0]}, c: &docker.Container{}}
+	// good、bad 各用自己的镜像；base:1 两个互不相干（分在不同组）的容器都用；left、right 用
+	// 同一个镜像的两个名字，这个镜像还有一个谁都没用的名字 pair:latest。
+	for _, x := range [][3]string{{"good", "good:1"}, {"bad", "bad:1"}, {"tool-a", "base:1"}, {"tool-b", "base:1"},
+		{"left", "left:1", "sha256:pair"}, {"right", "right:1", "sha256:pair"}} {
+		it := &citem{m: bundle.Container{Name: x[0], ImageID: x[2]}, c: &docker.Container{}}
 		it.c.Config.Image = x[1]
 		r.items = append(r.items, it)
 	}
 	r.buildGroups(nil)
-	for i, ref := range []string{"good:1", "bad:1", "base:1"} {
-		id := "sha256:" + strings.TrimSuffix(ref, ":1")
-		f := bundle.ImageFile{File: fmt.Sprint(i), ID: id, Refs: []string{ref}}
+	for i, refs := range [][]string{{"good:1"}, {"bad:1"}, {"base:1"}, {"left:1", "right:1", "pair:latest"}} {
+		id := "sha256:" + strings.TrimSuffix(refs[0], ":1")
+		if len(refs) > 1 {
+			id = "sha256:pair"
+		}
+		f := bundle.ImageFile{File: fmt.Sprint(i), ID: id, Refs: refs}
 		r.m.ImageFiles = append(r.m.ImageFiles, f)
-		r.m.Images.Refs[ref] = id
+		for _, ref := range refs {
+			r.m.Images.Refs[ref] = id
+		}
 		r.images[f.File] = imageSource{local: id} // 本机已经有，只加名字
 	}
 	j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
@@ -283,8 +291,9 @@ func TestImageNamesFollowGroups(t *testing.T) {
 		}
 	}
 	want := map[string]string{"good:1": r.groupOf["c:good"], "bad:1": r.groupOf["c:bad"], "base:1": "",
-		"已有": "sha256:bad,sha256:base,sha256:good,sha256:old-bad"}
-	if !maps.Equal(got, want) || want["good:1"] == want["bad:1"] {
+		"left:1": r.groupOf["c:left"], "right:1": r.groupOf["c:right"], "pair:latest": "",
+		"已有": "sha256:bad,sha256:base,sha256:good,sha256:old-bad,sha256:pair"}
+	if !maps.Equal(got, want) || want["good:1"] == want["bad:1"] || want["left:1"] == want["right:1"] {
 		t.Fatalf("实际 %v，应为 %v", got, want)
 	}
 }
