@@ -3,8 +3,10 @@ package crypto
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
 	"errors"
 	"io"
+	"net"
 	"strings"
 	"testing"
 )
@@ -16,6 +18,9 @@ func TestLinkRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 		s := l.String()
+		if !strings.HasPrefix(s, "https://") {
+			t.Errorf("链接应以 https:// 开头：%s", s)
+		}
 		if len(s) > 110 {
 			t.Errorf("链接太长（%d 个字符）：%s", len(s), s)
 		}
@@ -54,8 +59,10 @@ func TestParseLinkErrors(t *testing.T) {
 		{"1.2.3.4:8080", "这不是迁移链接"},
 		{l.Base(), "缺少 # 后面的密钥"},
 		{good[:len(good)-5], "密钥不完整"},
-		{"http://1.2.3.4:8080/x/#" + l.Secret(), "下载地址不完整"},
-		{"http://1.2.3.4:99999/" + l.Token + "/#" + l.Secret(), "端口不对"},
+		{"https://1.2.3.4:8080/x/#" + l.Secret(), "下载地址不完整"},
+		{"https://1.2.3.4:99999/" + l.Token + "/#" + l.Secret(), "端口不对"},
+		// 1.2.0 之前的版本生成的 http:// 链接不再支持：提示在旧服务器上重新迁出。
+		{strings.Replace(good, "https://", "http://", 1), "旧版本的 DockHop 生成的"},
 		{l.Base() + "#" + string(key), "密钥不对"},
 	}
 	for _, c := range cases {
@@ -114,5 +121,55 @@ func TestEncryptDecrypt(t *testing.T) {
 	other, _ := NewLink("1.2.3.4", 8080)
 	if _, err := open(other, sealed); !errors.Is(err, ErrWrongKey) {
 		t.Errorf("密钥不对时应返回 ErrWrongKey：%v", err)
+	}
+}
+
+// handshake 让 server 链接的下载服务和拿着 client 链接的新服务器握手，返回新服务器那边的结果。
+func handshake(t *testing.T, server, client Link) error {
+	t.Helper()
+	cfg, err := server.ServerTLS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		s := tls.Server(c, cfg)
+		_ = s.Handshake()
+		s.Close()
+	}()
+	c, err := tls.Dial("tcp", ln.Addr().String(), client.ClientTLS())
+	if err == nil {
+		c.Close()
+	}
+	<-done
+	return err
+}
+
+// 新服务器按链接里的密钥核对旧服务器的证书：同一条链接（旧服务器生成的、新服务器粘贴解析的）
+// 握手成功；别的链接的下载服务冒充不了。证书每次现场生成，内容不同也不影响核对。
+func TestTLSIdentity(t *testing.T) {
+	l, _ := NewLink("127.0.0.1", 8080)
+	parsed, err := ParseLink(l.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := handshake(t, l, parsed); err != nil {
+			t.Fatalf("同一条链接应握手成功：%v", err)
+		}
+	}
+	other, _ := NewLink("127.0.0.1", 8080)
+	if err := handshake(t, other, parsed); !errors.Is(err, ErrWrongServer) {
+		t.Fatalf("别的链接的下载服务应被认出来：%v", err)
 	}
 }

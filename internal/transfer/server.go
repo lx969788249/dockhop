@@ -5,11 +5,13 @@ package transfer
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -87,7 +89,8 @@ func Listen(port int) (net.Listener, int, error) {
 	return nil, 0, fmt.Errorf("端口 %d 往后的 50 个端口都被占用了（%v）", port, lastErr)
 }
 
-// NewServer 在 ln 上提供下载。notify 收到下载进度和迁入结果，可以为 nil。
+// NewServer 在 ln 上用 HTTPS 提供下载（证书见 crypto.Link.ServerTLS）。notify 收到下载进度
+// 和迁入结果，可以为 nil。
 func NewServer(ln net.Listener, link crypto.Link, bundlePath, planPath string, notify func(Event), logf func(string, ...any)) (*Server, error) {
 	st, err := os.Stat(bundlePath)
 	if err != nil {
@@ -99,6 +102,11 @@ func NewServer(ln net.Listener, link crypto.Link, bundlePath, planPath string, n
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	cfg, err := link.ServerTLS()
+	if err != nil {
+		return nil, err
+	}
+	ln = tls.NewListener(ln, cfg)
 	prefix := "/" + link.Token + "/"
 	s := &Server{link: link, prefix: prefix, bundlePath: bundlePath, planPath: planPath, size: st.Size(), notify: notify, logf: logf, ln: ln}
 	mux := http.NewServeMux()
@@ -106,8 +114,18 @@ func NewServer(ln net.Listener, link crypto.Link, bundlePath, planPath string, n
 	mux.HandleFunc(prefix+"image/", s.serveImage)
 	mux.HandleFunc(prefix+"plan", s.servePlan)
 	mux.HandleFunc(prefix+"status", s.receiveStatus)
-	s.srv = &http.Server{Handler: s.logged(mux), ReadHeaderTimeout: 30 * time.Second}
+	s.srv = &http.Server{Handler: s.logged(mux), ReadHeaderTimeout: 30 * time.Second,
+		// 连接层面的错误（扫描端口的程序常常握手到一半就断开）只写进日志，不打到屏幕上。
+		ErrorLog: log.New(logWriter(logf), "", 0)}
 	return s, nil
+}
+
+// logWriter 把下载服务自己的错误写进 DockHop 的日志。
+type logWriter func(string, ...any)
+
+func (f logWriter) Write(p []byte) (int, error) {
+	f("下载服务：%s", strings.TrimSpace(string(p)))
+	return len(p), nil
 }
 
 // Serve 开始提供下载，直到 Shutdown。
@@ -274,7 +292,7 @@ func SendStatus(ctx context.Context, link crypto.Link, st Status) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(StatusHeader, hex.EncodeToString(link.SignStatus(body)))
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient(link, 10*time.Second).Do(req)
 	if err != nil {
 		return err
 	}

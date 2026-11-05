@@ -23,13 +23,13 @@ func (r *run) client() *transfer.Client {
 			timeout = d
 		}
 	}
-	return transfer.NewClient(timeout, r.Log.Printf)
+	return transfer.NewClient(r.opts.Link, timeout, r.Log.Printf)
 }
 
 func (r *run) fetchPlan(ctx context.Context) error {
 	s := r.Screen
 	s.Note("连接旧服务器 " + r.opts.Link.Host)
-	raw, err := r.client().FetchPlan(ctx, r.opts.Link)
+	raw, err := r.client().FetchPlan(ctx)
 	if errors.Is(err, transfer.ErrNoPlan) {
 		// 迁移计划是迁入前检查和核对下载文件的依据，没有它不能迁入。
 		return s.StepFailed("旧服务器没有提供迁移计划，没法做迁入前检查（还没有下载或改动任何东西）", "",

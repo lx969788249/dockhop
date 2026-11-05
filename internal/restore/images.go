@@ -129,7 +129,7 @@ func (r *run) fetch(ctx context.Context, label string, parts []fetchPart) error 
 			p.Done(err)
 			return s.StepFailed("无法创建下载目录", err.Error(), "")
 		}
-		err := r.client().Download(ctx, r.opts.Link, transfer.Part{URL: part.url, Size: part.size, Before: before, Total: total}, part.path,
+		err := r.client().Download(ctx, transfer.Part{URL: part.url, Size: part.size, Before: before, Total: total}, part.path,
 			func(done, all int64) {
 				if total == 0 && all > 0 {
 					p.SetTotal(before + all)

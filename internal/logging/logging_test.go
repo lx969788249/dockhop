@@ -13,18 +13,18 @@ func TestRedact(t *testing.T) {
 	r.AddSecret("hunter2-very-secret")
 	r.AddSecret("abc") // 太短，不登记，避免误伤
 	cases := map[string]string{
-		"数据库密码是 hunter2-very-secret":                                                          "数据库密码是 ***",
-		"-e DB_PASSWORD=p@ss123 -e MODE=prod":                                                 "-e DB_PASSWORD=*** -e MODE=prod",
-		"MYSQL_ROOT_PASSWORD=x&y":                                                             "MYSQL_ROOT_PASSWORD=***&y",
-		`{"Env":["API_TOKEN=tok_123"],"Password": "s3cret"}`:                                  `{"Env":["API_TOKEN=***"],"Password": "***"}`,
-		"  admin_password: changeme":                                                          "  admin_password: ***",
-		"key is AGE-SECRET-KEY-1QQQ7ZZ":                                                       "key is ***",
-		"http://1.2.3.4:8080/tok/#a7j8zg6qtzkg8ddwxnzl94th3c4ns7ckdzjxu0w0fypeapduldmqq2q4nn": "http://1.2.3.4:8080/tok/#***",
-		"cannot connect to postgres://app:p%40ss!w0rd@db/app":                                 "cannot connect to postgres://app:***@db/app",
-		"DSN=mysql://root:x@tcp(db)/app":                                                      "DSN=***",
-		"see https://example.com/a@b":                                                         "see https://example.com/a@b",
-		"abc 是普通文字":                                                                           "abc 是普通文字",
-		"MODE=production":                                                                     "MODE=production",
+		"数据库密码是 hunter2-very-secret":                                                           "数据库密码是 ***",
+		"-e DB_PASSWORD=p@ss123 -e MODE=prod":                                                  "-e DB_PASSWORD=*** -e MODE=prod",
+		"MYSQL_ROOT_PASSWORD=x&y":                                                              "MYSQL_ROOT_PASSWORD=***&y",
+		`{"Env":["API_TOKEN=tok_123"],"Password": "s3cret"}`:                                   `{"Env":["API_TOKEN=***"],"Password": "***"}`,
+		"  admin_password: changeme":                                                           "  admin_password: ***",
+		"key is AGE-SECRET-KEY-1QQQ7ZZ":                                                        "key is ***",
+		"https://1.2.3.4:8080/tok/#a7j8zg6qtzkg8ddwxnzl94th3c4ns7ckdzjxu0w0fypeapduldmqq2q4nn": "https://1.2.3.4:8080/tok/#***",
+		"cannot connect to postgres://app:p%40ss!w0rd@db/app":                                  "cannot connect to postgres://app:***@db/app",
+		"DSN=mysql://root:x@tcp(db)/app":                                                       "DSN=***",
+		"see https://example.com/a@b":                                                          "see https://example.com/a@b",
+		"abc 是普通文字":                                                                            "abc 是普通文字",
+		"MODE=production":                                                                      "MODE=production",
 	}
 	for in, want := range cases {
 		if got := r.Redact(in); got != want {

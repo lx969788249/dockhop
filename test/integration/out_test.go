@@ -22,7 +22,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/transfer"
 )
 
-var linkPattern = regexp.MustCompile(`http://127\.0\.0\.1:\d+/[A-Za-z0-9]+/#[0-9a-z]{58}`)
+var linkPattern = regexp.MustCompile(`https://127\.0\.0\.1:\d+/[A-Za-z0-9]+/#[0-9a-z]{58}`)
 
 // fixture 是一组覆盖各种情况的测试容器。
 type fixture struct {
@@ -149,13 +149,13 @@ func TestOutBundleContents(t *testing.T) {
 	}
 
 	// 像新服务器一样：先拿迁移计划，再下载迁移包、解开。
-	plan := download(t, link.PlanURL())
+	plan := download(t, link, link.PlanURL())
 	pl, err := bundle.DecryptPlan(strings.NewReader(plan), link)
 	if err != nil {
 		t.Fatalf("迁移计划解不开：%v", err)
 	}
 	dst := t.TempDir()
-	resp, err := http.Get(link.BundleURL())
+	resp, err := fetch(link, link.BundleURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestOutBundleContents(t *testing.T) {
 	if !strings.HasPrefix(img.Pull, "alpine@sha256:") || len(pl.Images) != 1 || pl.Images[0].File != img.File || pl.Images[0].Pull != img.Pull {
 		t.Errorf("镜像应带着按摘要拉取的引用，迁移计划里也应有：%+v %+v", img, pl.Images)
 	}
-	resp, err = http.Get(link.ImageURL(img.File))
+	resp, err = fetch(link, link.ImageURL(img.File))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,9 +419,14 @@ func tarEntries(t *testing.T, rc io.ReadCloser) map[string]entry {
 	}
 }
 
-func download(t *testing.T, url string) string {
+// fetch 像新服务器一样下载：按链接核对旧服务器的证书。
+func fetch(link crypto.Link, url string) (*http.Response, error) {
+	return (&http.Client{Transport: &http.Transport{TLSClientConfig: link.ClientTLS()}}).Get(url)
+}
+
+func download(t *testing.T, link crypto.Link, url string) string {
 	t.Helper()
-	resp, err := http.Get(url)
+	resp, err := fetch(link, url)
 	if err != nil {
 		t.Fatal(err)
 	}

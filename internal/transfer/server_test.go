@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -43,6 +45,13 @@ func (r *recorder) has(kind EventKind) bool {
 
 func startServer(t *testing.T) (crypto.Link, []byte, *recorder) {
 	t.Helper()
+	link, data, rec, _ := startServerLogs(t)
+	return link, data, rec
+}
+
+// startServerLogs 开一个下载服务，另外返回下载服务写进日志的内容。
+func startServerLogs(t *testing.T) (crypto.Link, []byte, *recorder, func() string) {
+	t.Helper()
 	dir := t.TempDir()
 	data := make([]byte, 3<<20)
 	rand.Read(data)
@@ -54,22 +63,34 @@ func startServer(t *testing.T) (crypto.Link, []byte, *recorder) {
 	}
 	link, _ := crypto.NewLink("127.0.0.1", port)
 	rec := &recorder{}
-	s, err := NewServer(ln, link, filepath.Join(dir, "bundle"), filepath.Join(dir, "plan"), rec.add, nil)
+	var mu sync.Mutex
+	var logs strings.Builder
+	logf := func(format string, args ...any) {
+		mu.Lock()
+		fmt.Fprintf(&logs, format+"\n", args...)
+		mu.Unlock()
+	}
+	s, err := NewServer(ln, link, filepath.Join(dir, "bundle"), filepath.Join(dir, "plan"), rec.add, logf)
 	if err != nil {
 		t.Fatal(err)
 	}
 	go s.Serve()
 	t.Cleanup(func() { s.Shutdown(context.Background()) })
-	return link, data, rec
+	return link, data, rec, func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return logs.String()
+	}
 }
 
-func get(t *testing.T, url, rangeHeader string) (*http.Response, []byte) {
+// get 像新服务器一样下载：按链接核对旧服务器的证书。
+func get(t *testing.T, link crypto.Link, url, rangeHeader string) (*http.Response, []byte) {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	if rangeHeader != "" {
 		req.Header.Set("Range", rangeHeader)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient(link, 5*time.Second).Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,19 +101,19 @@ func get(t *testing.T, url, rangeHeader string) (*http.Response, []byte) {
 
 func TestServerDownloadAndResume(t *testing.T) {
 	link, data, rec := startServer(t)
-	resp, body := get(t, link.PlanURL(), "")
+	resp, body := get(t, link, link.PlanURL(), "")
 	if resp.StatusCode != 200 || string(body) != "PLAN" {
 		t.Fatalf("迁移计划：%d %q", resp.StatusCode, body)
 	}
 	// 先下一部分，再从断点继续。
-	resp, first := get(t, link.BundleURL(), "bytes=0-1048575")
+	resp, first := get(t, link, link.BundleURL(), "bytes=0-1048575")
 	if resp.StatusCode != http.StatusPartialContent || len(first) != 1<<20 {
 		t.Fatalf("分段下载：%d %d", resp.StatusCode, len(first))
 	}
 	if rec.has(DownloadComplete) {
 		t.Fatal("没下完时不应报告下载完成")
 	}
-	resp, rest := get(t, link.BundleURL(), fmt.Sprintf("bytes=%d-", len(first)))
+	resp, rest := get(t, link, link.BundleURL(), fmt.Sprintf("bytes=%d-", len(first)))
 	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(append(first, rest...), data) {
 		t.Fatalf("续传后的内容不一致：%d", resp.StatusCode)
 	}
@@ -100,7 +121,7 @@ func TestServerDownloadAndResume(t *testing.T) {
 		t.Fatal("下完后应报告下载完成")
 	}
 	// 随机路径不对时什么也拿不到。
-	resp, _ = get(t, strings.Replace(link.BundleURL(), link.Token, "wrongtoken12", 1), "")
+	resp, _ = get(t, link, strings.Replace(link.BundleURL(), link.Token, "wrongtoken12", 1), "")
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("错误的路径应返回 404：%d", resp.StatusCode)
 	}
@@ -114,19 +135,54 @@ func TestServerStatus(t *testing.T) {
 	if !rec.has(StatusReceived) {
 		t.Fatal("应收到迁入结果")
 	}
-	// 用别的密钥签名的结果会被拒绝。
+	// 拿着别的链接的新服务器：证书对不上，连结果都不发出去。
 	other, _ := crypto.NewLink(link.Host, link.Port)
 	other.Token = link.Token
-	if err := SendStatus(context.Background(), other, Status{Result: "success"}); err == nil || !strings.Contains(err.Error(), "403") {
-		t.Fatalf("签名不对应被拒绝：%v", err)
+	if err := SendStatus(context.Background(), other, Status{Result: "success"}); !errors.Is(err, crypto.ErrWrongServer) {
+		t.Fatalf("证书对不上时不应发出结果：%v", err)
+	}
+	// 知道下载口令、不知道密钥的人不核对证书硬发：签名不对，被拒绝。
+	post := func(body []byte, sig string, c *http.Client) int {
+		req, _ := http.NewRequest(http.MethodPost, link.StatusURL(), bytes.NewReader(body))
+		req.Header.Set(StatusHeader, sig)
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	insecure := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	body := []byte(`{"result":"success"}`)
+	if code := post(body, hex.EncodeToString(other.SignStatus(body)), insecure); code != http.StatusForbidden {
+		t.Fatalf("签名不对应返回 403：%d", code)
 	}
 	// 结果字段不对也会被拒绝。
-	body := []byte(`{"result":"maybe"}`)
-	req, _ := http.NewRequest(http.MethodPost, link.StatusURL(), bytes.NewReader(body))
-	req.Header.Set(StatusHeader, hex.EncodeToString(link.SignStatus(body)))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil || resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("结果字段不对应返回 400：%v %v", resp, err)
+	body = []byte(`{"result":"maybe"}`)
+	if code := post(body, hex.EncodeToString(link.SignStatus(body)), httpClient(link, 5*time.Second)); code != http.StatusBadRequest {
+		t.Fatalf("结果字段不对应返回 400：%d", code)
+	}
+}
+
+// 下载服务走 HTTPS：不加密的请求拿不到任何东西，握手失败只写进日志，不打到屏幕上。
+func TestServerRefusesPlainHTTP(t *testing.T) {
+	link, data, _, logs := startServerLogs(t)
+	plain := strings.Replace(link.BundleURL(), "https://", "http://", 1)
+	resp, err := http.Get(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || bytes.Contains(b, data[:64]) {
+		t.Fatalf("不加密的请求应被拒绝：%d %q", resp.StatusCode, b)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs(), "下载服务：http: TLS handshake error") {
+		if time.Now().After(deadline) {
+			t.Fatalf("握手失败应写进日志：%q", logs())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -187,7 +243,7 @@ func TestServerImagesAndTotalProgress(t *testing.T) {
 		if rangeHeader != "" {
 			req.Header.Set("Range", rangeHeader)
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient(link, 5*time.Second).Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -221,7 +277,7 @@ func TestServerImagesAndTotalProgress(t *testing.T) {
 		t.Fatalf("全部下完时进度应到头并报告下载完成：%+v", last)
 	}
 	for _, name := range []string{"image-2", "bundle", "plan"} {
-		resp, _ := get(t, link.Base()+"image/"+name, "")
+		resp, _ := get(t, link, link.Base()+"image/"+name, "")
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("没登记的镜像文件 %q 应返回 404：%d", name, resp.StatusCode)
 		}

@@ -15,29 +15,35 @@ import (
 	"github.com/lx969788249/dockhop/internal/crypto"
 )
 
-// Client 是新服务器上的下载客户端。
+// Client 是新服务器上的下载客户端，从一条链接对应的旧服务器下载。
 type Client struct {
+	link crypto.Link
 	http *http.Client
-	// ConnectTimeout 是连接旧服务器的超时时间；连不上时要很快说明原因，不能重试好几分钟。
-	ConnectTimeout time.Duration
 	// Retries 是下载中断后自动续传的次数。
 	Retries int
 	logf    func(string, ...any)
 }
 
-// NewClient 创建下载客户端。
-func NewClient(connectTimeout time.Duration, logf func(string, ...any)) *Client {
+// NewClient 创建下载客户端。connectTimeout 是连接旧服务器的超时时间：连不上时要很快说明
+// 原因，不能重试好几分钟。
+func NewClient(link crypto.Link, connectTimeout time.Duration, logf func(string, ...any)) *Client {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	c := &Client{ConnectTimeout: connectTimeout, Retries: 20, logf: logf}
-	c.http = &http.Client{Transport: &http.Transport{
+	return &Client{link: link, http: httpClient(link, connectTimeout), Retries: 20, logf: logf}
+}
+
+// httpClient 是连接旧服务器用的 HTTPS 客户端：按链接里的密钥核对旧服务器的证书（见
+// crypto.Link.ClientTLS）。
+func httpClient(link crypto.Link, connectTimeout time.Duration) *http.Client {
+	return &http.Client{Transport: &http.Transport{
 		Proxy:                 nil, // 两台服务器直连，不走代理
 		DialContext:           (&net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		TLSClientConfig:       link.ClientTLS(),
+		TLSHandshakeTimeout:   connectTimeout,
 		ResponseHeaderTimeout: 2 * time.Minute,
 		IdleConnTimeout:       30 * time.Second,
 	}}
-	return c
 }
 
 // ConnError 说明为什么连不上旧服务器，以及怎么处理。
@@ -61,6 +67,10 @@ func explain(link crypto.Link, err error) error {
 	switch {
 	case errors.Is(err, context.Canceled):
 		return err
+	case errors.Is(err, crypto.ErrWrongServer), errors.Is(err, http.ErrSchemeMismatch):
+		// 证书对不上，或者对方根本不是 HTTPS：这个端口上不是这次的迁出。
+		return &ConnError{Reason: "连上的不是这次迁出：" + where + " 和链接对不上",
+			Hint: "旧服务器上的迁出可能已经结束或重新运行过；请用旧服务器上最新显示的链接", Err: err}
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return &ConnError{Reason: "连接被拒绝：" + where + " 拒绝连接",
 			Hint: "确认旧服务器上的 DockHop 迁出还在运行（没有按回车结束），并" + firewall, Err: err}
@@ -80,38 +90,39 @@ func explain(link crypto.Link, err error) error {
 
 func statusError(link crypto.Link, code int) error {
 	if code == http.StatusNotFound {
-		return &ConnError{Reason: "旧服务器上找不到这次迁移（返回 404）",
-			Hint: "旧服务器上的迁出可能已经结束或重新运行过；请在旧服务器重新运行迁出，用新的链接"}
+		// 证书已经对上了（密钥没错），只是下载口令不对：链接被改动过。
+		return &ConnError{Reason: "链接里的下载地址不对（旧服务器返回 404）",
+			Hint: "可能复制时改动了字符，请完整复制旧服务器上显示的链接"}
 	}
 	return &ConnError{Reason: fmt.Sprintf("旧服务器 %s 返回 HTTP %d", link.Host, code), Hint: "确认链接完整，并且旧服务器上的迁出还在运行"}
 }
 
 // FetchPlan 下载加密的迁移计划（很小）。旧服务器没有提供时返回 ErrNoPlan。
-func (c *Client) FetchPlan(ctx context.Context, link crypto.Link) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link.PlanURL(), nil)
+func (c *Client) FetchPlan(ctx context.Context) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.link.PlanURL(), nil)
 	if err != nil {
 		return nil, err
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, explain(link, err)
+		return nil, explain(c.link, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		// 区分“计划没生成”和“整个迁移不存在”：迁移包还在就只是没有计划。
-		if c.bundleExists(ctx, link) {
+		if c.bundleExists(ctx) {
 			return nil, ErrNoPlan
 		}
-		return nil, statusError(link, resp.StatusCode)
+		return nil, statusError(c.link, resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, statusError(link, resp.StatusCode)
+		return nil, statusError(c.link, resp.StatusCode)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 }
 
-func (c *Client) bundleExists(ctx context.Context, link crypto.Link) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, link.BundleURL(), nil)
+func (c *Client) bundleExists(ctx context.Context) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.link.BundleURL(), nil)
 	if err != nil {
 		return false
 	}
@@ -137,10 +148,10 @@ var errSize = errors.New("旧服务器发来的文件大小和迁移计划里记
 // Download 把旧服务器上的一个文件（迁移包或镜像文件）下载到 path。path 已经有一部分时
 // 从断点继续；中途断开会自动续传，最多 Retries 次。progress 收到这个文件已经下载的字节数
 // 和它的大小。
-func (c *Client) Download(ctx context.Context, link crypto.Link, part Part, path string, progress func(done, total int64)) error {
+func (c *Client) Download(ctx context.Context, part Part, path string, progress func(done, total int64)) error {
 	failures := 0
 	for {
-		done, total, err := c.downloadOnce(ctx, link, part, path, progress)
+		done, total, err := c.downloadOnce(ctx, part, path, progress)
 		if err == nil && done == total {
 			return nil
 		}
@@ -171,7 +182,7 @@ func (c *Client) Download(ctx context.Context, link crypto.Link, part Part, path
 	}
 }
 
-func (c *Client) downloadOnce(ctx context.Context, link crypto.Link, part Part, path string, progress func(done, total int64)) (int64, int64, error) {
+func (c *Client) downloadOnce(ctx context.Context, part Part, path string, progress func(done, total int64)) (int64, int64, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return 0, 0, err
@@ -194,7 +205,7 @@ func (c *Client) downloadOnce(ctx context.Context, link crypto.Link, part Part, 
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return have, 0, explain(link, err)
+		return have, 0, explain(c.link, err)
 	}
 	defer resp.Body.Close()
 	var total int64
@@ -229,7 +240,7 @@ func (c *Client) downloadOnce(ctx context.Context, link crypto.Link, part Part, 
 		}
 		return 0, 0, errors.New("本地已有的下载文件和旧服务器上的对不上，重新下载")
 	default:
-		return have, 0, statusError(link, resp.StatusCode)
+		return have, 0, statusError(c.link, resp.StatusCode)
 	}
 	// 大小以迁移计划为准：旧服务器（或网络上的设备）说的大小不对，或者发来的数据比应有的多，
 	// 都不是要下载的那个文件，不能一直往磁盘里写。

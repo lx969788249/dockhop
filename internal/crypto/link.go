@@ -1,10 +1,11 @@
 // Package crypto 负责迁移链接和加密。
 //
-// 链接形如 http://203.0.113.7:8080/k3Jx9QmP2vLa/#a7j8…（约 100 个字符）：
+// 链接形如 https://203.0.113.7:8080/k3Jx9QmP2vLa/#a7j8…（约 100 个字符）：
 // 路径里是随机的下载口令，# 后面是密钥。# 后面的部分浏览器和 curl 都不会发给
 // 服务器，所以下载服务本身拿不到密钥。迁移包和迁移计划都用这个密钥加密，
 // 加密方式是开源加密库 age 的分块认证加密：每 64KB 一段，每段都带校验，
-// 能发现内容被改、被截断或顺序被调换。
+// 能发现内容被改、被截断或顺序被调换。传输还走 HTTPS，证书由同一个密钥推算
+// （见 tls.go）。
 package crypto
 
 import (
@@ -39,11 +40,10 @@ func (e *LinkError) Error() string { return e.Reason }
 
 // Link 是一条迁移链接。
 type Link struct {
-	Scheme string // http 或 https
-	Host   string // 地址，IPv6 不带方括号
-	Port   int
-	Token  string
-	id     *age.X25519Identity
+	Host  string // 地址，IPv6 不带方括号
+	Port  int
+	Token string
+	id    *age.X25519Identity
 }
 
 // NewLink 为一次迁出生成新的口令和密钥。
@@ -56,7 +56,7 @@ func NewLink(host string, port int) (Link, error) {
 	if err != nil {
 		return Link{}, err
 	}
-	return Link{Scheme: "http", Host: host, Port: port, Token: token, id: id}, nil
+	return Link{Host: host, Port: port, Token: token, id: id}, nil
 }
 
 func randomToken(n int) (string, error) {
@@ -80,13 +80,13 @@ func (l Link) key() string {
 // Secret 返回密钥，用于在日志里隐藏它。
 func (l Link) Secret() string { return l.key() }
 
-// Base 是下载地址的公共前缀，例如 http://1.2.3.4:8080/k3Jx9QmP2vLa/。
+// Base 是下载地址的公共前缀，例如 https://1.2.3.4:8080/k3Jx9QmP2vLa/。
 func (l Link) Base() string {
 	host := l.Host
 	if strings.Contains(host, ":") {
 		host = "[" + host + "]"
 	}
-	return fmt.Sprintf("%s://%s:%d/%s/", l.Scheme, host, l.Port, l.Token)
+	return fmt.Sprintf("https://%s:%d/%s/", host, l.Port, l.Token)
 }
 
 // String 返回完整的迁移链接（含密钥）。只能显示给用户，不能写进日志。
@@ -109,13 +109,13 @@ func ParseLink(s string) (Link, error) {
 		return Link{}, &LinkError{"没有提供迁移链接"}
 	}
 	u, err := url.Parse(s)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return Link{}, &LinkError{"这不是迁移链接。请完整复制旧服务器上显示的、以 http:// 开头的链接"}
+	if err == nil && u.Scheme == "http" && u.Host != "" {
+		return Link{}, &LinkError{"这个链接是旧版本的 DockHop 生成的（以 http:// 开头），请在旧服务器上重新运行迁出，用新显示的链接"}
 	}
-	port := 80
-	if u.Scheme == "https" {
-		port = 443
+	if err != nil || u.Host == "" || u.Scheme != "https" {
+		return Link{}, &LinkError{"这不是迁移链接。请完整复制旧服务器上显示的、以 https:// 开头的链接"}
 	}
+	port := 443
 	if p := u.Port(); p != "" {
 		n, err := strconv.Atoi(p)
 		if err != nil || n < 1 || n > 65535 {
@@ -142,7 +142,7 @@ func ParseLink(s string) (Link, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		host = ip.String()
 	}
-	return Link{Scheme: u.Scheme, Host: host, Port: port, Token: token, id: id}, nil
+	return Link{Host: host, Port: port, Token: token, id: id}, nil
 }
 
 // SignStatus 用链接里的密钥给迁入结果签名：只有拿到完整链接的新服务器才能通知

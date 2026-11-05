@@ -103,14 +103,14 @@ func TestParseOptions(t *testing.T) {
 }
 
 func TestInLinkMessages(t *testing.T) {
-	r := runCLI(t, "", nil, "in", "http://1.2.3.4:8080/abcdefghijkl/")
+	r := runCLI(t, "", nil, "in", "https://1.2.3.4:8080/abcdefghijkl/")
 	if r.code != ExitFailed || !strings.Contains(r.stderr, "缺少 # 后面的密钥") {
 		t.Errorf("缺密钥：%d %q", r.code, r.stderr)
 	}
 	// 交互时：第一次粘贴的链接不完整会提示重新粘贴，第二次完整的链接被接受、开始迁入。
 	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
 	l, _ := crypto.NewLink("1.2.3.4", 8080)
-	r = runCLI(t, "http://1.2.3.4:8080/abcdefghijkl/\n"+l.String()+"\n", nil, "in")
+	r = runCLI(t, "https://1.2.3.4:8080/abcdefghijkl/\n"+l.String()+"\n", nil, "in")
 	if !strings.Contains(r.stderr, "缺少 # 后面的密钥") || !strings.Contains(r.stderr, "连不上 Docker") {
 		t.Errorf("交互粘贴链接：%q", r.stderr)
 	}

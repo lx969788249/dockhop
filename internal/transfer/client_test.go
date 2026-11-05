@@ -51,10 +51,10 @@ func TestDownloadResume(t *testing.T) {
 	go srv.Serve()
 	defer srv.Shutdown(context.Background())
 
-	c := NewClient(5*time.Second, t.Logf)
+	c := NewClient(link, 5*time.Second, t.Logf)
 	dst := filepath.Join(dir, "download")
 	var last int64
-	if err := c.Download(context.Background(), link, Part{URL: link.BundleURL()}, dst, func(done, total int64) { last = done }); err != nil {
+	if err := c.Download(context.Background(), Part{URL: link.BundleURL()}, dst, func(done, total int64) { last = done }); err != nil {
 		t.Fatalf("应自动续传成功：%v", err)
 	}
 	got, _ := os.ReadFile(dst)
@@ -62,7 +62,7 @@ func TestDownloadResume(t *testing.T) {
 		t.Fatalf("续传结果不对：%d 字节，请求 %d 次", len(got), requests.Load())
 	}
 	// 已经下载完整：再下载一次直接结束，不重新下载。
-	if err := c.Download(context.Background(), link, Part{URL: link.BundleURL()}, dst, nil); err != nil {
+	if err := c.Download(context.Background(), Part{URL: link.BundleURL()}, dst, nil); err != nil {
 		t.Fatal(err)
 	}
 	if st, _ := os.Stat(dst); st.Size() != int64(len(content)) {
@@ -76,39 +76,66 @@ func TestConnectionErrors(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	link, _ := crypto.NewLink("127.0.0.1", port)
-	c := NewClient(2*time.Second, nil)
-	_, err := c.FetchPlan(context.Background(), link)
+	_, err := NewClient(link, 2*time.Second, nil).FetchPlan(context.Background())
 	var ce *ConnError
 	if !errors.As(err, &ce) || !strings.Contains(ce.Reason, "拒绝连接") || !strings.Contains(ce.Hint, "ufw allow") {
 		t.Errorf("拒绝连接：%v", err)
 	}
 
-	// 下载服务还在、但链接不对（迁出已经重新运行过）：404。
-	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "bundle"), []byte("x"), 0o600)
-	ln, _ = net.Listen("tcp", "127.0.0.1:0")
-	port = ln.Addr().(*net.TCPAddr).Port
-	served, _ := crypto.NewLink("127.0.0.1", port)
-	srv, _ := NewServer(ln, served, filepath.Join(dir, "bundle"), "", nil, nil)
-	go srv.Serve()
-	defer srv.Shutdown(context.Background())
-	other, _ := crypto.NewLink("127.0.0.1", port)
-	_, err = c.FetchPlan(context.Background(), other)
-	if !errors.As(err, &ce) || !strings.Contains(ce.Reason, "找不到这次迁移") {
-		t.Errorf("404：%v", err)
+	// 下载服务还在、但链接不对（迁出已经重新运行过）：证书和链接里的密钥对不上，什么也不下载。
+	served := serveBundleOnly(t)
+	other, _ := crypto.NewLink("127.0.0.1", served.Port)
+	_, err = NewClient(other, 2*time.Second, nil).FetchPlan(context.Background())
+	if !errors.As(err, &ce) || !errors.Is(err, crypto.ErrWrongServer) || !strings.Contains(ce.Reason, "连上的不是这次迁出") ||
+		!strings.Contains(ce.Hint, "最新显示的链接") {
+		t.Errorf("链接不对：%v", err)
 	}
-	// 同一个迁移，但旧服务器没生成迁移计划：只是跳过检查。
-	if _, err := c.FetchPlan(context.Background(), served); !errors.Is(err, ErrNoPlan) {
+	// 同一个迁移，但旧服务器没生成迁移计划：不能迁入。
+	if _, err := NewClient(served, 2*time.Second, nil).FetchPlan(context.Background()); !errors.Is(err, ErrNoPlan) {
 		t.Errorf("没有迁移计划：%v", err)
 	}
+	// 密钥对、下载口令不对（复制时改了字符）：404。
+	altered := served
+	altered.Token = "wrongtoken12"
+	_, err = NewClient(altered, 2*time.Second, nil).FetchPlan(context.Background())
+	if !errors.As(err, &ce) || !strings.Contains(ce.Reason, "下载地址不对") {
+		t.Errorf("404：%v", err)
+	}
+
+	// 端口上是别的、不加密的服务：也不是这次的迁出。
+	plain := httptestServer(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("hello")) })
+	wrong, _ := crypto.NewLink("127.0.0.1", plain.port)
+	_, err = NewClient(wrong, 2*time.Second, nil).FetchPlan(context.Background())
+	if !errors.As(err, &ce) || !strings.Contains(ce.Reason, "连上的不是这次迁出") {
+		t.Errorf("对方不是 HTTPS：%v", err)
+	}
+}
+
+// serveBundleOnly 开一个只有迁移包、没有迁移计划的下载服务，返回它的链接。
+func serveBundleOnly(t *testing.T) crypto.Link {
+	t.Helper()
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "bundle"), []byte("x"), 0o600)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, _ := crypto.NewLink("127.0.0.1", ln.Addr().(*net.TCPAddr).Port)
+	srv, err := NewServer(ln, link, filepath.Join(dir, "bundle"), "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
+	return link
 }
 
 func TestConnectTimeoutExplained(t *testing.T) {
 	// 192.0.2.0/24 是文档专用地址，不会有人响应：连接超时。
 	link, _ := crypto.NewLink("192.0.2.1", 18080)
-	c := NewClient(500*time.Millisecond, nil)
+	c := NewClient(link, 500*time.Millisecond, nil)
 	start := time.Now()
-	_, err := c.FetchPlan(context.Background(), link)
+	_, err := c.FetchPlan(context.Background())
 	var ce *ConnError
 	if !errors.As(err, &ce) {
 		t.Skipf("这台机器上的网络不会超时（%v）", err)
@@ -148,7 +175,7 @@ func TestDownloadSizeLimit(t *testing.T) {
 		})
 		link, _ := crypto.NewLink("127.0.0.1", srv.port)
 		dst := filepath.Join(t.TempDir(), "bundle")
-		err := NewClient(5*time.Second, t.Logf).Download(context.Background(), link, Part{URL: srv.url, Size: c.size}, dst, nil)
+		err := NewClient(link, 5*time.Second, t.Logf).Download(context.Background(), Part{URL: srv.url, Size: c.size}, dst, nil)
 		if c.ok != (err == nil) {
 			t.Errorf("%s：%v", c.name, err)
 		}

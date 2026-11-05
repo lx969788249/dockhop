@@ -29,7 +29,7 @@ ROOT_DIR="$(cd "${APPS_DIR}/../.." && pwd)"
 OLD_DOCKER="${OLD_DOCKER:-27.5}"
 NEW_DOCKER="${NEW_DOCKER:-27.5}"
 BACKUP_PORT=18080
-LINK_PATTERN='http://old:[0-9]+/[A-Za-z0-9]+/#[0-9a-z]{58}'
+LINK_PATTERN='https://old:[0-9]+/[A-Za-z0-9]+/#[0-9a-z]{58}'
 
 id="dhapps$$"
 old="${id}_old"
