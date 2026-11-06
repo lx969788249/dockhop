@@ -10,10 +10,10 @@
 # 设置了 DOCKHOP_MIRROR=镜像站地址 时只用这个镜像站。
 set -euo pipefail
 
-VERSION="1.2.1"
-SHA256_AMD64="a96872191ee10f6bc3d0d2f3284db461d9f952ad7ebd3d61b1893e0093ed98be"
-SHA256_ARM64="9eb71355387376fec6aaff9f22d73a4a403079a30ef90f53ea9818736c0c028e"
-SHA256_ARMV7="133bf6006b12c131f7bb32af05ae2e0353a9c548f2d23ad1b7fb95abacfa387e"
+VERSION="1.2.2"
+SHA256_AMD64="ec8548528d5fb3ba82bb90760f4ea2d35417c530721b670330e3b54d1cfa0ba7"
+SHA256_ARM64="4ae232122a9580b15ed0a5485ab21ceed66d1e824cac8281303cf276f06036cc"
+SHA256_ARMV7="7eed8f8258fe3cf4e2253a2d4e8ffeb3a03ab397bfbe2c1d3e0e47116637e80e"
 GITEE="https://gitee.com/lx969788249/dockhop/releases/download"
 GITHUB="https://github.com/lx969788249/dockhop/releases/download"
 # 成功完成迁移的次数：dockhop.run 返回这个脚本时填上，交给程序在菜单里显示（从国内访问
