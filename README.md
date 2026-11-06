@@ -146,7 +146,7 @@ bash <(curl -fsSL https://dockhop.run) out --port 9000
 <details>
 <summary><b>迁移次数是怎么统计的？会上传我的信息吗？</b></summary>
 
-迁入成功后，程序向 `dockhop.run` 发一个空请求，成功次数加 1；迁出、迁入失败时也发一个，失败次数加 1（用来改进稳定性）。统计里只存次数，不存 IP，也不存任何服务器信息（IP 只用来防止有人刷次数）。不想统计的话，运行前设置 `DOCKHOP_NO_STATS=1`。
+迁入成功后，程序向 `dockhop.run` 发一个空请求，成功次数加 1；迁出、迁入失败时也发一个，失败次数加 1（用来改进稳定性）。统计里只存次数，不存 IP，也不存任何服务器信息（IP 只用来防止有人刷次数），次数和成功率在 https://dockhop.run/stats 能看到。不想统计的话，运行前设置 `DOCKHOP_NO_STATS=1`。
 </details>
 
 <details>

@@ -6,8 +6,8 @@
 //
 // /count 是成功完成迁移的次数：程序开头的菜单显示它（通过一行命令运行时用 run.sh 里填好的，直接
 // 运行程序时来这里读）；迁入成功时程序发一个空的 POST，次数加 1。/failed 是迁移失败的次数：迁出、
-// 迁入失败时程序发一个空的 POST，次数加 1；不公开，在 Cloudflare 的 D1 里看（算成功率的语句在
-// schema.sql 里）。D1 里只存这两个数字，不记录任何别的东西。
+// 迁入失败时程序发一个空的 POST，次数加 1。/stats 显示这两个次数和成功率，浏览器、命令行都能看。
+// D1 里只存这两个数字，不记录任何别的东西。
 
 const SCRIPT = "https://raw.githubusercontent.com/lx969788249/dockhop/main/run.sh";
 const REPO = "https://github.com/lx969788249/dockhop";
@@ -32,6 +32,9 @@ export default {
     }
     if (url.pathname === "/failed" && request.method === "POST") {
       return bump(request, env, "failed");
+    }
+    if (url.pathname === "/stats") {
+      return stats(env);
     }
     const cli = isCLI(request.headers.get("user-agent") ?? "");
     if (url.pathname !== "/" && url.pathname !== "/run.sh") {
@@ -95,6 +98,23 @@ async function bump(request, env, column) {
     return new Response(null, { status: 204 });
   } catch {
     return text("暂时记不了\n", 503);
+  }
+}
+
+// stats 显示成功、失败的次数和成功率（最多保留一位小数；还没有记录时不算成功率）。出了问题
+// （例如免费额度用完）返回 503。
+async function stats(env) {
+  try {
+    const row = await env.DB.prepare("SELECT n, failed FROM counter").first();
+    const n = row?.n ?? 0;
+    const failed = row?.failed ?? 0;
+    let body = `成功：${n} 次\n失败：${failed} 次\n`;
+    if (n + failed > 0) {
+      body += `成功率：${Math.round((1000 * n) / (n + failed)) / 10}%\n`;
+    }
+    return text(body, 200);
+  } catch {
+    return text("暂时读不到\n", 503);
   }
 }
 
