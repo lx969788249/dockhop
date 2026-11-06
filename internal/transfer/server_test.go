@@ -141,26 +141,49 @@ func TestServerStatus(t *testing.T) {
 	if err := SendStatus(context.Background(), other, Status{Result: "success"}); !errors.Is(err, crypto.ErrWrongServer) {
 		t.Fatalf("证书对不上时不应发出结果：%v", err)
 	}
-	// 知道下载口令、不知道密钥的人不核对证书硬发：签名不对，被拒绝。
-	post := func(body []byte, sig string, c *http.Client) int {
+	// 签名不对的结果被拒绝。
+	post := func(body []byte, sig string) int {
 		req, _ := http.NewRequest(http.MethodPost, link.StatusURL(), bytes.NewReader(body))
 		req.Header.Set(StatusHeader, sig)
-		resp, err := c.Do(req)
+		resp, err := httpClient(link, 5*time.Second).Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
 		resp.Body.Close()
 		return resp.StatusCode
 	}
-	insecure := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 	body := []byte(`{"result":"success"}`)
-	if code := post(body, hex.EncodeToString(other.SignStatus(body)), insecure); code != http.StatusForbidden {
+	if code := post(body, hex.EncodeToString(other.SignStatus(body))); code != http.StatusForbidden {
 		t.Fatalf("签名不对应返回 403：%d", code)
 	}
 	// 结果字段不对也会被拒绝。
 	body = []byte(`{"result":"maybe"}`)
-	if code := post(body, hex.EncodeToString(link.SignStatus(body)), httpClient(link, 5*time.Second)); code != http.StatusBadRequest {
+	if code := post(body, hex.EncodeToString(link.SignStatus(body))); code != http.StatusBadRequest {
 		t.Fatalf("结果字段不对应返回 400：%d", code)
+	}
+}
+
+// 只拿到链接 # 前面那部分（没有密钥）的人不核对证书硬连（像 curl -k）：迁移计划、迁移包、
+// 镜像文件一个字节也拿不到，也发不了迁入结果，旧服务器不会把它当成新服务器在下载。
+func TestServerRequiresKey(t *testing.T) {
+	link, _, rec := startServer(t)
+	insecure := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	try := func(method, url string, body []byte) {
+		req, _ := http.NewRequest(method, url, bytes.NewReader(body))
+		if resp, err := insecure.Do(req); err == nil {
+			resp.Body.Close()
+			t.Errorf("没有密钥也连上了：%s %s 返回 %d", method, strings.TrimPrefix(url, link.Base()), resp.StatusCode)
+		}
+	}
+	for _, url := range []string{link.PlanURL(), link.BundleURL(), link.ImageURL("image-1")} {
+		try(http.MethodGet, url, nil)
+		try(http.MethodHead, url, nil)
+	}
+	try(http.MethodPost, link.StatusURL(), []byte(`{"result":"success"}`))
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.events) > 0 {
+		t.Errorf("没有密钥的连接不应算作新服务器在下载或迁入：%+v", rec.events)
 	}
 }
 

@@ -124,8 +124,9 @@ func TestEncryptDecrypt(t *testing.T) {
 	}
 }
 
-// handshake 让 server 链接的下载服务和拿着 client 链接的新服务器握手，返回新服务器那边的结果。
-func handshake(t *testing.T, server, client Link) error {
+// handshake 让 server 链接的下载服务和用 client 设置连接的一方握手，返回两边各自的结果。
+// 连接的一方等下载服务握手结束再断开。
+func handshake(t *testing.T, server Link, client *tls.Config) (clientErr, serverErr error) {
 	t.Helper()
 	cfg, err := server.ServerTLS()
 	if err != nil {
@@ -136,23 +137,23 @@ func handshake(t *testing.T, server, client Link) error {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
 		c, err := ln.Accept()
 		if err != nil {
+			done <- err
 			return
 		}
 		s := tls.Server(c, cfg)
-		_ = s.Handshake()
+		done <- s.Handshake()
 		s.Close()
 	}()
-	c, err := tls.Dial("tcp", ln.Addr().String(), client.ClientTLS())
-	if err == nil {
+	c, clientErr := tls.Dial("tcp", ln.Addr().String(), client)
+	serverErr = <-done
+	if clientErr == nil {
 		c.Close()
 	}
-	<-done
-	return err
+	return clientErr, serverErr
 }
 
 // 新服务器按链接里的密钥核对旧服务器的证书：同一条链接（旧服务器生成的、新服务器粘贴解析的）
@@ -164,12 +165,27 @@ func TestTLSIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		if err := handshake(t, l, parsed); err != nil {
-			t.Fatalf("同一条链接应握手成功：%v", err)
+		if cerr, serr := handshake(t, l, parsed.ClientTLS()); cerr != nil || serr != nil {
+			t.Fatalf("同一条链接应握手成功：%v，%v", cerr, serr)
 		}
 	}
 	other, _ := NewLink("127.0.0.1", 8080)
-	if err := handshake(t, other, parsed); !errors.Is(err, ErrWrongServer) {
-		t.Fatalf("别的链接的下载服务应被认出来：%v", err)
+	if cerr, _ := handshake(t, other, parsed.ClientTLS()); !errors.Is(cerr, ErrWrongServer) {
+		t.Fatalf("别的链接的下载服务应被认出来：%v", cerr)
+	}
+}
+
+// 旧服务器也核对新服务器：只拿到链接 # 前面那部分（没有密钥）的人不出示证书硬连（像 curl -k），
+// 或者出示别的链接的证书，都在握手时被拒绝，连接建立不起来。
+func TestTLSClientIdentity(t *testing.T) {
+	l, _ := NewLink("127.0.0.1", 8080)
+	if _, serr := handshake(t, l, &tls.Config{InsecureSkipVerify: true}); serr == nil {
+		t.Error("不出示证书的一方应被拒绝")
+	}
+	other, _ := NewLink("127.0.0.1", 8080)
+	impostor := other.ClientTLS()
+	impostor.VerifyConnection = nil // 不核对旧服务器，只看旧服务器认不认它出示的证书
+	if _, serr := handshake(t, l, impostor); !errors.Is(serr, errWrongClient) {
+		t.Errorf("出示别的链接的证书的一方应被拒绝：%v", serr)
 	}
 }
