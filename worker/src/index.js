@@ -4,9 +4,10 @@
 // 成功完成迁移的次数和先从哪里下载程序；浏览器来访问时，跳到 GitHub 上的项目页。程序本身由 run.sh
 // 从 Gitee 或 GitHub 下载，不经过这里。
 //
-// /count 是成功完成迁移的次数（D1 里只存这一个数字）：程序开头的菜单显示它（通过一行命令运行时
-// 用 run.sh 里填好的，直接运行程序时来这里读）；迁入成功时程序发一个空的 POST，次数加 1。
-// 不记录任何别的东西。
+// /count 是成功完成迁移的次数：程序开头的菜单显示它（通过一行命令运行时用 run.sh 里填好的，直接
+// 运行程序时来这里读）；迁入成功时程序发一个空的 POST，次数加 1。/failed 是迁移失败的次数：迁出、
+// 迁入失败时程序发一个空的 POST，次数加 1；不公开，在 Cloudflare 的 D1 里看（算成功率的语句在
+// schema.sql 里）。D1 里只存这两个数字，不记录任何别的东西。
 
 const SCRIPT = "https://raw.githubusercontent.com/lx969788249/dockhop/main/run.sh";
 const REPO = "https://github.com/lx969788249/dockhop";
@@ -28,6 +29,9 @@ export default {
     }
     if (url.pathname === "/count") {
       return count(request, env);
+    }
+    if (url.pathname === "/failed" && request.method === "POST") {
+      return bump(request, env, "failed");
     }
     const cli = isCLI(request.headers.get("user-agent") ?? "");
     if (url.pathname !== "/" && url.pathname !== "/run.sh") {
@@ -75,12 +79,18 @@ async function count(request, env) {
     const n = await readCount(env);
     return n === null ? text("暂时读不到\n", 503) : text(`${n}\n`, 200);
   }
+  return bump(request, env, "n");
+}
+
+// bump 把一个次数加 1（column 是 n：成功完成迁移的次数，或者 failed：迁移失败的次数）。出了问题
+// （例如免费额度用完）返回 503，程序不管结果。
+async function bump(request, env, column) {
   try {
-    // 只认 DockHop 发来的；同一个地址一分钟最多算 5 次，防止有人刷数字。
+    // 只认 DockHop 发来的；同一个地址一分钟最多算 5 次（成功、失败合计），防止有人刷数字。
     const ua = request.headers.get("user-agent") ?? "";
     const ip = request.headers.get("cf-connecting-ip") ?? "";
     if (ua.startsWith("DockHop/") && (await env.LIMIT.limit({ key: ip })).success) {
-      await env.DB.prepare("UPDATE counter SET n = n + 1").run();
+      await env.DB.prepare(`UPDATE counter SET ${column} = ${column} + 1`).run();
     }
     return new Response(null, { status: 204 });
   } catch {

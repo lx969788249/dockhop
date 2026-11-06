@@ -55,6 +55,9 @@ type Deps struct {
 	Home     string
 	Version  string
 	Getenv   func(string) string
+	// Failed 在迁出失败时调用一次，可以为空；还没改动就取消、按 Ctrl+C 中断、传输开始之后自己
+	// 结束传输时都不调用（见 ending）。之后还有收尾：显示结果。
+	Failed func()
 }
 
 // totalSteps 是迁出一共几步。
@@ -94,7 +97,11 @@ func Run(ctx context.Context, d Deps, o Options) error {
 
 	err = r.steps(ctx)
 	r.cleanup()
-	return r.report(ctx, err)
+	end := r.ending(ctx, err)
+	if end == endFailed && d.Failed != nil {
+		d.Failed()
+	}
+	return r.report(end)
 }
 
 // dropStale 删掉以前的迁出被强制结束时留下的工作目录（迁移包和镜像文件）。正常结束时 cleanup

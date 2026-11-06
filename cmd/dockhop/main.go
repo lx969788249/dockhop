@@ -30,6 +30,7 @@ func main() {
 		Context: ctx,
 		Width:   terminalWidth,
 		Count:   "https://dockhop.run/count",
+		Failed:  "https://dockhop.run/failed",
 	})
 	os.Exit(code)
 }

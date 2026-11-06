@@ -2,33 +2,104 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/lx969788249/dockhop/internal/crypto"
 )
 
-// 只有正式发布的版本、设置了地址、用户没有关闭时才访问计数。
+// 只有正式发布的版本、用户没有关闭时才统计（没有设置地址时也不访问，见 TestCountFailed）。
 func TestCountOn(t *testing.T) {
 	cases := []struct {
-		version, count string
-		env            map[string]string
-		on             bool
+		version string
+		env     map[string]string
+		on      bool
 	}{
-		{"1.1.2", "http://x", nil, true},
-		{"1.1.2", "", nil, false},
-		{"dev", "http://x", nil, false},
-		{"0.0.0-ci", "http://x", nil, false},
-		{"1.1.2", "http://x", map[string]string{"DOCKHOP_NO_STATS": "1"}, false},
-		{"1.1.2", "http://x", map[string]string{"DO_NOT_TRACK": "1"}, false},
-		{"1.1.2", "http://x", map[string]string{"DO_NOT_TRACK": "0"}, true},
+		{"1.1.2", nil, true},
+		{"dev", nil, false},
+		{"0.0.0-ci", nil, false},
+		{"1.1.2", map[string]string{"DOCKHOP_NO_STATS": "1"}, false},
+		{"1.1.2", map[string]string{"DO_NOT_TRACK": "1"}, false},
+		{"1.1.2", map[string]string{"DO_NOT_TRACK": "0"}, true},
 	}
 	for _, c := range cases {
-		e := Env{Version: c.version, Count: c.count, Getenv: func(k string) string { return c.env[k] }}
+		e := Env{Version: c.version, Getenv: func(k string) string { return c.env[k] }}
 		if got := e.countOn(); got != c.on {
-			t.Errorf("%s %q %v：%v，应为 %v", c.version, c.count, c.env, got, c.on)
+			t.Errorf("%s %v：%v，应为 %v", c.version, c.env, got, c.on)
+		}
+	}
+}
+
+// 迁出、迁入失败时把失败的次数加一：在后台带着版本号往失败次数的地址发一个空的 POST，wait 等它
+// 发完。关了统计、没有设置地址时不发。
+func TestCountFailed(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = append(got, r.Method+" "+r.URL.Path+" "+r.Header.Get("User-Agent"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	env := func(vars map[string]string) *Env {
+		return &Env{Version: "1.1.2", Count: srv.URL + "/count", Failed: srv.URL + "/failed", Context: t.Context(),
+			Getenv: func(k string) string { return vars[k] }}
+	}
+	countFailed(env(nil))()
+	countFailed(env(map[string]string{"DOCKHOP_NO_STATS": "1"}))()
+	noURL := env(nil)
+	noURL.Failed = ""
+	countFailed(noURL)()
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(got, "、") != "POST /failed DockHop/1.1.2" {
+		t.Errorf("应只发一次失败的计数：%v", got)
+	}
+}
+
+// 迁出、迁入失败时（这里是要迁出的服务不存在、连不上旧服务器）发一次失败的计数，不发成功的；
+// 关了统计时都不发。
+func TestFailureCounted(t *testing.T) {
+	var mu sync.Mutex
+	var posts []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		posts = append(posts, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	t.Setenv("DOCKER_HOST", fakeDockerSock(t))
+	link, _ := crypto.NewLink("127.0.0.1", 1)
+	cases := []struct {
+		name string
+		vars map[string]string
+		args []string
+		want string
+	}{
+		{"迁出失败", nil, []string{"out", "--include", "nosuch"}, "POST /failed"},
+		{"迁入失败", nil, []string{"in", link.String()}, "POST /failed"},
+		{"关了统计", map[string]string{"DOCKHOP_NO_STATS": "1"}, []string{"out", "--include", "nosuch"}, ""},
+	}
+	for _, c := range cases {
+		mu.Lock()
+		posts = nil
+		mu.Unlock()
+		var errb bytes.Buffer
+		code := Run(c.args, Env{Stdout: &bytes.Buffer{}, Stderr: &errb, Version: "1.2.1", Platform: "linux/amd64",
+			Getenv: func(k string) string { return c.vars[k] }, HomeDir: func() (string, error) { return t.TempDir(), nil },
+			Context: context.Background(), Count: srv.URL + "/count", Failed: srv.URL + "/failed"})
+		mu.Lock()
+		got := strings.Join(posts, "、")
+		mu.Unlock()
+		if code != ExitFailed || got != c.want {
+			t.Errorf("%s：退出码 %d，计数 %q，应为 %q\n%s", c.name, code, got, c.want, errb.String())
 		}
 	}
 }
@@ -104,7 +175,7 @@ func TestMenuShowsCount(t *testing.T) {
 	}
 
 	// 迁入成功时加一：在后台带着版本号发一个空的 POST，wait 等它发完。
-	wait := countMigration(&Env{Version: "1.1.2", Count: srv.URL + "?case=ok", Context: t.Context(), Getenv: func(string) string { return "" }})
+	wait := countSucceeded(&Env{Version: "1.1.2", Count: srv.URL + "?case=ok", Context: t.Context(), Getenv: func(string) string { return "" }})
 	wait()
 	mu.Lock()
 	defer mu.Unlock()

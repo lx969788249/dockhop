@@ -41,6 +41,7 @@ type Env struct {
 	Width    func() int // 终端有多少列；0 表示不知道
 	Args     []string
 	Count    string // 成功完成迁移的次数的地址（见 count.go）；为空时不访问
+	Failed   string // 迁移失败的次数的地址（见 count.go）；为空时不访问
 
 	// 一次运行只有一个屏幕和一个提问器：同一个终端输入只能有一个地方在读。
 	screen *ui.Screen
@@ -102,7 +103,7 @@ const helpText = `DockHop：只需两步，完整迁移你的 Docker。
 
 环境变量：
   DOCKHOP_HOME         日志、记录和工作文件的目录（默认 ~/.dockhop），磁盘不够时换到大一点的盘
-  DOCKHOP_NO_STATS=1   不统计、也不显示成功完成迁移的次数（也认 DO_NOT_TRACK=1）
+  DOCKHOP_NO_STATS=1   不统计、也不显示迁移次数（也认 DO_NOT_TRACK=1）
 
 迁移链接里有特殊字符，在命令里使用时请用单引号括起来：dockhop in '链接'
 `
@@ -207,11 +208,14 @@ func runOut(env *Env, opts OutOptions) error {
 		t.screen.Problem(err.Error(), "")
 		return ui.ErrReported
 	}
+	wait := func() {} // 迁出失败时发出的计数，退出前等它结束
 	err = backup.Run(env.Context, backup.Deps{
 		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
 		Home: t.home, Version: env.Version, Getenv: env.Getenv,
+		Failed: func() { wait = countFailed(env) },
 	}, backup.Options{Include: opts.Include, StopShared: opts.StopShared, Port: opts.Port, Host: opts.Host})
 	t.finish(err)
+	wait()
 	return err
 }
 
@@ -253,11 +257,12 @@ func runIn(env *Env, opts InOptions) error {
 		return err
 	}
 	t.redactor.AddSecret(link.Secret())
-	wait := func() {} // 迁入成功时发出的计数，退出前等它结束
+	wait := func() {} // 迁入成功、失败时发出的计数，退出前等它结束
 	err = restore.Run(env.Context, restore.Deps{
 		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
 		Home: t.home, Version: env.Version, Getenv: env.Getenv,
-		Succeeded: func() { wait = countMigration(env) },
+		Succeeded: func() { wait = countSucceeded(env) },
+		Failed:    func() { wait = countFailed(env) },
 	}, restore.Options{Link: link, Yes: opts.Yes, Existing: opts.Existing, KeepSucceeded: opts.KeepSucceeded})
 	t.finish(err)
 	wait()

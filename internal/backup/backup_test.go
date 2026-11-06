@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/transfer"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -53,9 +55,67 @@ func TestCancelWhileChecking(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
+	failed := 0
 	err = Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: t.TempDir(),
-		Getenv: func(string) string { return "" }}, Options{})
+		Getenv: func(string) string { return "" }, Failed: func() { failed++ }}, Options{})
 	if !errors.Is(err, ui.ErrCancelled) || !strings.Contains(out.String(), "已取消，这台服务器上什么都没有改动") || strings.Contains(out.String(), "✗") {
 		t.Fatalf("应按已取消处理、不显示失败：%v\n%s", err, out.String())
+	}
+	if failed > 0 {
+		t.Errorf("取消不算失败：%d", failed)
+	}
+}
+
+// 迁出失败时调用一次 Failed（统计失败的次数）。
+func TestFailedCounted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/version" {
+			w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
+			return
+		}
+		http.Error(w, `{"message":"x"}`, http.StatusInternalServerError) // 读取 Docker 信息就失败
+	}))
+	defer srv.Close()
+	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	failed := 0
+	err = Run(context.Background(), Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: t.TempDir(),
+		Getenv: func(string) string { return "" }, Failed: func() { failed++ }}, Options{})
+	if !errors.Is(err, ui.ErrReported) || !strings.Contains(out.String(), "❌ 迁出失败") || failed != 1 {
+		t.Fatalf("应失败，算一次失败（算了 %d 次）：%v\n%s", failed, err, out.String())
+	}
+}
+
+// 迁出的结局：结果摘要按它写，失败的次数按它统计。传输开始之后用户自己结束传输都算正常结束
+// （新服务器迁入失败时，失败算在新服务器那边）；停下的容器没能全部恢复算失败；还没改动就取消、
+// 停机打包时按 Ctrl+C 中断的不算失败。
+func TestEnding(t *testing.T) {
+	bg := context.Background()
+	stopped, cancel := context.WithCancel(bg)
+	cancel()
+	serving := &transfer.Server{}
+	cases := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		r    *run
+		want ending
+	}{
+		{"新服务器迁入成功", bg, nil, &run{server: serving, status: "success"}, endSucceeded},
+		{"新服务器迁入失败后结束传输", bg, nil, &run{server: serving, status: "failed"}, endSucceeded},
+		{"传输时按 Ctrl+C 结束", stopped, nil, &run{server: serving}, endSucceeded},
+		{"迁出失败", bg, ui.ErrReported, &run{}, endFailed},
+		{"停下的容器没能全部恢复", bg, nil, &run{toRestore: 2, restored: 1}, endFailed},
+		{"还没改动就按了 Ctrl+C", stopped, ui.ErrReported, &run{}, endCancelled},
+		{"回答问题时按了 Ctrl+D", bg, io.EOF, &run{}, endCancelled},
+		{"停机打包时按了 Ctrl+C", stopped, ui.ErrReported, &run{toRestore: 2, restored: 2}, endInterrupted},
+	}
+	for _, c := range cases {
+		if got := c.r.ending(c.ctx, c.err); got != c.want {
+			t.Errorf("%s：%v，应为 %v", c.name, got, c.want)
+		}
 	}
 }

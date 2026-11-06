@@ -58,9 +58,11 @@ type Deps struct {
 	Home     string
 	Version  string
 	Getenv   func(string) string
-	// Succeeded 在迁入成功（已经提交，不会再回滚）时调用一次，可以为空。之后还有收尾：
-	// 删除临时文件、通知旧服务器、显示结果。
+	// Succeeded 在迁入成功（已经提交，不会再回滚）时调用一次，Failed 在迁入失败（包括只迁入了
+	// 一部分）时调用一次，都可以为空；还没改动就取消、按 Ctrl+C 中断时都不调用（见 ending）。
+	// 之后还有收尾：回滚、删除临时文件、通知旧服务器、显示结果。
 	Succeeded func()
+	Failed    func()
 }
 
 // totalSteps 是屏幕上的步骤数（见 steps）。
@@ -128,14 +130,18 @@ func Run(ctx context.Context, d Deps, o Options) error {
 	r.dropStale()
 
 	err = r.steps(ctx)
+	end := r.ending(ctx, err)
+	switch {
+	case (end == endSucceeded || end == endCommitted) && d.Succeeded != nil:
+		d.Succeeded()
+	case (end == endPartial || end == endFailed) && d.Failed != nil:
+		d.Failed()
+	}
 	if err != nil && r.j != nil && !r.committed {
 		r.rollback(context.WithoutCancel(ctx))
 	}
-	if err == nil && d.Succeeded != nil {
-		d.Succeeded()
-	}
 	r.cleanup(err == nil)
-	return r.report(ctx, err)
+	return r.report(ctx, end)
 }
 
 // cleanup 收尾：关掉事务日志，删掉解密出来的数据（成功时连下载的文件一起）、临时容器和

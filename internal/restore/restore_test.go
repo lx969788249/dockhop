@@ -30,10 +30,61 @@ func TestCancelWhileChecking(t *testing.T) {
 	})
 	link, _ := crypto.NewLink("127.0.0.1", 1)
 	var out bytes.Buffer
+	var counted []string
 	err := Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: t.TempDir(),
-		Getenv: func(string) string { return "" }}, Options{Link: link, Yes: true})
+		Getenv:    func(string) string { return "" },
+		Succeeded: func() { counted = append(counted, "成功") }, Failed: func() { counted = append(counted, "失败") },
+	}, Options{Link: link, Yes: true})
 	if !errors.Is(err, ui.ErrCancelled) || !strings.Contains(out.String(), "已取消，这台服务器上什么都没有改动") || strings.Contains(out.String(), "✗") {
 		t.Fatalf("应按已取消处理、不显示失败：%v\n%s", err, out.String())
+	}
+	if len(counted) > 0 {
+		t.Errorf("取消不算成功也不算失败：%v", counted)
+	}
+}
+
+// 迁入失败时调用一次 Failed（统计失败的次数），不调用 Succeeded。
+func TestFailedCounted(t *testing.T) {
+	dc, _ := faultyDocker(t, func(http.ResponseWriter, *http.Request) bool { return false }) // 读取 Docker 信息就失败
+	link, _ := crypto.NewLink("127.0.0.1", 1)
+	var out bytes.Buffer
+	var counted []string
+	err := Run(context.Background(), Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: t.TempDir(),
+		Getenv:    func(string) string { return "" },
+		Succeeded: func() { counted = append(counted, "成功") }, Failed: func() { counted = append(counted, "失败") },
+	}, Options{Link: link, Yes: true})
+	if !errors.Is(err, ui.ErrReported) || !strings.Contains(out.String(), "❌ 迁入失败") || strings.Join(counted, "、") != "失败" {
+		t.Fatalf("应失败，算一次失败：%v %v\n%s", err, counted, out.String())
+	}
+}
+
+// 迁入的结局：结果摘要按它写，迁移次数按它统计。已经提交、只是清理没做完的，服务和数据都已迁入，
+// 算成功；只迁入了一部分算失败；还没改动就取消、改动之后按 Ctrl+C 中断的不算成功也不算失败。
+func TestEnding(t *testing.T) {
+	bg := context.Background()
+	stopped, cancel := context.WithCancel(bg)
+	cancel()
+	cases := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		r    *run
+		want ending
+	}{
+		{"迁入完成", bg, nil, &run{j: &Journal{}, committed: true}, endSucceeded},
+		{"已经提交，清理没做完", bg, ui.ErrReported, &run{j: &Journal{}, committed: true}, endCommitted},
+		{"只迁入了一部分", bg, errPartial, &run{j: &Journal{}, committed: true, partial: true}, endPartial},
+		{"还没改动就失败", bg, ui.ErrReported, &run{}, endFailed},
+		{"改动之后失败", bg, ui.ErrReported, &run{j: &Journal{}}, endFailed},
+		{"还没改动就按了 Ctrl+C", stopped, ui.ErrReported, &run{}, endCancelled},
+		{"回答问题时按了 Ctrl+D", bg, io.EOF, &run{}, endCancelled},
+		{"改动之后按了 Ctrl+C", stopped, ui.ErrReported, &run{j: &Journal{}}, endInterrupted},
+		{"删除上次留下的内容之后按了 Ctrl+C", stopped, ui.ErrReported, &run{rollbackDone: true}, endInterrupted},
+	}
+	for _, c := range cases {
+		if got := c.r.ending(c.ctx, c.err); got != c.want {
+			t.Errorf("%s：%v，应为 %v", c.name, got, c.want)
+		}
 	}
 }
 

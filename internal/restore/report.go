@@ -66,10 +66,41 @@ func (r *run) servicesText() string {
 // 或者上次被强制结束时留下的）。
 func (r *run) changed() bool { return r.j != nil || r.rollbackDone }
 
-func (r *run) report(ctx context.Context, err error) error {
-	// 还没改动这台服务器就取消了（回答问题、检查、下载时按 Ctrl+C）：不用摆出一整块失败结果。
-	// 按没按 Ctrl+C 看 ctx：被打断的那一步返回什么错误都有可能。
-	if (ui.Canceled(err) || ctx.Err() != nil) && !r.changed() {
+// ending 是一次迁入的结局：结果摘要按它写，迁移次数按它统计（见 Deps 的 Succeeded、Failed）。
+type ending int
+
+const (
+	endCancelled   ending = iota // 还没改动这台服务器就取消了
+	endSucceeded                 // 迁入完成
+	endCommitted                 // 服务和数据都已迁入（已经提交），但清理没有完成：算迁入成功
+	endPartial                   // 只迁入了一部分：算迁入失败
+	endInterrupted               // 改动之后按 Ctrl+C 中断了
+	endFailed                    // 迁入失败
+)
+
+// ending 在各个步骤执行完（err 是它们返回的错误）、回滚之前定下结局。按没按 Ctrl+C 看 ctx：
+// 被打断的那一步返回什么错误都有可能。回滚时再按 Ctrl+C 不改变结局（回滚照样做完）。
+func (r *run) ending(ctx context.Context, err error) ending {
+	interrupted := ctx.Err() != nil
+	switch {
+	case (ui.Canceled(err) || interrupted) && !r.changed():
+		return endCancelled // 回答问题、检查、下载时按了 Ctrl+C
+	case err == nil && !interrupted:
+		return endSucceeded
+	case r.partial:
+		return endPartial
+	case r.committed:
+		return endCommitted
+	case interrupted:
+		return endInterrupted
+	default:
+		return endFailed
+	}
+}
+
+func (r *run) report(ctx context.Context, end ending) error {
+	// 还没改动这台服务器就取消了：不用摆出一整块失败结果。
+	if end == endCancelled {
 		msg := "\n已取消，这台服务器上什么都没有改动。"
 		if r.downloaded {
 			msg += "已经下载的部分留着，用同一个链接重新迁入会接着下载。"
@@ -77,8 +108,8 @@ func (r *run) report(ctx context.Context, err error) error {
 		r.Screen.Println(msg)
 		return ui.ErrCancelled
 	}
-	interrupted := ctx.Err() != nil
-	success := err == nil && !interrupted
+	interrupted := end == endInterrupted
+	success := end == endSucceeded
 	if !success {
 		r.Screen.Fail()
 	}
@@ -97,7 +128,7 @@ func (r *run) report(ctx context.Context, err error) error {
 			lines = append(lines, "上次已经迁入："+strings.Join(r.done, "、"))
 		}
 		status.Result = "success"
-	case r.partial:
+	case end == endPartial:
 		ok, failed := r.splitGroups()
 		rep.Result = "⚠️ 只迁入了一部分"
 		lines = append(lines, "已经迁入、正常运行："+labels(ok))
@@ -124,7 +155,7 @@ func (r *run) report(ctx context.Context, err error) error {
 		lines = append(lines, "处理好问题后，用同一个链接重新迁入：已经迁入的会跳过，只迁入剩下的")
 		status.Result = "partial"
 		status.Message = "没能启动：" + labels(failed)
-	case r.committed:
+	case end == endCommitted:
 		rep.Result = "⚠️ 服务和数据都已迁入，但清理没有完成"
 		lines = append(lines, "待清理的回滚资料："+r.rbDir)
 		status.Result = "success"
