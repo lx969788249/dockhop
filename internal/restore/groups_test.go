@@ -199,3 +199,66 @@ func TestPartialRollbackRestoresImageNames(t *testing.T) {
 		t.Fatalf("镜像名 %v，删掉的 %v", d.tags, d.deleted)
 	}
 }
+
+// 只保留一部分服务时，镜像名按创建容器实际用的名字算是哪组的：app 和 app:latest 是同一个名字，
+// 两组都在用就留着；容器用的是旧版本的镜像（OldImage）时，创建它用的是那个旧版本的名字，配置里
+// 原来写的名字只算真正用它的那组的，那组没保留就改回去。
+func TestPartialRollbackImageNameUsers(t *testing.T) {
+	cases := []struct {
+		name      string
+		good, bad bundle.Container // Image 是容器配置里写的镜像
+		files     []bundle.ImageFile
+		want      map[string]string // 只保留 good 之后的镜像名
+	}{
+		{"同一个名字的两种写法",
+			bundle.Container{Name: "good", Image: "app", ImageID: "sha256:src"},
+			bundle.Container{Name: "bad", Image: "app:latest", ImageID: "sha256:src"},
+			[]bundle.ImageFile{{File: "src", ID: "sha256:src", Refs: []string{"app", "app:latest"}}},
+			map[string]string{"app:latest": "sha256:src"}},
+		{"保留的那组用旧版本的镜像",
+			bundle.Container{Name: "good", Image: "app:1", ImageID: "sha256:src-old", OldImage: "dockhop-image:123456789abc"},
+			bundle.Container{Name: "bad", Image: "app:1", ImageID: "sha256:src"},
+			[]bundle.ImageFile{{File: "old", ID: "sha256:src-old", Refs: []string{"dockhop-image:123456789abc"}},
+				{File: "src", ID: "sha256:src", Refs: []string{"app:1"}}},
+			map[string]string{"app:1": "sha256:target", "dockhop-image:123456789abc": "sha256:src-old"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// 新服务器上原来就有这个名字，指向另一个镜像。
+			d := &images{tags: map[string]string{dockerName(c.bad.Image): "sha256:target"},
+				ids: map[string]bool{"sha256:target": true, "sha256:src": true, "sha256:src-old": true}}
+			var out bytes.Buffer
+			r := &run{Deps: Deps{Docker: d.docker(t), Screen: ui.New(&out, false, nil), Home: t.TempDir()}, imageAs: map[string]string{},
+				m: &bundle.Manifest{ImageFiles: c.files, Images: bundle.Images{Refs: map[string]string{}}}, images: map[string]imageSource{}}
+			for _, x := range []bundle.Container{c.good, c.bad} {
+				it := &citem{m: x, c: &docker.Container{}}
+				it.c.Config.Image = x.Image
+				r.items = append(r.items, it)
+			}
+			r.buildGroups(nil)
+			for _, f := range c.files {
+				for _, ref := range f.Refs {
+					r.m.Images.Refs[ref] = f.ID
+				}
+				r.images[f.File] = imageSource{local: f.ID} // 本机已经有，只加名字
+			}
+			r.undo = &undo{dc: r.Docker, screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+			j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.j, r.rbDir = j, j.dir
+			if err := r.loadImages(context.Background()); err != nil {
+				t.Fatalf("%v\n%s", err, out.String())
+			}
+			ok, bad := r.groupByID(r.groupOf["c:good"]), r.groupByID(r.groupOf["c:bad"])
+			bad.reason = "没能启动"
+			if err := r.commitPartial(context.Background(), []*group{ok}, []*group{bad}); err != errPartial {
+				t.Fatal(err)
+			}
+			if !maps.Equal(d.tags, c.want) {
+				t.Fatalf("镜像名 %v，应为 %v", d.tags, c.want)
+			}
+		})
+	}
+}

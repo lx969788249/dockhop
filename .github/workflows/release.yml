@@ -1,10 +1,21 @@
 name: release
 
-# 推送 v1.2.3 这样的标签时自动发布：编译三个架构、生成校验值、创建 GitHub Release，
-# 把带新版本号和校验值的 run.sh 提交到 main（一行命令用的就是它），再同步到 Gitee。
+# 发布新版本：在 Actions 里运行这个工作流，或者 gh workflow run release.yml -f version=1.2.4 -F notes=@说明.txt。
+# 说明的第一行是一句话摘要（DockHop 1.2.4：……），空一行之后是几条简短的说明，放到发布页上。
+#
+# 编译三个架构、生成校验值之后，把带新版本号和校验值的 run.sh 提交在 main 最新的提交后面，在这个
+# 提交上打附注标签（标签的内容就是说明）：标签里的 run.sh 就是这个版本的。创建 GitHub Release 之后
+# 才把这个提交推到 main：一行命令用的是 main 上的 run.sh，等发布页上的文件都在了才换成新版本。
+# 最后同步到 Gitee。发布的过程中不要往 main 推送，否则最后一步推不上去。
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 版本号，例如 1.2.4
+        required: true
+      notes:
+        description: 更新说明：第一行是一句话摘要，空一行之后是几条简短的说明
+        required: true
 
 permissions:
   contents: write
@@ -12,6 +23,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: v${{ inputs.version }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -20,40 +34,48 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: 确认标签就在 main 上
-        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-      - name: 测试
+      - name: 检查版本号
         run: |
-          git checkout "$GITHUB_SHA"
-          go test ./...
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "版本号要写成 1.2.4 这样：$VERSION" >&2
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "$TAG 已经有了" >&2
+            exit 1
+          fi
+      - name: 测试
+        run: go test ./...
       - name: 编译
-        run: scripts/build.sh "${GITHUB_REF_NAME#v}" dist
+        run: scripts/build.sh "$VERSION" dist
       - name: 测试 run.sh
         run: scripts/test-run-sh.sh dist
+      - name: 提交 run.sh、打标签
+        env:
+          NOTES: ${{ inputs.notes }}
+        run: |
+          cp dist/run.sh run.sh
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "发布 ${TAG}：更新 run.sh 的版本号和校验值"
+          printf '%s\n' "$NOTES" >"$RUNNER_TEMP/message"
+          git tag -a "$TAG" -F "$RUNNER_TEMP/message"
+          git push origin "refs/tags/$TAG"
       - name: 创建 Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 更新说明写在附注标签里：第一行是一句话摘要，空一行之后的部分放到发布页上，后面接着
-          # GitHub 生成的“完整改动”链接。轻量标签没有说明（读出来的会是提交说明），只放链接。
-          if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" = tag ]; then
-            git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME"
-          fi >"$RUNNER_TEMP/notes.md"
-          gh release create "$GITHUB_REF_NAME" dist/dockhop-linux-* dist/SHA256SUMS dist/run.sh \
-            --title "DockHop ${GITHUB_REF_NAME#v}" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes
+          # 说明里空一行之后的部分放到发布页上，后面接着 GitHub 生成的“完整改动”链接。
+          git tag -l --format='%(contents:body)' "$TAG" >"$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" dist/dockhop-linux-* dist/SHA256SUMS dist/run.sh --verify-tag \
+            --title "DockHop $VERSION" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes
       - name: 更新 main 上的 run.sh
-        run: |
-          git checkout main
-          cp dist/run.sh run.sh
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "发布 ${GITHUB_REF_NAME}：更新 run.sh 的版本号和校验值"
-          git push origin main
+        run: git push origin HEAD:main
 
   # 同步失败不影响上面已经完成的 GitHub 发布，run.sh 会改从 GitHub 下载；可以在 Actions 里重跑这一步。
   gitee:
     needs: release
     uses: ./.github/workflows/gitee.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: v${{ inputs.version }}
     secrets: inherit

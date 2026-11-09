@@ -171,6 +171,7 @@ func (r *run) steps(ctx context.Context) error {
 	}
 	r.info = info
 	r.undo = &undo{dc: r.Docker, screen: s, logf: r.Log.Printf, fail: r.testFail,
+		record:   func(e Entry) error { return appendJournal(r.rbDir, e) },
 		defaults: spec.SourceDefaults{CgroupVersion: info.CgroupVersion, LoggingDriver: info.LoggingDriver, DefaultRuntime: info.DefaultRuntime}}
 	summary := "Docker " + info.ServerVersion
 	if t, err := compose.Detect(ctx); err == nil {

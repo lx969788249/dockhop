@@ -39,6 +39,7 @@ const (
 	opImages     Op = "images"      // 加载镜像之前这台服务器上已有的镜像（Names：镜像 ID），回滚时这些一个不删
 	opTag        Op = "tag"         // 镜像名要改为指向迁入的镜像（Name；ID：原来指向的镜像，为空表示原来没有这个名字）
 	opComposeUp  Op = "compose_up"  // 启动 Compose 项目（Name、Networks：启动前已有的项目网络）
+	opRebuilt    Op = "rebuilt"     // 回滚时重建了原有的 Compose 容器（Name；ID：重建后的 ID），再回滚时它就是原来的服务
 	opCommit     Op = "commit"      // 已提交：新服务都验证通过，不再撤销
 )
 
@@ -103,6 +104,17 @@ func openJournal(dir string) (*Journal, error) {
 		return nil, err
 	}
 	return j, nil
+}
+
+// appendJournal 在 dir 里已有的事务日志后面追加一条记录：回滚时记下它自己做的改动（见 opRebuilt）。
+func appendJournal(dir string, e Entry) error {
+	f, err := os.OpenFile(journalPath(dir), os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return err
+	}
+	j := &Journal{dir: dir, f: f}
+	defer j.close()
+	return j.add(e)
 }
 
 // add 追加一条记录并写到磁盘。写不进去时不能继续改动。

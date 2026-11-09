@@ -3,6 +3,7 @@ package restore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -22,6 +23,7 @@ type undo struct {
 	logf   func(string, ...any)
 	vio    *volumeIO
 	fail   func(point string) bool // 测试用：在指定的位置模拟失败
+	record func(Entry) error       // 把回滚自己做的改动追加到事务日志（见 opRebuilt）
 	// 回滚重建旧容器时用的默认值（就是这台服务器自己的）。
 	defaults spec.SourceDefaults
 }
@@ -43,13 +45,18 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		problems = append(problems, msg)
 		u.logf("回滚：%s", msg)
 	}
+	// 原有的容器，包括上次回滚已经重建的原有 Compose 容器（opRebuilt）：都不能当成这次新建的删掉。
 	oldIDs := map[string]bool{}
+	rebuilt := map[string]string{} // 上次回滚重建过的原有 Compose 容器：名字 → 重建后的 ID
 	for _, e := range entries {
 		if e.ID != "" && e.Op != opHelper {
 			oldIDs[e.ID] = true
 		}
 		for _, o := range e.Old {
 			oldIDs[o.ID] = true
+		}
+		if e.Op == opRebuilt {
+			rebuilt[e.Name] = e.ID
 		}
 	}
 
@@ -202,7 +209,7 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 	}
 	for _, o := range dependencyOrder(olds, func(o OldContainer) string { return o.Name },
 		func(o OldContainer) []string { return depsOf(conf[o.Name]) }) {
-		if id := u.undoOldCompose(ctx, o, images[o.ID], nameIn(oldNames), note); id != "" {
+		if id := u.undoOldCompose(ctx, o, rebuilt[o.Name], images[o.ID], nameIn(oldNames), note); id != "" {
 			revives = append(revives, revive{o.Name, id, o.State, depsOf(conf[o.Name])})
 		}
 	}
@@ -408,6 +415,9 @@ func (u *undo) undoVolume(ctx context.Context, e Entry, note func(string, ...any
 		return
 	}
 	f, err := os.Open(e.Backup)
+	if errors.Is(err, os.ErrNotExist) {
+		return // 已经放回去了（之前撤销过）：放回之后备份就删了，日志里有这一条时备份一定已经存好
+	}
 	if err != nil {
 		note("数据卷 %s 的备份读不到：%v", e.Name, err)
 		return
@@ -420,6 +430,12 @@ func (u *undo) undoVolume(ctx context.Context, e Entry, note func(string, ...any
 	_, _ = f.Seek(0, 0)
 	if err := u.vio.replace(ctx, e.Name, f); err != nil {
 		note("数据卷 %s 没能放回原来的数据：%v", e.Name, err)
+		return
+	}
+	// 放回之后删掉备份，和放回去的目录、文件一样：这次回滚做完、还没来得及删除回滚资料就被结束时，
+	// 下次再回滚不会把这之后（原来的服务已经重新启动）写进卷里的数据又改回去。
+	if err := os.Remove(e.Backup); err != nil {
+		u.logf("回滚：数据卷 %s 的备份没能删除：%v", e.Name, err)
 	}
 }
 
@@ -489,11 +505,20 @@ func reconnect(ctx context.Context, dc *docker.Client, id string, raw json.RawMe
 }
 
 // undoOldCompose 按记录原样重建新服务器上原有的 Compose 容器（不启动，启动见 rollback），
-// 返回它的 ID；没能重建时为空。nameOf 把配置里引用的旧 ID 换成名字。
-func (u *undo) undoOldCompose(ctx context.Context, o OldContainer, image string, nameOf func(string) string, note func(string, ...any)) string {
-	if c, _, err := u.dc.InspectContainer(ctx, o.ID); err == nil {
-		return c.ID // 还没被删除，只需恢复状态
+// 返回它的 ID；没能重建时为空。rebuilt 是上次回滚重建它之后的 ID（见 opRebuilt）。nameOf 把配置里
+// 引用的旧 ID 换成名字。
+func (u *undo) undoOldCompose(ctx context.Context, o OldContainer, rebuilt, image string, nameOf func(string) string, note func(string, ...any)) string {
+	// 还没被删除，或者上次回滚已经重建过（之后可能已经运行、写过东西）：只需恢复状态。
+	for _, ref := range []string{o.ID, rebuilt} {
+		if ref == "" {
+			continue
+		}
+		if c, _, err := u.dc.InspectContainer(ctx, ref); err == nil {
+			return c.ID
+		}
 	}
+	// 占着这个名字的是迁入的容器，或者上次回滚重建、没来得及记下的。删掉它不会删掉原来的匿名卷：
+	// 重建时按名字挂上它们（见 spec.Rebuild 的 KeepVolumes），Docker 不删按名字挂着的卷。
 	if c, _, err := u.dc.InspectContainer(ctx, o.Name); err == nil {
 		_ = u.dc.RemoveContainerAndVolumes(ctx, c.ID)
 	}
@@ -528,9 +553,19 @@ func (u *undo) undoOldCompose(ctx context.Context, o OldContainer, image string,
 		note("原来的容器 %s 没能重建：%v", o.Name, err)
 		return ""
 	}
+	connected := true
 	for _, c := range built.Connects {
 		if err := u.dc.ConnectNetwork(ctx, c.Network, id, c.Endpoint); err != nil {
 			note("原来的容器 %s 没能连上网络 %s：%v", o.Name, c.Network, err)
+			connected = false
+		}
+	}
+	// 记下重建后的 ID：这次回滚没做完就被结束时，下次再回滚认得它就是原来的服务，不会当成迁入的新
+	// 容器删掉。网络没接好的不记，下次删掉重建。没能记下（比如磁盘满了）不算回滚失败：原来的服务
+	// 已经回来了；算失败的话回滚资料会留下，下次运行又回滚一遍，反而会把它删掉重建。
+	if connected {
+		if err := u.record(Entry{Op: opRebuilt, Name: o.Name, ID: id}); err != nil {
+			u.logf("回滚：重建的原来的容器 %s 没能记进事务日志：%v", o.Name, err)
 		}
 	}
 	return id

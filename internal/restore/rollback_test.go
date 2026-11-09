@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -235,8 +236,8 @@ func TestRollbackKeepsDataWhenWriterWontStop(t *testing.T) {
 	}
 }
 
-// 上次回滚已经重建、启动了原来的 Compose 容器（新的 ID），之后又中断了。再次回滚时，要先
-// 按名字找到它、停下，再放回数据；停不下来时不能动数据。
+// 上次回滚已经重建、启动了原来的 Compose 容器（新的 ID），但没记下来（例如网络没接好），之后
+// 又中断了。再次回滚时，要先按名字找到它、停下，再放回数据；停不下来时不能动数据。
 func TestRollbackStopsRebuiltOldCompose(t *testing.T) {
 	for _, stopOK := range []bool{true, false} {
 		running, clearedWhileRunning, cleared := true, false, false
@@ -288,7 +289,7 @@ func TestRollbackStopsRebuiltOldCompose(t *testing.T) {
 		f.Close()
 		var out bytes.Buffer
 		u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
-			vio: &volumeIO{dc: dc, image: "alpine", helperBin: "/unused"}}
+			record: func(Entry) error { return nil }, vio: &volumeIO{dc: dc, image: "alpine", helperBin: "/unused"}}
 		problems := u.rollback(context.Background(), []Entry{
 			{Op: opComposeOld, Name: "stack", Old: []OldContainer{{ID: "old-app", Name: "stack-app-1", State: "running",
 				Raw: json.RawMessage(`{"Id":"old-app","Name":"/stack-app-1","Image":"sha256:original","Config":{"Image":"alpine"},"HostConfig":{}}`)}}},
@@ -302,6 +303,170 @@ func TestRollbackStopsRebuiltOldCompose(t *testing.T) {
 		case !stopOK && (cleared || len(problems) == 0):
 			t.Fatalf("停不下来时不能动数据，要报告：cleared=%v %v", cleared, problems)
 		}
+	}
+}
+
+// 回滚重建、启动了原来的 Compose 容器之后，还没删除回滚资料就被结束（比如断电）。下次再回滚
+// 要认得重建的容器：它就是原来的服务，这期间可能已经运行、写过东西，不能当成这次迁入的新容器
+// 删掉再重建。
+func TestRollbackAgainKeepsRebuiltOldCompose(t *testing.T) {
+	type ctr struct {
+		name    string
+		running bool
+	}
+	var mu sync.Mutex
+	ctrs := map[string]*ctr{"new-app": {name: "stack-app-1", running: true}} // 这次迁入的新容器
+	var removed, created []string
+	find := func(ref string) (string, *ctr) {
+		for id, c := range ctrs {
+			if id == ref || c.name == ref {
+				return id, c
+			}
+		}
+		return "", nil
+	}
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		ref, _, _ := strings.Cut(strings.TrimPrefix(p, "/containers/"), "/")
+		switch {
+		case p == "/containers/json": // 按 Compose 项目列出：这里的容器都是这个项目的
+			var list []map[string]any
+			for id, c := range ctrs {
+				list = append(list, map[string]any{"Id": id, "Names": []string{"/" + c.name}})
+			}
+			json.NewEncoder(w).Encode(list)
+		case p == "/containers/create":
+			id := fmt.Sprintf("rebuilt-%d", len(created)+1)
+			created = append(created, req.URL.Query().Get("name"))
+			ctrs[id] = &ctr{name: req.URL.Query().Get("name")}
+			fmt.Fprintf(w, `{"Id":%q}`, id)
+		case strings.HasPrefix(p, "/containers/"):
+			id, c := find(ref)
+			switch {
+			case c == nil:
+				http.Error(w, `{"message":"No such container"}`, 404)
+			case req.Method == "GET":
+				fmt.Fprintf(w, `{"Id":%q,"Name":"/%s","State":{"Running":%v}}`, id, c.name, c.running)
+			case req.Method == "DELETE":
+				removed = append(removed, id)
+				delete(ctrs, id)
+				w.WriteHeader(204)
+			default: // start、stop
+				c.running = strings.HasSuffix(p, "/start")
+				w.WriteHeader(204)
+			}
+		case strings.HasPrefix(p, "/images/"):
+			io.WriteString(w, `{"Id":"sha256:original"}`)
+		case p == "/networks":
+			io.WriteString(w, `[]`)
+		default:
+			return false
+		}
+		return true
+	})
+	j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []Entry{
+		{Op: opComposeOld, Name: "stack", Old: []OldContainer{{ID: "old-app", Name: "stack-app-1", State: "running",
+			Raw: json.RawMessage(`{"Id":"old-app","Name":"/stack-app-1","Image":"sha256:original","Config":{"Image":"alpine"},"HostConfig":{}}`)}}},
+		{Op: opOldImages, Name: "stack"},
+		{Op: opComposeUp, Name: "stack"},
+	} {
+		j.add(e)
+	}
+	j.close()
+	var out bytes.Buffer
+	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+		record: func(e Entry) error { return appendJournal(j.dir, e) }}
+	for i := 1; i <= 2; i++ { // 第二次：上次回滚做完了，回滚资料还没删
+		entries, err := readJournal(j.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if problems := u.rollback(context.Background(), entries); len(problems) > 0 {
+			t.Fatalf("第 %d 次回滚：%v", i, problems)
+		}
+	}
+	id, c := find("stack-app-1")
+	if strings.Join(removed, ",") != "new-app" || len(created) != 1 || c == nil || !c.running {
+		t.Fatalf("删掉了 %v，重建了 %v，现在的 stack-app-1：%s %+v", removed, created, id, c)
+	}
+}
+
+// 重建的原来的 Compose 容器没能记进事务日志（比如磁盘满了），不算回滚失败：原来的服务已经回来了。
+// 算失败的话回滚资料会留下，下次运行又回滚一遍，反而会把它删掉重建。
+func TestRollbackRebuiltNotRecorded(t *testing.T) {
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		switch {
+		case p == "/containers/old-app/json", p == "/containers/stack-app-1/json":
+			http.Error(w, `{"message":"No such container"}`, 404)
+		case strings.HasPrefix(p, "/images/"):
+			io.WriteString(w, `{"Id":"sha256:original"}`)
+		case p == "/containers/create":
+			io.WriteString(w, `{"Id":"rebuilt"}`)
+		case p == "/containers/rebuilt/json":
+			io.WriteString(w, `{"Id":"rebuilt","State":{"Running":false}}`)
+		case p == "/containers/rebuilt/start":
+			w.WriteHeader(204)
+		default:
+			return false
+		}
+		return true
+	})
+	var out bytes.Buffer
+	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+		record: func(Entry) error { return errors.New("磁盘满了") }}
+	problems := u.rollback(context.Background(), []Entry{{Op: opComposeOld, Name: "stack", Old: []OldContainer{{ID: "old-app", Name: "stack-app-1", State: "running",
+		Raw: json.RawMessage(`{"Id":"old-app","Name":"/stack-app-1","Image":"sha256:original","Config":{"Image":"alpine"},"HostConfig":{}}`)}}}})
+	if len(problems) > 0 {
+		t.Fatalf("原来的服务已经回来了，不该算回滚失败：%v", problems)
+	}
+}
+
+// 放回数据卷之后备份就删掉：上次回滚放回了数据、还没删除回滚资料就被结束时，再回滚不会把这之后
+// 写进卷里的数据又改回去。
+func TestRollbackRestoresVolumeOnce(t *testing.T) {
+	writes := 0
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		switch {
+		case p == "/volumes/data":
+			io.WriteString(w, `{"Name":"data","Driver":"local"}`)
+		case p == "/containers/create":
+			io.WriteString(w, `{"Id":"helper"}`)
+		case p == "/containers/helper/wait":
+			io.WriteString(w, `{"StatusCode":0}`)
+		case p == "/containers/helper/archive":
+			writes++
+			io.Copy(io.Discard, req.Body)
+		case req.Method == "DELETE", p == "/containers/helper/start":
+			w.WriteHeader(204)
+		default:
+			return false
+		}
+		return true
+	})
+	backup := filepath.Join(t.TempDir(), "volume-0001")
+	f, _ := os.Create(backup)
+	tw := tar.NewWriter(f)
+	tw.WriteHeader(&tar.Header{Name: "dockhop-data/", Typeflag: tar.TypeDir, Mode: 0o755})
+	tw.Close()
+	f.Close()
+	var out bytes.Buffer
+	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+		vio: &volumeIO{dc: dc, image: "alpine", helperBin: "/unused"}}
+	for i := 1; i <= 2; i++ {
+		if problems := u.rollback(context.Background(), []Entry{{Op: opVolume, Name: "data", Existed: true, Backup: backup}}); len(problems) > 0 {
+			t.Fatalf("第 %d 次回滚：%v", i, problems)
+		}
+	}
+	if writes != 1 {
+		t.Fatalf("数据卷放回了 %d 次", writes)
 	}
 }
 
@@ -338,7 +503,8 @@ func TestRollbackOldComposeNamespace(t *testing.T) {
 		return b
 	}
 	var out bytes.Buffer
-	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+		record: func(Entry) error { return nil }}
 	// 原来是停着的：只重建，不启动。sidecar 排在前面，检查重建的顺序。
 	u.rollback(context.Background(), []Entry{{Op: opComposeOld, Name: "stack", Old: []OldContainer{
 		{ID: sideID, Name: "stack-sidecar-1", State: "exited", Raw: raw(sideID, "stack-sidecar-1", "container:"+vpnID)},
@@ -494,7 +660,8 @@ func TestRollbackRestoresAcrossProjects(t *testing.T) {
 				entries = append(entries, Entry{Op: opComposeOld, Name: p, Old: []OldContainer{old[p]}})
 			}
 			var out bytes.Buffer
-			u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+			u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+				record: func(Entry) error { return nil }}
 			problems := u.rollback(context.Background(), entries)
 			if len(problems) > 0 || strings.Join(events, "，") != "建 avpn-vpn-1，建 zside-sidecar-1，启动 avpn-vpn-1，启动 zside-sidecar-1" {
 				t.Fatalf("顺序：%v；问题：%v", events, problems)
@@ -538,7 +705,7 @@ func (d *images) docker(t *testing.T) *docker.Client {
 			b, _ := json.Marshal(list)
 			w.Write(b)
 		case req.Method == "GET":
-			ref = strings.TrimSuffix(ref, "/json")
+			ref = dockerName(strings.TrimSuffix(ref, "/json"))
 			id := d.tags[ref]
 			if id == "" && d.ids[ref] {
 				id = ref
@@ -567,9 +734,9 @@ func (d *images) docker(t *testing.T) *docker.Client {
 			}
 			delete(d.ids, ref)
 			d.deleted = append(d.deleted, ref)
-		case req.Method == "DELETE" && d.tags[ref] != "":
-			id := d.tags[ref]
-			delete(d.tags, ref)
+		case req.Method == "DELETE" && d.tags[dockerName(ref)] != "":
+			id := d.tags[dockerName(ref)]
+			delete(d.tags, dockerName(ref))
 			if len(namesOf(id)) == 0 {
 				delete(d.ids, id)
 				d.deleted = append(d.deleted, id)
@@ -580,6 +747,14 @@ func (d *images) docker(t *testing.T) *docker.Client {
 		return true
 	})
 	return dc
+}
+
+// dockerName 是 Docker 认的镜像名：没写标签的就是 latest，app 和 app:latest 是同一个名字。
+func dockerName(ref string) string {
+	if strings.Contains(ref, "@") || strings.Contains(ref[strings.LastIndex(ref, "/")+1:], ":") {
+		return ref
+	}
+	return ref + ":latest"
 }
 
 // 回滚时镜像名改回迁入前的样子，只删这次迁入带来的镜像。迁入的镜像和这台服务器上原有的一模

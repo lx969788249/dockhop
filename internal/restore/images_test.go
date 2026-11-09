@@ -297,3 +297,21 @@ func TestImageNamesFollowGroups(t *testing.T) {
 		t.Fatalf("实际 %v，应为 %v", got, want)
 	}
 }
+
+// Docker 认为是同一个名字的不同写法，fullTag 都一样：没写标签的是 latest，没写仓库地址的是
+// docker.io，Docker Hub 的官方镜像在 library/ 下面。
+func TestFullTag(t *testing.T) {
+	for want, refs := range map[string][]string{
+		"docker.io/library/app:latest": {"app", "app:latest", "library/app", "docker.io/app", "docker.io/library/app:latest", "index.docker.io/library/app"},
+		"docker.io/user/app:1":         {"user/app:1", "docker.io/user/app:1"},
+		"localhost:5000/app:latest":    {"localhost:5000/app", "localhost:5000/app:latest"},
+		"ghcr.io/o/app:2":              {"ghcr.io/o/app:2"},
+		"app@sha256:abc":               {"app@sha256:abc"},
+	} {
+		for _, ref := range refs {
+			if got := fullTag(ref); got != want {
+				t.Errorf("fullTag(%q) = %q，应为 %q", ref, got, want)
+			}
+		}
+	}
+}

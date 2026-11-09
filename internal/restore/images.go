@@ -274,12 +274,13 @@ func (r *run) loadImageFile(ctx context.Context, label string, f bundle.ImageFil
 }
 
 // imageKey 返回一个镜像名跟着哪一组走（见 in）：只保留一部分服务时，没保留的组单独用的名字要
-// 改回去，几组都用的留着。按名字算，不按镜像：用这个名字的容器（容器配置里写的镜像是 ref）在哪一组，
-// 名字就跟着哪一组；没有容器用它时（同一个镜像的别的名字），跟着用这个镜像（ID 是 id）的容器。这些
-// 容器不止一组时为空，算整次迁入共用的。两组用同一个镜像的不同名字时各归各的，按镜像算的话，没保留
-// 的那组的名字也会被当成共用的留下来。
+// 改回去，几组都用的留着。按名字算，不按镜像：创建时用这个名字的容器（见 baseImage：用的是旧版本
+// 镜像时是那个旧版本的名字，不是配置里原来写的）在哪一组，名字就跟着哪一组；没有容器用它时（同一个
+// 镜像的别的名字），跟着用这个镜像（ID 是 id）的容器。这些容器不止一组时为空，算整次迁入共用的。
+// 两组用同一个镜像的不同名字时各归各的，按镜像算的话，没保留的那组的名字也会被当成共用的留下来。
+// 名字按 Docker 的认法比较（见 fullTag）：app 和 app:latest 是同一个名字。
 func (r *run) imageKey(id, ref string) string {
-	if key, used := r.usersKey(func(it *citem) bool { return it.c.Config.Image == ref }); used {
+	if key, used := r.usersKey(func(it *citem) bool { return fullTag(r.baseImage(it)) == fullTag(ref) }); used {
 		return key
 	}
 	key, _ := r.usersKey(func(it *citem) bool { return id != "" && it.m.ImageID == id })
@@ -303,10 +304,10 @@ func (r *run) usersKey(match func(*citem) bool) (key string, used bool) {
 }
 
 // noteTag 在镜像名 name 被改动之前（加名字，或者 docker load 按文件里记的名字加名字），把它
-// 原来指向哪个镜像记进事务日志：迁入失败时改回去，原来没有的名字删掉（见 undoTags）。
-// 按摘要的引用（名字@sha256:…）不是名字，不会被改动。
+// 原来指向哪个镜像记进事务日志：迁入失败时改回去，原来没有的名字删掉（见 undoTags）。同一个名字
+// 的不同写法（见 fullTag）只记一次。按摘要的引用（名字@sha256:…）不是名字，不会被改动。
 func (r *run) noteTag(ctx context.Context, name string) error {
-	if strings.Contains(name, "@sha256:") || r.noted[name] {
+	if strings.Contains(name, "@sha256:") || r.noted[fullTag(name)] {
 		return nil
 	}
 	id := ""
@@ -323,7 +324,7 @@ func (r *run) noteTag(ctx context.Context, name string) error {
 	if r.noted == nil {
 		r.noted = map[string]bool{}
 	}
-	r.noted[name] = true
+	r.noted[fullTag(name)] = true
 	return nil
 }
 
@@ -458,4 +459,27 @@ func splitTag(ref string) (string, string) {
 		return ref, "latest"
 	}
 	return ref[:i], ref[i+1:]
+}
+
+// fullTag 返回镜像名在 Docker 里的完整写法，用来判断两种写法是不是同一个名字：没写标签的是
+// latest，没写仓库地址的是 docker.io，Docker Hub 的官方镜像在 library/ 下面。app、app:latest、
+// library/app、docker.io/library/app:latest 都是同一个名字。按摘要的引用原样返回。
+func fullTag(ref string) string {
+	if strings.Contains(ref, "@") {
+		return ref
+	}
+	repo, tag := splitTag(ref)
+	domain, path := "docker.io", repo
+	if i := strings.IndexByte(repo, '/'); i >= 0 {
+		if first := repo[:i]; strings.ContainsAny(first, ".:") || first == "localhost" {
+			domain, path = first, repo[i+1:]
+		}
+	}
+	if domain == "index.docker.io" {
+		domain = "docker.io"
+	}
+	if domain == "docker.io" && !strings.Contains(path, "/") {
+		path = "library/" + path
+	}
+	return domain + "/" + path + ":" + tag
 }
