@@ -4,14 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -260,5 +265,141 @@ func TestPartialRollbackImageNameUsers(t *testing.T) {
 				t.Fatalf("镜像名 %v，应为 %v", d.tags, c.want)
 			}
 		})
+	}
+}
+
+// partialDirs 准备只保留一部分服务时两组的目录：g1 保留、g2 没启动。每组的目录里是迁移过来的
+// （new），旁边的备份是原来的（orig）。返回日志里对应的两条记录。
+func partialDirs(t *testing.T) (string, []Entry) {
+	root := t.TempDir()
+	var entries []Entry
+	for _, g := range []string{"g1", "g2"} {
+		dir, old := filepath.Join(root, g), filepath.Join(root, "."+g+".old")
+		for p, s := range map[string]string{dir: "new " + g, old: "orig " + g} {
+			os.MkdirAll(p, 0o755)
+			os.WriteFile(filepath.Join(p, "f"), []byte(s), 0o644)
+		}
+		entries = append(entries, Entry{Op: opBind, Path: dir, Existed: true, Backup: old, Group: g})
+	}
+	return root, entries
+}
+
+// checkPartialDone 确认 g1 留着迁移过来的、备份删掉了，g2 放回了原来的。
+func checkPartialDone(t *testing.T, root string) {
+	t.Helper()
+	for dir, want := range map[string]string{"g1": "new g1", "g2": "orig g2"} {
+		if b, _ := os.ReadFile(filepath.Join(root, dir, "f")); string(b) != want {
+			t.Errorf("%s 里是 %q，应为 %q", dir, b, want)
+		}
+		if _, err := os.Lstat(filepath.Join(root, "."+dir+".old")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s 的备份应删掉", dir)
+		}
+	}
+}
+
+// partialRun 是只有空的 Docker 的迁入（没有容器和镜像），回滚资料在 dir。
+func partialRun(t *testing.T, dir string) *run {
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		if strings.HasSuffix(req.URL.Path, "/containers/json") || strings.HasSuffix(req.URL.Path, "/images/json") {
+			io.WriteString(w, "[]")
+			return true
+		}
+		return false
+	})
+	log, err := logging.Open(filepath.Join(t.TempDir(), "logs"), "in", &logging.Redactor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { log.Finish(logging.Failed, true) })
+	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(io.Discard, false, nil), Prompt: ui.NewPrompter(nil, io.Discard), Log: log,
+		Home: t.TempDir(), Getenv: func(string) string { return "" }}, rbDir: dir}
+	r.undo = &undo{dc: dc, screen: r.Screen, logf: t.Logf, record: func(e Entry) error { return appendJournal(dir, e) },
+		fail: func(string) bool { return false }}
+	return r
+}
+
+// 只保留一部分服务时，删除没启动的组的整个过程中，日志里一直记着保留下来的组：中途被强制结束，
+// 下次运行还能接着清理它们的回滚资料（以前先把日志改成只剩没启动的组，被结束就再也找不到了）。
+func TestPartialCommitKeepsJournal(t *testing.T) {
+	root, entries := partialDirs(t)
+	j, err := openJournal(filepath.Join(root, "rb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		j.add(e)
+	}
+	r := partialRun(t, j.dir)
+	r.j = j
+	g1 := &group{id: "g1", items: []*citem{{m: bundle.Container{Name: "a"}, c: &docker.Container{}}}}
+	g2 := &group{id: "g2", reason: "没能启动", items: []*citem{{m: bundle.Container{Name: "b"}, c: &docker.Container{}}}}
+	r.groups = []*group{g1, g2}
+	var during []Entry // 删除没启动的组时日志里的内容
+	r.undo.fail = func(point string) bool {
+		if point == "rollback-data" {
+			during, _ = readJournal(r.rbDir)
+		}
+		return false
+	}
+	if err := r.commitPartial(context.Background(), []*group{g1}, []*group{g2}); err != errPartial {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(during, func(e Entry) bool { return e.Op == opBind && e.Group == "g1" }) {
+		t.Errorf("删除没启动的组时，日志里应还记着保留下来的组：%+v", during)
+	}
+	checkPartialDone(t, root)
+	if _, err := os.Lstat(r.rbDir); !errors.Is(err, os.ErrNotExist) {
+		t.Error("做完之后回滚资料目录应删掉")
+	}
+}
+
+// 只保留一部分服务时被强制结束：下次运行接着删除没启动的组、清理保留下来的组的回滚资料，不再问。
+func TestRecoverPartialCommit(t *testing.T) {
+	root, entries := partialDirs(t)
+	j, err := openJournal(filepath.Join(root, "rb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range append(entries, Entry{Op: opCommit, Names: []string{"g1"}}) {
+		j.add(e)
+	}
+	j.close()
+	r := partialRun(t, j.dir)
+	if err := r.recoverInterrupted(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	checkPartialDone(t, root)
+	if _, err := os.Lstat(r.rbDir); !errors.Is(err, os.ErrNotExist) {
+		t.Error("做完之后回滚资料目录应删掉")
+	}
+}
+
+// 上次迁入被强制结束、新服务器上一个容器都没有时（例如替换了一个没人用的同名数据卷），恢复数据卷的
+// 临时容器也要有镜像可用：从本机的镜像里挑一个有名字的（以前只从现有容器的镜像里挑）。
+func TestRecoverPicksHelperImage(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "rb")
+	j, err := openJournal(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.close()
+	r := partialRun(t, dir)
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/containers/json"):
+			io.WriteString(w, "[]")
+		case strings.HasSuffix(req.URL.Path, "/images/json"):
+			io.WriteString(w, `[{"Id":"sha256:none","RepoTags":["<none>:<none>"]},{"Id":"sha256:abc","RepoTags":["alpine:3.20"]}]`)
+		default:
+			return false
+		}
+		return true
+	})
+	r.Docker, r.undo.dc = dc, dc
+	if err := r.recoverInterrupted(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r.undo.vio == nil || r.undo.vio.image != "alpine:3.20" {
+		t.Fatalf("应从本机镜像里挑一个有名字的：%+v", r.undo.vio)
 	}
 }

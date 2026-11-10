@@ -73,7 +73,8 @@ func TestInFidelity(t *testing.T) {
 		"-v", single+":/etc/app.conf:ro", "-v", run+":/run/host",
 		"--entrypoint", "sh", "alpine:3.20", "-c", "sleep 600")
 	sh(t, "docker", "run", "-d", "--name", names["multi"], "--label", noWatchtower, "--network", p+"_neta",
-		"--ip", fmt.Sprintf("172.29.%d.10", octet), "--network-alias", "svc-a", "alpine:3.20", "sleep", "600")
+		"--ip", fmt.Sprintf("172.29.%d.10", octet), "--mac-address", fmt.Sprintf("02:42:ac:1d:%02x:0a", octet),
+		"--network-alias", "svc-a", "alpine:3.20", "sleep", "600")
 	sh(t, "docker", "network", "connect", "--alias", "svc-b", p+"_netb", names["multi"])
 	// exec 形式的健康检查只能写在镜像里，迁移后不能被改写成 shell 形式。
 	build := exec.Command("docker", "build", "-q", "-t", p+"_health:1", "-")
@@ -193,6 +194,11 @@ volumes:
 		if diff := diffMaps(want, after, ""); len(diff) > 0 {
 			t.Errorf("容器 %s 迁移前后不一致：\n%s", n, strings.Join(diff, "\n"))
 		}
+	}
+	// 用户指定的 MAC 地址：网卡上用的就是它（只比配置的话，配置对了网卡也可能不对）。
+	mac := sh(t, "docker", "inspect", "-f", `{{(index .NetworkSettings.Networks "`+p+`_neta").MacAddress}}`, names["multi"])
+	if want := fmt.Sprintf("02:42:ac:1d:%02x:0a", octet); mac != want {
+		t.Errorf("%s 的 MAC 地址是 %s，应为 %s", names["multi"], mac, want)
 	}
 
 	// ---- 数据 ----

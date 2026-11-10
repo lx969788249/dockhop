@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
+	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -123,6 +124,30 @@ func TestWaitReadyStableRunning(t *testing.T) {
 	}
 	if time.Since(start) > 500*time.Millisecond {
 		t.Errorf("已经稳定运行了，不用再等：%s", time.Since(start))
+	}
+}
+
+// 没有健康检查的容器稳定运行几秒就算就绪，之后还可能停掉。决定提交之前把就绪了的容器再查一遍：
+// 停了、在重启、不健康了的，它所在的组按没能启动处理；还在运行的不受影响。
+func TestConfirmReady(t *testing.T) {
+	for _, c := range []struct{ state, want string }{
+		{`{"Id":"new-app","Name":"/app","State":{"Status":"exited","ExitCode":1}}`, "容器 app 就绪之后又停了（退出码 1），最后的输出：panic: boom"},
+		{`{"Id":"new-app","Name":"/app","State":{"Status":"restarting","Running":true,"ExitCode":2}}`, "容器 app 就绪之后又退出了，Docker 正在重启它（退出码 2），最后的输出：panic: boom"},
+		{`{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true,"Health":{"Status":"unhealthy"}}}`, "容器 app 就绪之后健康检查又没通过，最后的输出：panic: boom"},
+		{`{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true,"Health":{"Status":"healthy"}}}`, ""},
+		{`{"Id":"new-app","Name":"/app","State":{"Status":"paused","Running":true,"Paused":true}}`, ""},
+	} {
+		_, _, r := fakeContainer(t, "panic: boom", c.state)
+		src := &docker.Container{}
+		src.State.Running = true
+		g := &group{id: "g", items: []*citem{{m: bundle.Container{Name: "app"}, c: src, newID: "new-app", ready: true}}}
+		r.groups = []*group{g}
+		if err := r.confirmReady(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if g.reason != c.want {
+			t.Errorf("%s\n  原因：%q\n  应为：%q", c.state, g.reason, c.want)
+		}
 	}
 }
 

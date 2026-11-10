@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -127,5 +128,20 @@ func TestWriteFileDurable(t *testing.T) {
 	}
 	if _, err := os.Stat(p + ".tmp"); !os.IsNotExist(err) {
 		t.Error("临时文件应已改名")
+	}
+}
+
+// /proc/self/mountinfo 的第 5 列是挂载点，空格之类的字符写成 \040 这样的八进制。
+func TestMountedAt(t *testing.T) {
+	const mountinfo = `22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+40 22 8:17 / /data rw,relatime shared:20 - ext4 /dev/sdb1 rw
+41 22 0:40 / /mnt/my\040disk rw,relatime - tmpfs tmpfs rw
+42 22 8:1 /srv/a /opt/app/config rw,relatime - ext4 /dev/sda1 rw
+`
+	for path, want := range map[string]bool{"/data": true, "/data/app": false, "/mnt/my disk": true, "/mnt/my": false,
+		"/opt/app/config": true, "/opt/app": false} {
+		if got := mountedAt(strings.NewReader(mountinfo), path); got != want {
+			t.Errorf("mountedAt(%q) = %v", path, got)
+		}
 	}
 }

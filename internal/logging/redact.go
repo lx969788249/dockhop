@@ -46,8 +46,11 @@ var patterns = []struct {
 	re   *regexp.Regexp
 	repl string
 }{
-	// NAME=值（环境变量、命令行参数）
-	{regexp.MustCompile(`(` + secretName + `)=([^\s"'&,;]+)`), "${1}=" + mask},
+	// "NAME=值"、'NAME=值'（JSON 里的环境变量、加了引号的命令行参数）：值里可能有空格，遮到引号为止
+	{regexp.MustCompile(`"(` + secretName + `)=[^"]*`), `"${1}=` + mask},
+	{regexp.MustCompile(`'(` + secretName + `)=[^']*`), `'${1}=` + mask},
+	// NAME=值（环境变量、命令行参数）：遮到空白或引号为止，值里的 & , ; 也遮（宁可多藏）
+	{regexp.MustCompile(`(` + secretName + `)=([^\s"']+)`), "${1}=" + mask},
 	// "name": "值"（JSON）
 	{regexp.MustCompile(`("` + secretName + `"\s*:\s*)"[^"]*"`), `${1}"` + mask + `"`},
 	// name: 值（YAML）

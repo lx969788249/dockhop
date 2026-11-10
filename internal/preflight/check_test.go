@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -35,7 +37,7 @@ func testTarget() *Target {
 		Arch: "x86_64", DockerVersion: "29.2.1", DockerRoot: "/var/lib/docker", HasCompose: true, Local: true,
 		Runtimes: map[string]bool{"runc": true}, Containers: map[string]TargetContainer{},
 		Volumes: map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{},
-		ListenersOK: true, Exists: func(string) bool { return true },
+		ListenersOK: true, Exists: func(string) bool { return true }, HasContent: func(string) bool { return false },
 		Disk: func(string) (host.Disk, error) { return host.Disk{Path: "/", Free: 100 << 30, Dev: 1}, nil },
 	}
 }
@@ -231,6 +233,19 @@ func TestEvaluateNetworksAndVolumes(t *testing.T) {
 	if find(Evaluate(p, tg, &Decisions{}, Options{}), "volume_mismatch") == nil {
 		t.Error("同名卷的选项名字不同时应询问")
 	}
+	// 新服务器上的同一个目录里已经有东西时，和数据卷一样提示会被替换；没有这个目录、或者是空目录时不提。
+	p = testPlan()
+	p.Containers[0].Binds = []string{"/srv/web"}
+	p.Binds = []bundle.PlanBind{{Path: "/srv/web", Bytes: 1 << 20}}
+	tg = testTarget()
+	tg.HasContent = func(path string) bool { return path == "/srv/web" }
+	if i := find(Evaluate(p, tg, &Decisions{}, Options{}), "bind_replace"); i == nil || i.Level != Info || !strings.Contains(i.Title, "/srv/web") {
+		t.Errorf("已有的目录会被替换时应提示：%+v", i)
+	}
+	tg.HasContent = func(string) bool { return false }
+	if i := find(Evaluate(p, tg, &Decisions{}, Options{}), "bind_replace"); i != nil {
+		t.Errorf("目录不存在或是空的，不用提示：%+v", i)
+	}
 }
 
 func TestEvaluateStops(t *testing.T) {
@@ -248,6 +263,37 @@ func TestEvaluateStops(t *testing.T) {
 	for _, want := range []string{"arch", "compose", "remote_docker", "gpu", "device", "bind_home"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("应停下：%s（实际 %s）", want, got)
+		}
+	}
+}
+
+// Docker 不在这台服务器上时，替换已有的数据卷（包括写进匿名卷：新建的匿名卷里有镜像带的文件）要先
+// 清空，清空要把本机的程序放进临时容器，做不到：没有目录和项目也要在下载之前停下。只写进新建的
+// 有名字的卷不用清空，不停。
+func TestEvaluateRemoteDockerVolumes(t *testing.T) {
+	const anon = "3977206abb71f8aa4677d89b605e71e99ae3db6773688b6f62e61fbbadf9c34c"
+	for _, c := range []struct {
+		name     string
+		existing bool   // 新服务器上已经有 data 这个卷
+		volume   string // web 用的卷
+		stop     bool
+	}{
+		{"替换已有的卷", true, "data", true},
+		{"写进匿名卷", false, anon, true},
+		{"新建的卷", false, "data", false},
+	} {
+		p := testPlan()
+		p.Containers = p.Containers[:1] // 只有 web：没有 Compose 项目
+		p.Containers[0].Volumes = []string{c.volume}
+		p.Volumes = []bundle.PlanVolume{{Name: c.volume, Driver: "local", Bytes: 1 << 20}}
+		tg := testTarget()
+		tg.Local = false
+		if c.existing {
+			tg.Volumes["data"] = &docker.Volume{Name: "data", Driver: "local"}
+		}
+		i := find(Evaluate(p, tg, &Decisions{}, Options{}), "remote_docker")
+		if got := i != nil && i.Level == Stop; got != c.stop {
+			t.Errorf("%s：应停下 %v，实际 %+v", c.name, c.stop, i)
 		}
 	}
 }
@@ -636,5 +682,20 @@ func TestCounterpartsNameHeldByKeptProject(t *testing.T) {
 	r = Evaluate(p, tg, &Decisions{ReplaceProjects: []string{"proxy", "site"}}, Options{})
 	if len(r.Issues) != 0 || r.Containers != 6 {
 		t.Errorf("替换 proxy、site 时名字都空出来（迁入 %d 个）：%+v", r.Containers, r.Issues)
+	}
+}
+
+func TestHasContent(t *testing.T) {
+	dir := t.TempDir()
+	empty, full, file, link := filepath.Join(dir, "empty"), filepath.Join(dir, "full"), filepath.Join(dir, "file"), filepath.Join(dir, "link")
+	os.Mkdir(empty, 0o755)
+	os.Mkdir(full, 0o755)
+	os.WriteFile(filepath.Join(full, "a"), nil, 0o644)
+	os.WriteFile(file, nil, 0o644)
+	os.Symlink(empty, link)
+	for path, want := range map[string]bool{empty: false, full: true, file: true, link: true, filepath.Join(dir, "none"): false} {
+		if got := hasContent(path); got != want {
+			t.Errorf("hasContent(%s) = %v", filepath.Base(path), got)
+		}
 	}
 }

@@ -354,10 +354,27 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 			Title: fmt.Sprintf("新服务器的 docker-compose 是老版本 %s，旧服务器用的是 Compose %s；有些写法老版本读不懂，迁入时可能失败（失败会自动删除迁入的内容）。"+
 				"建议先在新服务器安装新版 Docker Compose", t.Compose, plan.Source.Compose)})
 	}
-	if !t.Local && (len(plan.Binds) > 0 || hasProject) {
-		addIssue(Issue{Level: Stop, Kind: "remote_docker",
-			Title: "Docker 不在这台服务器上（DOCKER_HOST 指向了别的机器），没法把目录和 Compose 项目文件放到 Docker 所在的服务器",
-			Hint:  "请在 Docker 所在的服务器上直接运行 DockHop"})
+	if !t.Local {
+		// 替换已有的数据卷要先清空（写进匿名卷也是：新建的匿名卷里有镜像带的文件），清空要把本机的
+		// 程序放进临时容器，Docker 在别的机器上时做不到。只写进新建的有名字的卷不用清空。
+		var what []string
+		if len(plan.Binds) > 0 {
+			what = append(what, "放目录")
+		}
+		if hasProject {
+			what = append(what, "放 Compose 项目文件")
+		}
+		for _, v := range plan.Volumes {
+			if usedVolumes[v.Name] && !d.KeepVolume(v.Name) && (spec.IsAnonymousVolume(v.Name) || t.Volumes[v.Name] != nil) {
+				what = append(what, "替换已有的数据卷")
+				break
+			}
+		}
+		if len(what) > 0 {
+			addIssue(Issue{Level: Stop, Kind: "remote_docker",
+				Title: "Docker 不在这台服务器上（DOCKER_HOST 指向了别的机器），没法在 Docker 所在的服务器上" + strings.Join(what, "、"),
+				Hint:  "请在 Docker 所在的服务器上直接运行 DockHop"})
+		}
 	}
 	for _, c := range containers {
 		if c.Runtime != "" && len(t.Runtimes) > 0 && !t.Runtimes[c.Runtime] {
@@ -493,6 +510,13 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		} else {
 			addIssue(Issue{Level: Info, Kind: "volume_replace", Volume: v.Name,
 				Title: "数据卷 " + v.Name + " 已存在，迁移过来的数据会替换它（失败时放回原来的）"})
+		}
+	}
+	// 目录和数据卷一样整个替换，迁入成功后原来的内容就删了，所以里面有东西时也要说一声。
+	for _, b := range plan.Binds {
+		if usedBinds[b.Path] && t.HasContent(b.Path) {
+			addIssue(Issue{Level: Info, Kind: "bind_replace",
+				Title: "目录 " + b.Path + " 已存在，迁移过来的内容会替换它（失败时放回原来的）"})
 		}
 	}
 

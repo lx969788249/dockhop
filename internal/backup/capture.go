@@ -227,9 +227,24 @@ func (c *cleanupReader) Close() error {
 	return err
 }
 
+// walkRoot 和 filepath.WalkDir 一样遍历 root，只是 root 本身是软链接时（例如项目目录 /root/app 指向
+// 数据盘上的 /data/app）遍历它指向的内容：WalkDir 不进入软链接，以前项目目录什么都没打包。fn 收到
+// 两个路径：按 root 写的（名字、给人看的都用它），和真实的（读文件用）。
+func walkRoot(root string, fn func(p, real string, d fs.DirEntry, err error) error) error {
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		resolved = root
+	}
+	return filepath.WalkDir(resolved, func(p string, d fs.DirEntry, err error) error {
+		return fn(root+strings.TrimPrefix(p, resolved), p, d, err)
+	})
+}
+
 // hostTar 把宿主机上的 roots（目录或文件）写成一个 tar 流。base 为 "/" 时，名字是完整
 // 路径去掉开头的 /（挂载目录）；否则是相对于 base 的路径（Compose 项目目录）。
 // 保留属主、权限、修改时间、软链接和设备文件；socket 没法放进 tar，跳过并记日志。
+// root 本身是软链接时打包它指向的内容（见 walkRoot）。excludes 里的路径不打包，按原来的写法
+// 或者真实路径（挂载目录记的是真实路径）都行。
 type hostTar struct {
 	ctx      context.Context
 	roots    []string
@@ -249,8 +264,8 @@ func (h hostTar) stream() io.ReadCloser {
 func (h hostTar) write(w io.Writer) error {
 	tw := tar.NewWriter(w)
 	for _, root := range h.roots {
-		if err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-			return h.entry(tw, p, d, err)
+		if err := walkRoot(root, func(p, real string, d fs.DirEntry, err error) error {
+			return h.entry(tw, p, real, d, err)
 		}); err != nil {
 			return err
 		}
@@ -258,7 +273,8 @@ func (h hostTar) write(w io.Writer) error {
 	return tw.Close()
 }
 
-func (h hostTar) entry(tw *tar.Writer, p string, d fs.DirEntry, err error) error {
+// entry 打包一项：p 是按 root 写的路径（决定名字），real 是真实路径（读文件用），见 walkRoot。
+func (h hostTar) entry(tw *tar.Writer, p, real string, d fs.DirEntry, err error) error {
 	if err != nil {
 		return fmt.Errorf("读取 %s 失败：%v", p, err)
 	}
@@ -266,14 +282,14 @@ func (h hostTar) entry(tw *tar.Writer, p string, d fs.DirEntry, err error) error
 		return err
 	}
 	for _, e := range h.excludes {
-		if p == e {
+		if p == e || real == e {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 	}
-	info, err := os.Lstat(p)
+	info, err := os.Lstat(real)
 	if err != nil {
 		return fmt.Errorf("读取 %s 失败：%v", p, err)
 	}
@@ -291,7 +307,7 @@ func (h hostTar) entry(tw *tar.Writer, p string, d fs.DirEntry, err error) error
 	}
 	link := ""
 	if mode&fs.ModeSymlink != 0 {
-		if link, err = os.Readlink(p); err != nil {
+		if link, err = os.Readlink(real); err != nil {
 			return err
 		}
 	}
@@ -312,7 +328,7 @@ func (h hostTar) entry(tw *tar.Writer, p string, d fs.DirEntry, err error) error
 		return err
 	}
 	if mode.IsRegular() {
-		return copyFile(h.ctx, tw, p, hdr.Size, h.logf)
+		return copyFile(h.ctx, tw, real, hdr.Size, h.logf)
 	}
 	return nil
 }

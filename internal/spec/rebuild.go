@@ -19,7 +19,8 @@ import (
 //   - container:<ID> 改为 container:<名字>（依附的容器在新服务器上有新 ID）；
 //   - 镜像改为快照镜像或指定的镜像；按预检的决定改端口、不再对外开放、改绑到所有地址、
 //     改为自动分配 IP；
-//   - 只保留用户指定的固定 IP，动态分配的 IP 和 MAC 地址不固定；别名里去掉旧容器的 ID；
+//   - 只保留用户指定的固定 IP 和 MAC 地址（MAC 也写进主网络的设置，新版本的接口只认那里），
+//     动态分配的不固定；别名里去掉旧容器的 ID；
 //   - Docker 25 以下不支持创建时连接多个网络：先连主网络，其余的创建后再连。
 
 // SourceDefaults 是旧服务器 Docker 的默认值，用来判断哪些设置是自动填的。
@@ -181,9 +182,15 @@ func (r Rebuild) Build() (*Built, error) {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	// 用户指定的 MAC 地址（配置里有 MacAddress 的就是指定的，自动分配的没有）也写进主网络的设置：
+	// 新版本的接口只认这里，Docker 25 以前的只认配置里的（原样留着）。
+	mac := str(cfg["MacAddress"])
 	endpoints := map[string]any{}
 	for _, n := range names {
 		ep := endpoint(asMap(nets[n]), short, r.AutoIP != nil && r.AutoIP(n))
+		if n == primary && mac != "" {
+			ep["MacAddress"] = mac
+		}
 		if n == primary || r.MultiNetwork {
 			endpoints[n] = ep
 		} else {

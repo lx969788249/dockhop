@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -56,7 +57,7 @@ func (e *Env) fill() {
 		e.Context = context.Background()
 	}
 	if e.HomeDir == nil {
-		e.HomeDir = os.UserHomeDir
+		e.HomeDir = userHome
 	}
 	if e.Platform == "" {
 		e.Platform = runtime.GOOS + "/" + runtime.GOARCH
@@ -66,20 +67,33 @@ func (e *Env) fill() {
 	}
 }
 
+// userHome 是当前用户的主目录：先看 HOME，没设置时（例如有的定时任务里）按用户信息找。
+func userHome() (string, error) {
+	if h, err := os.UserHomeDir(); err == nil {
+		return h, nil
+	}
+	u, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	return u.HomeDir, nil
+}
+
 // dockhopHome 是日志、记录和工作文件的目录：DOCKHOP_HOME，默认 ~/.dockhop。总是绝对路径：
 // 锁文件的路径记在临时容器的标签上，用来判断它是哪个任务的，从别的目录运行时也要认得出。
-func (e *Env) dockhopHome() string {
+// 找不到主目录时不退回 /tmp：谁都能先在那里放一个软链接，以 root 运行时会跟着它改别的文件。
+func (e *Env) dockhopHome() (string, error) {
 	if h := e.Getenv("DOCKHOP_HOME"); h != "" {
 		if abs, err := filepath.Abs(h); err == nil {
-			return abs
+			return abs, nil
 		}
-		return h
+		return h, nil
 	}
 	home, err := e.HomeDir()
 	if err != nil || home == "" {
-		home = os.TempDir()
+		return "", errors.New("找不到当前用户的主目录")
 	}
-	return filepath.Join(home, ".dockhop")
+	return filepath.Join(home, ".dockhop"), nil
 }
 
 const helpText = `DockHop：只需两步，完整迁移你的 Docker。
@@ -184,7 +198,7 @@ func menu(env *Env) error {
 	if n >= shownFrom {
 		env.screen.Println(" 已协助完成迁移：" + env.screen.Green(strconv.Itoa(n)) + " 次\n")
 	}
-	choice, err := env.prompt.Choose([]string{"迁出", "迁入"})
+	choice, err := env.prompt.Menu([]string{"迁出", "迁入"})
 	if err != nil {
 		return err
 	}

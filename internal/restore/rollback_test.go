@@ -19,6 +19,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -118,6 +119,186 @@ func TestFileChangesRollBack(t *testing.T) {
 	}
 	if after := snapshotTree(t, world); after != before {
 		t.Fatal("重复还原后不一样了")
+	}
+}
+
+// bindStream 把 files（相对挂载目录 dst 的路径 → 内容；以 / 结尾的是目录）写成迁移包里一个挂载目录
+// 的数据（编号 b1），返回放数据的目录。mode 是 dst 本身的权限。
+func bindStream(t *testing.T, dst string, mode int64, files map[string]string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	base := strings.TrimPrefix(dst, "/")
+	tw.WriteHeader(&tar.Header{Name: base + "/", Typeflag: tar.TypeDir, Mode: mode})
+	for _, n := range slices.Sorted(maps.Keys(files)) {
+		if strings.HasSuffix(n, "/") {
+			tw.WriteHeader(&tar.Header{Name: base + "/" + n, Typeflag: tar.TypeDir, Mode: 0o755})
+			continue
+		}
+		tw.WriteHeader(&tar.Header{Name: base + "/" + n, Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(files[n]))})
+		io.WriteString(tw, files[n])
+	}
+	tw.Close()
+	dir := t.TempDir()
+	part := filepath.Join(dir, filepath.FromSlash(bundle.PartName("binds/b1", 1)))
+	os.MkdirAll(filepath.Dir(part), 0o755)
+	os.WriteFile(part, buf.Bytes(), 0o600)
+	return dir
+}
+
+func dirNames(dir string) []string {
+	var names []string
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+func bindRun(t *testing.T, root, dataDir string) *run {
+	t.Helper()
+	r := &run{Deps: Deps{Screen: ui.New(io.Discard, false, nil), Home: filepath.Join(root, "home"), Getenv: func(string) string { return "" }},
+		dataDir: dataDir}
+	j, err := openJournal(filepath.Join(root, "rb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.j = j
+	return r
+}
+
+// 解压用的临时目录在动手之前记进日志：程序被强制结束时它会留下来（在挂载目录旁边、隐藏的，可能
+// 很大），下次回滚时要删掉它。
+func TestRestoreBindJournalsStage(t *testing.T) {
+	root := t.TempDir()
+	dst := filepath.Join(root, "world", "data")
+	os.MkdirAll(dst, 0o755)
+	r := bindRun(t, root, bindStream(t, dst, 0o755, map[string]string{"new.txt": "migrated"}))
+	if err := r.restoreBind(context.Background(), bundle.Bind{ID: "b1", Path: dst, Dir: true, Parts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	r.j.close()
+	entries, err := readJournal(filepath.Join(root, "rb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ops []string
+	for _, e := range entries {
+		ops = append(ops, string(e.Op))
+	}
+	if strings.Join(ops, ",") != "start,stage,bind" || entries[1].Path != siblingName(dst, "stage") {
+		t.Fatalf("日志：%+v", entries)
+	}
+}
+
+// 留下来的临时目录：回滚时删掉，提交后清理回滚资料时也删掉。
+func TestStageRemoved(t *testing.T) {
+	for _, commit := range []bool{false, true} {
+		stage := filepath.Join(t.TempDir(), ".data.dockhop-stage-x")
+		os.MkdirAll(filepath.Join(stage, "srv", "data"), 0o700)
+		os.WriteFile(filepath.Join(stage, "srv", "data", "big"), []byte("big"), 0o600)
+		u := &undo{screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+		entries := []Entry{{Op: opStage, Path: stage}}
+		if commit {
+			if left := u.cleanupCommitted(context.Background(), entries); len(left) > 0 {
+				t.Fatal(left)
+			}
+		} else if problems := u.rollback(context.Background(), entries); len(problems) > 0 {
+			t.Fatal(problems)
+		}
+		if _, err := os.Lstat(stage); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("提交=%v：临时目录应删掉", commit)
+		}
+	}
+}
+
+// 挂载目录本身是单独挂载的磁盘时不能改名（Linux 会报“设备忙”），在原地换内容：迁移过来的解在
+// 它里面（同一块盘上），原来的挪进它里面的备份目录，目录本身的权限换成迁移过来的。回滚后和
+// 原来完全一样，再回滚一次也一样。
+func TestRestoreBindIntoMountPoint(t *testing.T) {
+	root := t.TempDir()
+	world := filepath.Join(root, "world")
+	dst := filepath.Join(world, "data")
+	os.MkdirAll(filepath.Join(dst, "old-sub"), 0o755)
+	os.WriteFile(filepath.Join(dst, "keep.txt"), []byte("old data"), 0o600)
+	os.WriteFile(filepath.Join(dst, "same.txt"), []byte("old same"), 0o600)
+	os.Chmod(dst, 0o750)
+	before := snapshotTree(t, world)
+	saved := isMountPoint
+	isMountPoint = func(p string) bool { return p == dst }
+	t.Cleanup(func() { isMountPoint = saved })
+
+	r := bindRun(t, root, bindStream(t, dst, 0o700, map[string]string{"same.txt": "migrated", "new-sub/": ""}))
+	if err := r.restoreBind(context.Background(), bundle.Bind{ID: "b1", Path: dst, Dir: true, Parts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	backups, _ := filepath.Glob(filepath.Join(dst, ".dockhop-old-*"))
+	b, _ := os.ReadFile(filepath.Join(dst, "same.txt"))
+	st, _ := os.Stat(dst)
+	if len(backups) != 1 || len(dirNames(dst)) != 3 || string(b) != "migrated" || st.Mode().Perm() != 0o700 {
+		t.Fatalf("应在原地换内容：%v，same.txt=%q，权限 %v", dirNames(dst), b, st.Mode())
+	}
+	if kept := dirNames(backups[0]); strings.Join(kept, ",") != "keep.txt,old-sub,same.txt" {
+		t.Fatalf("原来的内容应挪进备份目录：%v", kept)
+	}
+	r.j.close()
+	entries, err := readJournal(filepath.Join(root, "rb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := &undo{screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+	for i := 1; i <= 2; i++ {
+		if problems := u.rollback(context.Background(), entries); len(problems) > 0 {
+			t.Fatalf("第 %d 次回滚：%v", i, problems)
+		}
+		if after := snapshotTree(t, world); after != before {
+			t.Fatalf("第 %d 次回滚后和原来不一样：\n原来：\n%s\n现在：\n%s", i, before, after)
+		}
+	}
+}
+
+// 原地换内容做到一半、或者回滚做到一半被打断时，再回滚也分得清哪些是原来的：日志里记着原来有
+// 哪些东西，名字不在里面的、或者原来的那个已经挪进备份的，才是迁移过来的。
+func TestUndoContentsResumes(t *testing.T) {
+	want := map[string]string{"a": "old a", "same": "old same"}
+	for _, c := range []struct {
+		name            string
+		inDst, inBackup map[string]string
+	}{
+		{"原来的挪了一半", map[string]string{"a": "old a"}, map[string]string{"same": "old same"}},
+		{"迁移过来的放了一半", map[string]string{"same": "new same", "c": "new c"}, map[string]string{"a": "old a", "same": "old same"}},
+		{"已经放回去了", want, nil},
+	} {
+		dst := filepath.Join(t.TempDir(), "data")
+		backup := filepath.Join(dst, ".dockhop-old-x")
+		os.MkdirAll(dst, 0o700)
+		for n, s := range c.inDst {
+			os.WriteFile(filepath.Join(dst, n), []byte(s), 0o600)
+		}
+		if c.inBackup != nil {
+			os.Mkdir(backup, 0o750)
+			for n, s := range c.inBackup {
+				os.WriteFile(filepath.Join(backup, n), []byte(s), 0o600)
+			}
+		}
+		u := &undo{screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+		e := Entry{Op: opBind, Path: dst, Existed: true, Backup: backup, Names: []string{"a", "same"}}
+		for i := 1; i <= 2; i++ {
+			if problems := u.rollback(context.Background(), []Entry{e}); len(problems) > 0 {
+				t.Fatalf("%s，第 %d 次回滚：%v", c.name, i, problems)
+			}
+		}
+		got := map[string]string{}
+		for _, n := range dirNames(dst) {
+			b, _ := os.ReadFile(filepath.Join(dst, n))
+			got[n] = string(b)
+		}
+		if !maps.Equal(got, want) {
+			t.Errorf("%s：回滚后是 %v", c.name, got)
+		}
+		if st, _ := os.Stat(dst); c.inBackup != nil && st.Mode().Perm() != 0o750 {
+			t.Errorf("%s：目录本身的权限应改回原来的：%v", c.name, st.Mode())
+		}
 	}
 }
 
@@ -809,5 +990,42 @@ func TestRollbackKeepsImagesThatWereThere(t *testing.T) {
 				t.Fatalf("镜像名 %v，删掉的 %v，问题 %v", d.tags, d.deleted, problems)
 			}
 		})
+	}
+}
+
+// 提交之后，被替换的旧容器连同它的匿名卷一起删掉，原有 Compose 容器为了回滚留着的匿名卷也删掉：
+// 以前留着，成了没人用的卷。还挂在别的容器上的卷不是没人用的，不删，也不算没删掉的回滚资料。
+func TestCleanupRemovesOldAnonymousVolumes(t *testing.T) {
+	var deleted []string
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		if req.Method != "DELETE" {
+			return false
+		}
+		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		if req.URL.RawQuery != "" {
+			p += "?" + req.URL.RawQuery
+		}
+		deleted = append(deleted, p)
+		if p == "/volumes/shared" {
+			http.Error(w, `{"message":"remove shared: volume is in use - [other]"}`, http.StatusConflict)
+			return true
+		}
+		w.WriteHeader(204)
+		return true
+	})
+	u := &undo{dc: dc, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+	entries := []Entry{
+		{Op: opRename, Name: "web", ID: "old-web", Backup: "web.dockhop-backup-1"},
+		{Op: opComposeOld, Name: "stack", Old: []OldContainer{
+			{ID: "old-app", Name: "stack-app-1", Volumes: map[string]string{"/data": "anon1"}},
+			{ID: "old-db", Name: "stack-db-1", Volumes: map[string]string{"/var/lib/db": "shared"}}}},
+		{Op: opOldImages, Name: "stack", Images: map[string]string{"old-app": "dockhop-rollback:1"}},
+	}
+	if left := u.cleanupCommitted(context.Background(), entries); len(left) > 0 {
+		t.Fatalf("不应有没删掉的：%v", left)
+	}
+	want := "/containers/old-web?force=1&v=1 /volumes/anon1 /volumes/shared /images/dockhop-rollback:1?noprune=0"
+	if got := strings.Join(deleted, " "); got != want {
+		t.Fatalf("删掉了：%s\n应为：%s", got, want)
 	}
 }

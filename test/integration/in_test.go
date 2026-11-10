@@ -197,6 +197,53 @@ func TestInSymlinkAliases(t *testing.T) {
 	noLeftovers(t, home)
 }
 
+// 新服务器上，挂载目录本身是单独挂载的（例如一块数据盘）：不能改名，要在原地换里面的内容。
+// 迁入前提示原来的内容会被替换；迁入失败时原来的内容和权限放回去；用同一个链接再迁入，挂载
+// 还在，里面只有迁移过来的内容，权限也是迁移过来的。
+func TestInBindIsMountPoint(t *testing.T) {
+	p := fmt.Sprintf("dmtest_mp%d", os.Getpid())
+	t.Cleanup(func() { removePrefixed(p) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	data := filepath.Join(t.TempDir(), "data")
+	os.MkdirAll(data, 0o755)
+	os.Chmod(data, 0o755)
+	os.WriteFile(filepath.Join(data, "app.txt"), []byte("migrated"), 0o644)
+	name := p + "_app"
+	sh(t, "docker", "run", "-d", "--name", name, "--label", noWatchtower, "-v", data+":/data", "alpine:3.20", "sleep", "600")
+	m := startOut(t, "--include", name)
+	removeAll(name)
+
+	// 新服务器上：同一个路径挂着一块“盘”，里面有原来的东西。
+	os.RemoveAll(data)
+	os.MkdirAll(data, 0o755)
+	sh(t, "mount", "-t", "tmpfs", "-o", "mode=0700", "tmpfs", data)
+	t.Cleanup(func() { try("umount", data) })
+	os.WriteFile(filepath.Join(data, "old.txt"), []byte("old"), 0o644)
+	before := dirFiles(t, data)
+	mounted := func() bool { return exec.Command("mountpoint", "-q", data).Run() == nil }
+
+	home := t.TempDir()
+	out, code := m.in(t, home, []string{"DOCKHOP_TEST_FAIL=container:" + name})
+	if code == 0 {
+		t.Fatalf("模拟失败时迁入不应成功：\n%s", out)
+	}
+	mustContain(t, out, "目录 "+data+" 已存在，迁移过来的内容会替换它")
+	if after := dirFiles(t, data); after != before || !mounted() {
+		t.Fatalf("迁入失败后应放回原来的内容（挂载还在：%v）：\n原来：\n%s\n现在：\n%s\n%s", mounted(), before, after, out)
+	}
+	if out, code = m.in(t, home, nil); code != 0 {
+		t.Fatalf("迁入应成功：%d\n%s", code, out)
+	}
+	if got := dirFiles(t, data); got != ". drwxr-xr-x\napp.txt -rw-r--r-- migrated" || !mounted() {
+		t.Errorf("挂载应该还在（%v），里面只有迁移过来的内容：\n%s", mounted(), got)
+	}
+	if v := exec1(t, name, "cat /data/app.txt"); v != "migrated" {
+		t.Errorf("容器看到的数据：%q", v)
+	}
+	m.waitOutSuccess(t)
+	noLeftovers(t, home)
+}
+
 // 1Panel 的样子：应用和数据库是两个 Compose 项目，接在同一个外部网络上，应用的启动命令里写着
 // 数据库的服务名。应用的项目名排在前面，按名字顺序先启动它的话，它连不上数据库、一直在重启，
 // 健康检查过不了。要先启动数据库、等它就绪，再启动应用；日志里写明顺序和原因。
@@ -331,6 +378,57 @@ func TestInProjectInsideMount(t *testing.T) {
 	noLeftovers(t, home)
 	onlyLogs(t, home)
 	onlyLogs(t, m.home)
+}
+
+// 项目目录本身是软链接（例如 /root/app 指向数据盘上的 /data/app），在软链接的路径上启动；env_file
+// 写的文件本身也是软链接。打包的是它们指向的内容：以前项目目录什么都没打包，env_file 只打包了一个
+// 指向旧服务器路径的软链接，迁过去起不来。
+func TestInLinkedProjectDir(t *testing.T) {
+	p := fmt.Sprintf("dmtest_lp%d", os.Getpid())
+	t.Cleanup(func() { removeProject(p); removePrefixed(p) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	root := t.TempDir()
+	real, link := filepath.Join(root, "disk", p), filepath.Join(root, p)
+	secret, envLink := filepath.Join(root, "secrets", "app.env"), filepath.Join(root, "app.env")
+	os.MkdirAll(filepath.Join(real, "site"), 0o755)
+	os.MkdirAll(filepath.Dir(secret), 0o755)
+	os.WriteFile(secret, []byte("GREETING=hello\n"), 0o600)
+	os.Symlink(secret, envLink)
+	os.WriteFile(filepath.Join(real, "site", "index.html"), []byte("migrated-site\n"), 0o644)
+	os.WriteFile(filepath.Join(real, "compose.yml"), []byte(`services:
+  web:
+    image: alpine:3.20
+    command: ["sleep", "600"]
+    labels: {com.centurylinklabs.watchtower.enable: "false"}
+    env_file: [`+envLink+`]
+    volumes: ["./site:/site"]
+`), 0o644)
+	os.Symlink(real, link)
+	c := composeCmd(t)
+	up := exec.Command(c[0], append(c[1:], "-p", p, "up", "-d")...)
+	up.Dir = link
+	if b, err := up.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, b)
+	}
+	web := containerByLabel(t, p, "web")
+	if wd := sh(t, "docker", "inspect", "-f", `{{index .Config.Labels "com.docker.compose.project.working_dir"}}`, web); wd != link {
+		t.Skipf("Compose 记的项目目录是 %s，不是软链接的路径", wd)
+	}
+	m := startOut(t, "--include", web)
+	removeProject(p)
+	for _, path := range []string{filepath.Join(root, "disk"), link, filepath.Join(root, "secrets"), envLink} {
+		os.RemoveAll(path)
+	}
+
+	home := t.TempDir()
+	if out, code := m.in(t, home, nil); code != 0 {
+		t.Fatalf("迁入应成功：%d\n%s", code, out)
+	}
+	if got := exec1(t, containerByLabel(t, p, "web"), "cat /site/index.html; echo $GREETING"); got != "migrated-site\nhello" {
+		t.Errorf("项目文件和 env_file 应迁过来：%q", got)
+	}
+	m.waitOutSuccess(t)
+	noLeftovers(t, home)
 }
 
 // 项目 aapp 把项目 zproxy 建的网络当外部网络用（反向代理常见写法），而 aapp 的名字排在前面：

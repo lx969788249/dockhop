@@ -141,6 +141,41 @@ func (c *Client) InspectContainer(ctx context.Context, id string) (*Container, j
 	return &ct, raw, nil
 }
 
+// InspectContainerFull 和 InspectContainer 一样，只是原始配置里补上用户指定的 MAC 地址，迁出时读
+// 要迁移的容器用：接口 1.52 起配置里不再写出 MacAddress，网络设置里的 MAC 自动分配的也有，看不出
+// 哪个是用户指定的。按 1.51 的接口再问一次，有就补进 Config，其他内容原样不动；问不到时（以后的
+// Docker 不再支持 1.51）和不补一样。
+func (c *Client) InspectContainerFull(ctx context.Context, id string) (*Container, json.RawMessage, error) {
+	ct, raw, err := c.InspectContainer(ctx, id)
+	if err != nil || !c.AtLeast("1.52") {
+		return ct, raw, err
+	}
+	var old struct {
+		Config struct {
+			MacAddress string `json:"MacAddress"`
+		} `json:"Config"`
+	}
+	if c.do(ctx, http.MethodGet, "/v1.51/containers/"+url.PathEscape(id)+"/json", nil, nil, "", &old) != nil || old.Config.MacAddress == "" {
+		return ct, raw, nil
+	}
+	var top map[string]json.RawMessage
+	var cfg map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return nil, nil, err
+	}
+	if err := json.Unmarshal(top["Config"], &cfg); err != nil {
+		return nil, nil, err
+	}
+	cfg["MacAddress"], _ = json.Marshal(old.Config.MacAddress)
+	if top["Config"], err = json.Marshal(cfg); err != nil {
+		return nil, nil, err
+	}
+	if raw, err = json.Marshal(top); err != nil {
+		return nil, nil, err
+	}
+	return ct, raw, nil
+}
+
 // ContainerSize 返回容器可写层的大小（容器里没挂载出来的改动），单位字节。
 // Docker 要现场统计，改动多时会慢一些，但不需要停止容器。
 func (c *Client) ContainerSize(ctx context.Context, id string) (int64, error) {

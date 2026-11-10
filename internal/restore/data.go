@@ -22,6 +22,9 @@ import (
 // 恢复数据：数据卷、目录（连同软链接）、Compose 项目文件。写之前先把原来的备份好、记进事务日志，
 // 文件操作见 files.go，读写数据卷见 volumes.go。
 
+// isMountPoint 判断一个目录本身是不是挂载点（测试时换掉）。
+var isMountPoint = host.IsMountPoint
+
 func (r *run) restoreData(ctx context.Context) error {
 	s, dc := r.Screen, r.Docker
 	vols, binds := r.dataTargets()
@@ -165,7 +168,17 @@ func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
 	if err := r.mkdirAll(parent, 0o755); err != nil {
 		return err
 	}
+	// 单独挂载的目录（例如一块数据盘）不能改名，只能在原地换里面的内容（见 replaceContents），
+	// 解压也解在它里面：和它在同一块盘上。
+	inPlace := b.Dir && isMountPoint(b.Path)
 	stage := siblingName(b.Path, "stage")
+	if inPlace {
+		stage = innerName(b.Path, "stage")
+	}
+	// 解压用的临时目录先记进日志：程序被强制结束时它会留下来，回滚时删掉。
+	if err := r.j.add(Entry{Op: opStage, Path: stage}); err != nil {
+		return err
+	}
 	_ = os.RemoveAll(stage)
 	if err := os.Mkdir(stage, 0o700); err != nil {
 		return err
@@ -190,7 +203,12 @@ func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
 	if st.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("迁移包里的 %s 是软链接，拒绝使用", b.Path)
 	}
-	if err := r.replaceDir(staged, b.Path); err != nil {
+	if inPlace {
+		err = r.replaceContents(stage, staged, b.Path)
+	} else {
+		err = r.replaceDir(staged, b.Path)
+	}
+	if err != nil {
 		return err
 	}
 	_ = os.RemoveAll(filepath.Join(r.dataDir, "binds", b.ID))

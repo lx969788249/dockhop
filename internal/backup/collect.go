@@ -265,10 +265,15 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 			continue
 		}
 		p := &projectInfo{u: u}
+		// 挂载目录记的是真实路径，项目目录本身是软链接时也按它的真实路径比较。
+		dir := u.workingDir
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			dir = real
+		}
 		for _, b := range out.binds {
-			if b.path == u.workingDir || strings.HasPrefix(u.workingDir, b.path+"/") {
+			if b.path == dir || strings.HasPrefix(dir, b.path+"/") {
 				p.inBind = true
-			} else if strings.HasPrefix(b.path, u.workingDir+"/") {
+			} else if strings.HasPrefix(b.path, dir+"/") {
 				p.excludes = append(p.excludes, b.path)
 			}
 		}
@@ -384,12 +389,13 @@ func sharesData(it *item, vols map[string]*volumeInfo, binds []*bindInfo) bool {
 	return false
 }
 
-// treeSize 统计目录或文件的大小。excludes 里的路径不统计；bigLimit 大于 0 时，
-// 超过它的文件不统计并返回它们的路径。
+// treeSize 统计目录或文件的大小，和打包时一样，root 本身是软链接时统计它指向的内容（见 walkRoot）。
+// excludes 里的路径不统计（按原来的写法或者真实路径）；bigLimit 大于 0 时，超过它的文件不统计并
+// 返回它们的路径。
 func treeSize(ctx context.Context, root string, excludes []string, bigLimit int64) (int64, []string) {
 	var total int64
 	var skipped []string
-	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	_ = walkRoot(root, func(p, real string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
 			return filepath.SkipAll // 按了 Ctrl+C：不用统计完，调用的地方接着会发现
 		}
@@ -397,7 +403,7 @@ func treeSize(ctx context.Context, root string, excludes []string, bigLimit int6
 			return nil
 		}
 		for _, e := range excludes {
-			if p == e {
+			if p == e || real == e {
 				if d.IsDir() {
 					return filepath.SkipDir
 				}

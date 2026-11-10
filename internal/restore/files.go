@@ -40,9 +40,74 @@ func (r *run) replaceDir(staged, dst string) error {
 	return nil
 }
 
+// replaceContents 把解好的 staged 里的东西换进 dst。dst 是单独挂载的目录，不能改名（见 restoreBind），
+// 只能换它里面的内容：先在日志里记下 dst 原来有哪些东西（解压用的临时目录 stage 不算），再把它们
+// 挪进 dst 里的备份目录 old（dst 本身的属主、权限也记在 old 上），最后把 staged 里的东西挪进来，
+// dst 的属主、权限改成迁移过来的。都在同一块盘上，每一步都只是改名。回滚见 undoContents。
+func (r *run) replaceContents(stage, staged, dst string) error {
+	old := innerName(dst, "old")
+	cur, err := os.ReadDir(dst)
+	if err != nil {
+		return err
+	}
+	var names []string
+	for _, e := range cur {
+		if p := filepath.Join(dst, e.Name()); p != stage && p != old {
+			names = append(names, e.Name())
+		}
+	}
+	if err := r.j.add(Entry{Op: opBind, Path: dst, Existed: true, Backup: old, Names: names}); err != nil {
+		return err
+	}
+	if err := os.Mkdir(old, 0o700); err != nil {
+		return err
+	}
+	if err := copyDirMeta(dst, old); err != nil {
+		return err
+	}
+	for _, n := range names {
+		if err := os.Rename(filepath.Join(dst, n), filepath.Join(old, n)); err != nil {
+			return fmt.Errorf("没能先把 %s 里原来的 %s 挪开：%v", dst, n, err)
+		}
+	}
+	migrated, err := os.ReadDir(staged)
+	if err != nil {
+		return err
+	}
+	for _, e := range migrated {
+		if err := os.Rename(filepath.Join(staged, e.Name()), filepath.Join(dst, e.Name())); err != nil {
+			return fmt.Errorf("没能把迁移过来的 %s 放进 %s：%v", e.Name(), dst, err)
+		}
+	}
+	return copyDirMeta(staged, dst)
+}
+
+// copyDirMeta 把目录 from 的属主、权限和修改时间设到目录 to 上。改属主会清掉 setuid 位，
+// 所以权限放在属主之后设置。
+func copyDirMeta(from, to string) error {
+	st, err := os.Lstat(from)
+	if err != nil {
+		return err
+	}
+	if s, ok := st.Sys().(*syscall.Stat_t); ok {
+		if err := os.Lchown(to, int(s.Uid), int(s.Gid)); err != nil {
+			return err
+		}
+	}
+	if err := os.Chmod(to, st.Mode()&(os.ModePerm|os.ModeSetuid|os.ModeSetgid|os.ModeSticky)); err != nil {
+		return err
+	}
+	return os.Chtimes(to, st.ModTime(), st.ModTime())
+}
+
 // siblingName 是 path 旁边的一个临时名字，例如 /srv/.data.dockhop-old-ab12cd。
 func siblingName(path, kind string) string {
 	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".dockhop-"+kind+"-"+runID)
+}
+
+// innerName 是目录 path 里面的一个临时名字，例如 /data/.dockhop-old-ab12cd（见 replaceContents）。
+func innerName(path, kind string) string {
+	return filepath.Join(path, ".dockhop-"+kind+"-"+runID)
 }
 
 // runID 区分不同次的迁入，临时文件名里用到。

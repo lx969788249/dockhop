@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"errors"
@@ -73,5 +74,56 @@ func TestOutsideArchiveAccepted(t *testing.T) {
 	}
 	if err := bundle.ScanArchive(bytes.NewReader(archive.Bytes()), trimmed...); err != nil {
 		t.Fatalf("新服务器不接受打包的文件：%v", err)
+	}
+}
+
+// 项目目录、项目外的文件本身是软链接时（例如 /root/app 指向数据盘上的 /data/app）：打包、统计的是它
+// 指向的内容，名字还是原来的路径。以前项目目录什么都没打包（WalkDir 不进入软链接），项目外的文件只
+// 打包了一个指向旧服务器路径的软链接，迁过去起不来。已经作为挂载目录迁移的子目录按真实路径排除。
+func TestHostTarFollowsLinkedRoots(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "data", "app")
+	os.MkdirAll(filepath.Join(real, "conf"), 0o755)
+	os.MkdirAll(filepath.Join(real, "db"), 0o755)
+	os.WriteFile(filepath.Join(real, "compose.yml"), []byte("services: {}\n"), 0o644)
+	os.WriteFile(filepath.Join(real, "conf", "app.ini"), []byte("x=1\n"), 0o644)
+	os.WriteFile(filepath.Join(real, "db", "big"), []byte("mounted separately"), 0o644)
+	project := filepath.Join(root, "app")
+	os.Symlink(real, project)
+	secret := filepath.Join(root, "secrets", "app.env")
+	os.MkdirAll(filepath.Dir(secret), 0o755)
+	os.WriteFile(secret, []byte("A=1\n"), 0o600)
+	env := filepath.Join(root, "etc", "app.env")
+	os.MkdirAll(filepath.Dir(env), 0o755)
+	os.Symlink(secret, env)
+	db, _ := filepath.EvalSymlinks(filepath.Join(real, "db")) // 挂载目录记的是真实路径
+
+	names := func(h hostTar) string {
+		var buf bytes.Buffer
+		if err := h.write(&buf); err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		tr := tar.NewReader(&buf)
+		for {
+			hdr, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, hdr.Name+" "+string(hdr.Typeflag))
+		}
+		return strings.Join(out, ",")
+	}
+	if got := names(hostTar{ctx: context.Background(), roots: []string{project}, base: project, excludes: []string{db}, logf: t.Logf}); got != "compose.yml 0,conf/ 5,conf/app.ini 0" {
+		t.Errorf("项目目录打包了：%s", got)
+	}
+	if got, want := names(hostTar{ctx: context.Background(), roots: []string{env}, base: "/", logf: t.Logf}), strings.TrimPrefix(env, "/")+" 0"; got != want {
+		t.Errorf("项目外的文件打包了：%s，应为 %s", got, want)
+	}
+	if size, _ := treeSize(context.Background(), project, []string{db}, 0); size != int64(len("services: {}\n")+len("x=1\n")) {
+		t.Errorf("项目目录的大小：%d", size)
 	}
 }

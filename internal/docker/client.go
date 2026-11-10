@@ -69,6 +69,12 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &e) && e.Status == http.StatusNotFound
 }
 
+// IsConflict 表示 Docker 因为和现在的状态冲突而拒绝，例如要删的数据卷还挂在别的容器上。
+func IsConflict(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Status == http.StatusConflict
+}
+
 // ErrNotRunning 表示连不上 Docker。
 var ErrNotRunning = errors.New("连不上 Docker")
 

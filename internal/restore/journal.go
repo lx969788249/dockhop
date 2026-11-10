@@ -29,7 +29,8 @@ const (
 	opComposeOld Op = "compose_old" // 已有的同名 Compose 项目，即将停止并删除（Name、Old）
 	opOldImages  Op = "old_images"  // 上一条里的容器已经存成回滚镜像，接下来删除容器（Name、Images）
 	opVolume     Op = "volume"      // 写入数据卷（Name、Existed、Backup）
-	opBind       Op = "bind"        // 替换目录（Path、Existed、Backup）
+	opStage      Op = "stage"       // 新建解压用的临时目录（Path），回滚、提交后都整个删掉
+	opBind       Op = "bind"        // 替换目录（Path、Existed、Backup；Backup 在 Path 里面时是原地换内容，Names：原来有哪些东西）
 	opLink       Op = "link"        // 新建软链接（Path）
 	opFile       Op = "file"        // 写入 Compose 项目里的文件（Path、Existed、Backup）
 	opMkdir      Op = "mkdir"       // 新建目录（Path）
@@ -40,7 +41,7 @@ const (
 	opTag        Op = "tag"         // 镜像名要改为指向迁入的镜像（Name；ID：原来指向的镜像，为空表示原来没有这个名字）
 	opComposeUp  Op = "compose_up"  // 启动 Compose 项目（Name、Networks：启动前已有的项目网络）
 	opRebuilt    Op = "rebuilt"     // 回滚时重建了原有的 Compose 容器（Name；ID：重建后的 ID），再回滚时它就是原来的服务
-	opCommit     Op = "commit"      // 已提交：新服务都验证通过，不再撤销
+	opCommit     Op = "commit"      // 已提交：新服务都验证通过，不再撤销（Names：只保留一部分服务时，保留下来的组）
 )
 
 // Entry 是日志里的一条记录。
@@ -212,11 +213,22 @@ func rewriteJournal(dir string, entries []Entry) error {
 	return host.SyncDir(dir)
 }
 
+// committed 表示全部提交了：只差删除回滚资料。
 func committed(entries []Entry) bool {
 	for _, e := range entries {
-		if e.Op == opCommit {
+		if e.Op == opCommit && len(e.Names) == 0 {
 			return true
 		}
 	}
 	return false
+}
+
+// partialCommit 返回只提交了一部分时保留下来的组（见 commitPartial）。
+func partialCommit(entries []Entry) ([]string, bool) {
+	for _, e := range entries {
+		if e.Op == opCommit && len(e.Names) > 0 {
+			return e.Names, true
+		}
+	}
+	return nil, false
 }

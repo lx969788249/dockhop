@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -150,6 +151,10 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 				if err := os.Remove(e.Path); err != nil {
 					note("本次新建的软链接 %s 没能删除：%v", e.Path, err)
 				}
+			}
+		case opStage:
+			if err := os.RemoveAll(e.Path); err != nil {
+				note("解压用的临时目录 %s 没能删除：%v", e.Path, err)
 			}
 		case opBind:
 			u.undoBind(e, note)
@@ -372,6 +377,10 @@ func (u *undo) undoBind(e Entry, note func(string, ...any)) {
 	if e.Path == "" || e.Path == "/" {
 		return
 	}
+	if e.Existed && filepath.Dir(e.Backup) == e.Path {
+		u.undoContents(e, note)
+		return
+	}
 	_, curErr := os.Lstat(e.Path)
 	if !e.Existed {
 		if curErr == nil {
@@ -396,6 +405,53 @@ func (u *undo) undoBind(e Entry, note func(string, ...any)) {
 	}
 	if err := os.Rename(e.Backup, e.Path); err != nil {
 		note("目录 %s 没能放回原来的：%v", e.Path, err)
+	}
+}
+
+// undoContents 撤销原地换内容（见 replaceContents）：Path 里迁移过来的东西删掉，备份目录里原来的
+// 挪回去，Path 的属主、权限改回原来的，最后删掉空了的备份目录。日志里记着 Path 原来有哪些东西
+// （Names）：名字不在里面的，或者原来的那个已经挪进了备份目录的，才是迁移过来的；原来的那个还没
+// 挪走（或者已经挪回来了）的留着。所以换到一半、回滚到一半被打断，从头再来一遍都是安全的。
+func (u *undo) undoContents(e Entry, note func(string, ...any)) {
+	backed, err := os.ReadDir(e.Backup)
+	if errors.Is(err, os.ErrNotExist) {
+		return // 还没开始挪原来的东西，或者已经全部放回去了
+	}
+	if err != nil {
+		note("目录 %s 的备份读不了：%v", e.Path, err)
+		return
+	}
+	inBackup := map[string]bool{}
+	for _, b := range backed {
+		inBackup[b.Name()] = true
+	}
+	cur, err := os.ReadDir(e.Path)
+	if err != nil {
+		note("目录 %s 读不了：%v", e.Path, err)
+		return
+	}
+	for _, c := range cur {
+		p := filepath.Join(e.Path, c.Name())
+		if p == e.Backup || slices.Contains(e.Names, c.Name()) && !inBackup[c.Name()] {
+			continue
+		}
+		if err := os.RemoveAll(p); err != nil {
+			note("没能删除迁入的 %s：%v", p, err)
+			return
+		}
+	}
+	for _, b := range backed {
+		if err := os.Rename(filepath.Join(e.Backup, b.Name()), filepath.Join(e.Path, b.Name())); err != nil {
+			note("目录 %s 里原来的 %s 没能放回去：%v", e.Path, b.Name(), err)
+			return
+		}
+	}
+	if err := copyDirMeta(e.Backup, e.Path); err != nil {
+		note("目录 %s 没能改回原来的属主和权限：%v", e.Path, err)
+		return
+	}
+	if err := os.Remove(e.Backup); err != nil {
+		note("目录 %s 的备份目录没能删除：%v", e.Path, err)
 	}
 }
 
@@ -593,8 +649,8 @@ func restoreState(ctx context.Context, dc *docker.Client, id, state string) erro
 	return nil
 }
 
-// cleanupCommitted 提交之后删除回滚资料：改名备份的旧容器、回滚镜像、旧数据。
-// 返回没能删除的东西。
+// cleanupCommitted 提交之后删除回滚资料：改名备份的旧容器、回滚镜像、旧数据，以及被替换的容器的
+// 匿名卷（新的容器不用它们，留着就成了没人用的卷）。返回没能删除的东西。
 func (u *undo) cleanupCommitted(ctx context.Context, entries []Entry) []string {
 	var left []string
 	if u.fail("commit-cleanup") {
@@ -605,8 +661,18 @@ func (u *undo) cleanupCommitted(ctx context.Context, entries []Entry) []string {
 		case opHelper:
 			u.removeHelper(ctx, e, func(f string, a ...any) { left = append(left, fmt.Sprintf(f, a...)) })
 		case opRename:
-			if err := u.dc.RemoveContainer(ctx, e.ID, true); err != nil && !docker.IsNotFound(err) {
+			if err := u.dc.RemoveContainerAndVolumes(ctx, e.ID); err != nil && !docker.IsNotFound(err) {
 				left = append(left, fmt.Sprintf("改名备份的旧容器 %s：%v", e.Backup, err))
+			}
+		case opComposeOld:
+			// 删除原有的 Compose 容器时留着它们的匿名卷，回滚重建时要用（见 spec.Rebuild 的 KeepVolumes）。
+			// 还挂在别的容器上的不是没人用的，不删。
+			for _, o := range e.Old {
+				for _, v := range o.Volumes {
+					if err := u.dc.RemoveVolume(ctx, v); err != nil && !docker.IsNotFound(err) && !docker.IsConflict(err) {
+						left = append(left, fmt.Sprintf("原来的容器 %s 的匿名卷 %s：%v", o.Name, v, err))
+					}
+				}
 			}
 		case opOldImages:
 			for _, img := range e.Images {
@@ -619,6 +685,10 @@ func (u *undo) cleanupCommitted(ctx context.Context, entries []Entry) []string {
 				if err := os.RemoveAll(e.Backup); err != nil {
 					left = append(left, fmt.Sprintf("旧目录 %s：%v", e.Backup, err))
 				}
+			}
+		case opStage:
+			if err := os.RemoveAll(e.Path); err != nil {
+				left = append(left, fmt.Sprintf("解压用的临时目录 %s：%v", e.Path, err))
 			}
 		}
 	}

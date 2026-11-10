@@ -99,7 +99,7 @@ func buildInventory(ctx context.Context, dc *docker.Client, screen *ui.Screen) (
 	var order []*unit
 	for i, s := range list {
 		screen.Count("识别容器", i+1, len(list), s.Name())
-		c, raw, err := dc.InspectContainer(ctx, s.ID)
+		c, raw, err := dc.InspectContainerFull(ctx, s.ID) // 带上用户指定的 MAC 地址（见 InspectContainerFull）
 		if err != nil {
 			if docker.IsNotFound(err) {
 				continue // 刚好被删掉了

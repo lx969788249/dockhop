@@ -157,3 +157,33 @@ func TestRebuildKeepVolumes(t *testing.T) {
 		t.Errorf("回滚重建时应沿用原来的匿名卷：%v", mounts)
 	}
 }
+
+// 用户指定的 MAC 地址（容器配置里有 MacAddress 的就是指定的，自动分配的没有）：新建的容器两处都要写，
+// 主网络的设置里（新版本的接口只认这里）和容器配置里（Docker 25 以前的接口只认这里）。以前只留在
+// 容器配置里，新版本的 Docker 不认，迁过去网卡用的是随机的 MAC。自动分配的不固定。
+func TestRebuildKeepsFixedMAC(t *testing.T) {
+	var top map[string]any
+	json.Unmarshal([]byte(sourceRaw), &top)
+	top["Config"].(map[string]any)["MacAddress"] = "02:42:ac:14:00:0a"
+	raw, _ := json.Marshal(top)
+	for _, multi := range []bool{true, false} {
+		b, err := Rebuild{Raw: raw, MultiNetwork: multi}.Build()
+		if err != nil {
+			t.Fatal(err)
+		}
+		eps := b.Body["NetworkingConfig"].(map[string]any)["EndpointsConfig"].(map[string]any)
+		if mac := eps["appnet"].(map[string]any)["MacAddress"]; mac != "02:42:ac:14:00:0a" || b.Body["MacAddress"] != "02:42:ac:14:00:0a" {
+			t.Errorf("指定的 MAC 应两处都写（同时连多个网络 %v）：主网络 %v，配置 %v", multi, mac, b.Body["MacAddress"])
+		}
+		if ep, ok := eps["backend"].(map[string]any); ok && ep["MacAddress"] != nil {
+			t.Error("其他网络的 MAC 是自动分配的，不固定")
+		}
+	}
+	b, err := Rebuild{Raw: json.RawMessage(sourceRaw), MultiNetwork: true}.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mac := b.Body["NetworkingConfig"].(map[string]any)["EndpointsConfig"].(map[string]any)["appnet"].(map[string]any)["MacAddress"]; mac != nil {
+		t.Errorf("自动分配的 MAC 不固定：%v", mac)
+	}
+}

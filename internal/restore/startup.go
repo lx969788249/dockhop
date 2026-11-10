@@ -65,6 +65,9 @@ func (r *run) startServices(ctx context.Context) error {
 		}
 	}
 	r.in("")
+	if err := r.confirmReady(ctx); err != nil {
+		return err
+	}
 	ok, failed := r.splitGroups()
 	switch {
 	case len(failed) == 0:

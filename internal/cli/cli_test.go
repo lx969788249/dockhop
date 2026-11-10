@@ -119,7 +119,7 @@ func TestInLinkMessages(t *testing.T) {
 func TestMenu(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
 	r := runCLI(t, "1\n", nil)
-	if !strings.Contains(r.stderr, "1. 迁出\n") || !strings.Contains(r.stderr, "2. 迁入\n") || strings.Contains(r.stderr, "3. ") {
+	if !strings.Contains(r.stderr, " [1]  迁出\n [2]  迁入\n 请输入数字：") || strings.Contains(r.stderr, "[3]") {
 		t.Fatalf("菜单文字不对：%q", r.stderr)
 	}
 	if r.code != ExitFailed || !strings.Contains(r.stderr, "连不上 Docker") || !strings.Contains(r.stderr, "systemctl start docker") {
@@ -138,7 +138,7 @@ func TestMenuClearsScreen(t *testing.T) {
 	if !strings.HasPrefix(out, clearScreen) || strings.Count(out, clearScreen) != 2 {
 		t.Fatalf("开始时和选完菜单后应各清屏一次：%q", out)
 	}
-	if after := out[strings.LastIndex(out, clearScreen):]; strings.Contains(after, "1. 迁出") {
+	if after := out[strings.LastIndex(out, clearScreen):]; strings.Contains(after, "[1]  迁出") {
 		t.Errorf("选完之后屏幕上不应再有菜单：%q", after)
 	}
 }
@@ -195,5 +195,18 @@ func TestFailureLogRecordsEnvironment(t *testing.T) {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("日志里缺少「%s」：\n%s", want, b)
 		}
+	}
+}
+
+// 取不到用户的主目录时不能退回 /tmp：谁都能先在那里放一个软链接，以 root 运行的 DockHop 会跟着它
+// 改别的文件的权限。HOME 没设置时按用户信息找，再找不到就停下说明。
+func TestDockhopHomeNotTmp(t *testing.T) {
+	e := &Env{Getenv: func(string) string { return "" }, HomeDir: func() (string, error) { return "", fmt.Errorf("$HOME is not defined") }}
+	if h, err := e.dockhopHome(); err == nil || strings.HasPrefix(h, os.TempDir()) {
+		t.Fatalf("取不到主目录时应停下：%q %v", h, err)
+	}
+	t.Setenv("HOME", "")
+	if h, err := userHome(); err != nil || h == "" {
+		t.Fatalf("HOME 没设置时应按用户信息找：%q %v", h, err)
 	}
 }

@@ -235,6 +235,42 @@ func exitInfo(c *docker.Container) string {
 	return s
 }
 
+// confirmReady 在决定提交之前把就绪了的容器再查一遍：没有健康检查的稳定运行几秒就算就绪，
+// 之后还可能停掉；一组服务启动、等待的时候，先就绪的组也可能已经出了问题。停了、在重启、
+// 不健康了的，它所在的组和没能启动的一样处理。
+func (r *run) confirmReady(ctx context.Context) error {
+	for _, g := range r.groups {
+		for _, it := range g.items {
+			if g.reason != "" {
+				break
+			}
+			if !it.running() {
+				continue
+			}
+			c, _, err := r.Docker.InspectContainer(docker.Quiet(ctx), it.newID)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			problem := ""
+			switch {
+			case err != nil:
+				problem = fmt.Sprintf("就绪之后读不到了：%v", err)
+			case c.State.Status == "restarting":
+				problem = "就绪之后又退出了，Docker 正在重启它（" + exitInfo(c) + "）"
+			case c.State.Status != "running" && c.State.Status != "paused":
+				problem = "就绪之后又停了（" + exitInfo(c) + "）"
+			case c.State.Health != nil && c.State.Health.Status == "unhealthy":
+				problem = "就绪之后健康检查又没通过"
+			}
+			if problem != "" {
+				err := r.notReady(ctx, it, "容器 "+it.m.Name+" "+problem)
+				r.groupFailed(g, err.Error(), groupHint(err))
+			}
+		}
+	}
+	return nil
+}
+
 // notReady 是容器没能就绪的报错。容器最后的输出写进日志，报错里接上最能说明问题的一行；
 // 按名字找不到别的服务时，在建议里说明可能的原因。报错会显示在屏幕和结果里，所以先隐藏秘密。
 func (r *run) notReady(ctx context.Context, it *citem, reason string) error {

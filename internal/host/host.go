@@ -1,4 +1,4 @@
-// Package host 读取本机信息：系统、磁盘空间、正在监听的端口、权限。
+// Package host 读取本机信息：系统、磁盘空间、挂载点、正在监听的端口。
 // 只读系统文件和系统调用，不依赖 ss、df 等外部命令。
 package host
 
@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -54,9 +55,6 @@ func Kernel() string {
 		unix.ByteSliceToString(u.Release[:]), unix.ByteSliceToString(u.Machine[:]))
 }
 
-// IsRoot 表示是否以 root 身份运行。
-func IsRoot() bool { return os.Geteuid() == 0 }
-
 // Disk 是一个目录所在磁盘的空间。
 type Disk struct {
 	Path  string // 实际统计的目录（目录不存在时向上找到的第一个存在的父目录）
@@ -92,6 +90,48 @@ func DiskOf(path string) (Disk, error) {
 	}
 	bs := uint64(st.Bsize)
 	return Disk{Path: p, Total: uint64(st.Blocks) * bs, Free: uint64(st.Bavail) * bs, Dev: uint64(fi.Dev)}, nil
+}
+
+// IsMountPoint 表示 path 本身是不是挂载点（单独挂载的磁盘、绑定挂载的目录等）。挂载点不能改名、
+// 不能删除，只能改它里面的内容。path 的上级目录里有软链接时按真实路径找；path 本身是软链接时
+// 不算（改名改的是软链接）。
+func IsMountPoint(path string) bool {
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if dir, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+		path = filepath.Join(dir, filepath.Base(path))
+	}
+	return mountedAt(f, path)
+}
+
+// mountedAt 在 /proc/self/mountinfo 的内容里找挂载点 path：第 5 列是挂载点，空格、制表符、
+// 换行和反斜杠写成 \040 这样的三位八进制。
+func mountedAt(r io.Reader, path string) bool {
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		if f := strings.Fields(sc.Text()); len(f) > 4 && unescapeOctal(f[4]) == path {
+			return true
+		}
+	}
+	return false
+}
+
+func unescapeOctal(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+4 <= len(s) {
+			if n, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(n))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // Listener 是一个正在监听的端口。

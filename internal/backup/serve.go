@@ -165,7 +165,7 @@ func (r *run) instructions(ctx context.Context, link crypto.Link) string {
 	b.WriteString(s.Green(link.String()) + "\n\n")
 	b.WriteString("下一步：\n")
 	b.WriteString("  1. 登录新服务器，运行 bash <(curl -fsSL https://dockhop.run)\n")
-	b.WriteString("  2. 选择「2. 迁入」，粘贴上面的链接\n\n")
+	b.WriteString("  2. 选择「[2] 迁入」，粘贴上面的链接\n\n")
 	// 这两行在 80 列的终端里不折行。
 	b.WriteString(s.Orange("⚠ 请不要关闭这个窗口") + "：新服务器要从这里下载数据，迁入成功后这里会自动结束。\n")
 	b.WriteString(s.Orange(fmt.Sprintf("⚠ 请放行 TCP %d 端口", link.Port)) + "：在云服务商的安全组或防火墙里放行，否则新服务器连不上。\n")

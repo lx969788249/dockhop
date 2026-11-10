@@ -15,7 +15,11 @@ func TestRedact(t *testing.T) {
 	cases := map[string]string{
 		"数据库密码是 hunter2-very-secret":                                                           "数据库密码是 ***",
 		"-e DB_PASSWORD=p@ss123 -e MODE=prod":                                                  "-e DB_PASSWORD=*** -e MODE=prod",
-		"MYSQL_ROOT_PASSWORD=x&y":                                                              "MYSQL_ROOT_PASSWORD=***&y",
+		"MYSQL_ROOT_PASSWORD=x&y":                                                              "MYSQL_ROOT_PASSWORD=***",
+		"API_TOKEN=a,b;c 其他":                                                                   "API_TOKEN=*** 其他",
+		"https://x/?token=abc&user=bob":                                                        "https://x/?token=***",
+		`{"Env":["DB_PASSWORD=my secret&x","MODE=prod"]}`:                                      `{"Env":["DB_PASSWORD=***","MODE=prod"]}`,
+		"docker run -e 'DB_PASSWORD=my secret' app":                                            "docker run -e 'DB_PASSWORD=***' app",
 		`{"Env":["API_TOKEN=tok_123"],"Password": "s3cret"}`:                                   `{"Env":["API_TOKEN=***"],"Password": "***"}`,
 		"  admin_password: changeme":                                                           "  admin_password: ***",
 		"key is AGE-SECRET-KEY-1QQQ7ZZ":                                                        "key is ***",

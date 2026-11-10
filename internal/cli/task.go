@@ -25,7 +25,12 @@ type task struct {
 }
 
 func startTask(env *Env, kind string) (*task, error) {
-	t := &task{env: env, home: env.dockhopHome(), redactor: &logging.Redactor{}}
+	home, err := env.dockhopHome()
+	if err != nil {
+		env.screen.Problem(err.Error(), "设置 HOME，或者用 DOCKHOP_HOME 指定 DockHop 放文件的目录")
+		return nil, ui.ErrReported
+	}
+	t := &task{env: env, home: home, redactor: &logging.Redactor{}}
 	log, err := logging.Open(filepath.Join(t.home, "logs"), kind, t.redactor)
 	if err != nil {
 		// 没有日志也能继续，只是出错时没有日志可以反馈。

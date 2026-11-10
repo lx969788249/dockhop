@@ -58,6 +58,9 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 			o.BaseDir = d.Workdir
 		}
 		t, err := r.Collect()
+		if ui.Canceled(err) {
+			return nil, err
+		}
 		if err != nil {
 			return nil, &Problem{Reason: "读取新服务器的情况失败：" + err.Error()}
 		}

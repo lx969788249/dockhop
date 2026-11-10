@@ -60,7 +60,7 @@ func (r *run) check(ctx context.Context) (string, error) {
 			if r.tool != nil {
 				v = r.tool.Version
 			}
-			return preflight.Collect(context.Background(), r.Docker, v)
+			return preflight.Collect(ctx, r.Docker, v)
 		}}
 	res, err := runner.Run(r.plan, &r.d, preflight.Options{Existing: r.opts.Existing, BaseDir: r.workBase(), Home: r.Home})
 	if ui.Canceled(err) {

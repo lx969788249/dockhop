@@ -93,16 +93,26 @@ func (p *Prompter) read() (string, error) {
 }
 
 // Choose 列出选项让用户选一个，返回从 1 开始的序号。没有默认值，一定要输入序号：直接回车
-// 不算，免得多带的一个回车（例如粘贴命令时）替用户做了选择。
+// 不算，免得多带的一个回车（例如粘贴命令时）替用户做了选择。选项写成“  1. 迁出”。
 func (p *Prompter) Choose(options []string) (int, error) {
+	return p.choose(options, "  ", "%d. ")
+}
+
+// Menu 和 Choose 一样，用在首页：和首页的其他行一样缩进 1 格，选项写成“ [1]  迁出”。
+func (p *Prompter) Menu(options []string) (int, error) {
+	return p.choose(options, " ", "[%d]  ")
+}
+
+// choose 列出选项、读序号。indent 是选项和提示的缩进，number 是序号的写法。
+func (p *Prompter) choose(options []string, indent, number string) (int, error) {
 	if !p.Interactive() {
 		return 0, ErrNotInteractive
 	}
 	for i, o := range options {
-		fmt.Fprintf(p.out, "  %d. %s\n", i+1, o)
+		fmt.Fprintf(p.out, "%s%s%s\n", indent, fmt.Sprintf(number, i+1), o)
 	}
 	for {
-		fmt.Fprint(p.out, "  请输入数字：")
+		fmt.Fprint(p.out, indent+"请输入数字：")
 		line, err := p.readLine()
 		if err != nil {
 			return 0, err
@@ -110,7 +120,7 @@ func (p *Prompter) Choose(options []string) (int, error) {
 		if n, err := strconv.Atoi(line); err == nil && n >= 1 && n <= len(options) {
 			return n, nil
 		}
-		fmt.Fprintf(p.out, "  请输入 1 到 %d 之间的数字。\n", len(options))
+		fmt.Fprintf(p.out, "%s请输入 1 到 %d 之间的数字。\n", indent, len(options))
 	}
 }
 

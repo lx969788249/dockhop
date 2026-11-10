@@ -297,11 +297,10 @@ func (r *run) decidePartial(ok, failed []*group) (bool, error) {
 
 // commitPartial 只删除没启动的组、提交其他组。顺序：
 //  1. 恢复临时停下的、属于保留下来的组的容器（失败就整体删除，和全部成功时一样）；
-//  2. 日志里只留下没启动的组的改动（之后被强制结束，下次运行只会删除它们）；
-//  3. 按日志删除没启动的组；
-//  4. 删除保留下来的组的回滚资料（被替换的旧容器、回滚镜像、旧目录）。有删不掉的，
-//     日志改写成“已提交”加上这些记录，和全部成功时一样，下次运行迁入时接着删；
-//  5. 记下已经迁入的服务，重试时跳过。
+//  2. 日志里记下保留下来的组：从这里开始它们就算迁入完成了；
+//  3. 删除没启动的组、删除保留下来的组的回滚资料（见 finishPartial）。之后被强制结束，下次运行
+//     接着做完；
+//  4. 记下已经迁入的服务，重试时跳过。
 func (r *run) commitPartial(ctx context.Context, ok, failed []*group) error {
 	s := r.Screen
 	failedID := map[string]bool{}
@@ -321,38 +320,18 @@ func (r *run) commitPartial(ctx context.Context, ok, failed []*group) error {
 	if err != nil {
 		return s.StepFailed("事务日志读不了", err.Error(), "")
 	}
-	var keep, drop []Entry
-	for _, e := range entries {
-		if e.Op == opStart || e.Op == opImages || failedID[e.Group] {
-			drop = append(drop, e)
-		} else {
-			keep = append(keep, e)
-		}
+	var kept []string
+	for _, g := range ok {
+		kept = append(kept, g.id)
+	}
+	if err := r.j.add(Entry{Op: opCommit, Names: kept}); err != nil {
+		return s.StepFailed(err.Error(), "", "")
 	}
 	r.j.close()
-	if err := rewriteJournal(r.rbDir, drop); err != nil {
-		return s.StepFailed("写入事务日志失败", err.Error(), "")
-	}
-	// 从这里开始，保留下来的组就算迁入完成了，不再整体删除。
 	r.committed, r.partial = true, true
-	ctx = context.WithoutCancel(ctx)
 	s.Note("删除没启动的服务")
-	r.rollbackIssues = r.undo.rollback(ctx, drop)
+	r.rollbackIssues, r.cleanupLeft = r.finishPartial(context.WithoutCancel(ctx), entries, kept)
 	r.rollbackDone = true
-	r.cleanupLeft = r.undo.cleanupCommitted(ctx, keep)
-	switch {
-	case len(r.rollbackIssues) > 0:
-		// 日志里还是没启动的组的改动，下次运行迁入时接着删除它们。
-		// 保留下来的组没删掉的回滚资料只能在结果里列出来，交给人工处理。
-	case len(r.cleanupLeft) > 0:
-		if err := rewriteJournal(r.rbDir, append(keep, Entry{Op: opCommit, Time: time.Now()})); err != nil {
-			r.cleanupLeft = append(r.cleanupLeft, "事务日志没能改写："+err.Error())
-		}
-	default:
-		if err := os.RemoveAll(r.rbDir); err != nil {
-			r.Log.Printf("回滚资料目录没能删除：%v", err)
-		}
-	}
 	var items []*citem
 	for _, g := range ok {
 		items = append(items, g.items...)
@@ -367,6 +346,43 @@ func (r *run) commitPartial(ctx context.Context, ok, failed []*group) error {
 		s.End("保留 " + labels(ok) + " · 已删除 " + labels(failed))
 	}
 	return errPartial
+}
+
+// finishPartial 做完只提交了一部分（保留下来的组是 kept）的迁入：没保留的组按日志撤销，保留下来的组
+// 删除回滚资料（被替换的旧容器、回滚镜像、旧目录）。这两样都可以重复做，中途被强制结束时下次运行
+// 从头再做一遍（见 recoverInterrupted）。撤销有没做完的，日志原样留着，下次运行接着做；只是回滚
+// 资料有删不掉的，日志改写成全部提交，和全部成功时一样，下次运行接着删。
+func (r *run) finishPartial(ctx context.Context, entries []Entry, kept []string) (issues, left []string) {
+	drop, keep := splitPartial(entries, kept)
+	issues = r.undo.rollback(ctx, drop)
+	left = r.undo.cleanupCommitted(ctx, keep)
+	switch {
+	case len(issues) > 0:
+	case len(left) > 0:
+		if err := rewriteJournal(r.rbDir, append(keep, Entry{Op: opCommit, Time: time.Now()})); err != nil {
+			left = append(left, "事务日志没能改写："+err.Error())
+		}
+	default:
+		if err := os.RemoveAll(r.rbDir); err != nil {
+			r.Log.Printf("回滚资料目录没能删除：%v", err)
+		}
+	}
+	return issues, left
+}
+
+// splitPartial 把只提交了一部分的日志分成两份：没保留的组的改动要撤销（连同撤销要用到的：事务开始、
+// 加载镜像之前已有的镜像、上次撤销时重建的原有容器），其余的（保留下来的组和共用的）只删除回滚资料。
+func splitPartial(entries []Entry, kept []string) (drop, keep []Entry) {
+	for _, e := range entries {
+		switch {
+		case e.Op == opCommit:
+		case e.Op == opStart || e.Op == opImages || e.Op == opRebuilt || e.Group != "" && !slices.Contains(kept, e.Group):
+			drop = append(drop, e)
+		default:
+			keep = append(keep, e)
+		}
+	}
+	return drop, keep
 }
 
 // errPartial 表示只迁入了一部分（用户选择保留已经正常运行的服务）。

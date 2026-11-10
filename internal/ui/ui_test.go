@@ -377,6 +377,15 @@ func TestPrompter(t *testing.T) {
 	if _, err := none.Choose([]string{"a"}); !errors.Is(err, ErrNotInteractive) {
 		t.Fatalf("不能交互时应返回 ErrNotInteractive：%v", err)
 	}
+	if _, err := none.Menu([]string{"a"}); !errors.Is(err, ErrNotInteractive) {
+		t.Fatalf("不能交互时应返回 ErrNotInteractive：%v", err)
+	}
+	// 首页的菜单：和首页的其他行一样缩进 1 格，序号写成 [1]。同样没有默认值，直接回车不算。
+	out.Reset()
+	n, err = NewPrompter(strings.NewReader("\n2\n"), &out).Menu([]string{"迁出", "迁入"})
+	if want := " [1]  迁出\n [2]  迁入\n 请输入数字： 请输入 1 到 2 之间的数字。\n 请输入数字："; err != nil || n != 2 || out.String() != want {
+		t.Fatalf("首页菜单的样子不对：%d, %v, %q", n, err, out.String())
+	}
 }
 
 func TestBanner(t *testing.T) {

@@ -31,6 +31,7 @@ type Target struct {
 	ListenersOK   bool
 	HostIPs       map[string]bool // 本机的地址；为 nil 时不检查
 	Exists        func(path string) bool
+	HasContent    func(path string) bool // path 上已经有东西：文件、软链接，或者不是空的目录
 	Disk          func(path string) (host.Disk, error)
 	Pullable      func(ref string) bool
 }
@@ -55,6 +56,24 @@ type TargetNetwork struct {
 	IPs     map[string]string // IP → 容器名
 }
 
+// hasContent 表示 path 上已经有东西：文件、软链接，或者不是空的目录。读不了的目录算有东西。
+func hasContent(path string) bool {
+	st, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	if !st.IsDir() {
+		return true
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+	names, _ := f.Readdirnames(1)
+	return len(names) > 0
+}
+
 // Collect 读出新服务器的情况。读不到的部分留空，相应的检查就跳过。
 func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, error) {
 	info, err := dc.Info(ctx)
@@ -67,8 +86,9 @@ func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, e
 		Runtimes: map[string]bool{}, VolumePlugins: map[string]bool{},
 		Containers: map[string]TargetContainer{},
 		Volumes:    map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{},
-		Exists: func(p string) bool { _, err := os.Stat(p); return err == nil },
-		Disk:   host.DiskOf,
+		Exists:     func(p string) bool { _, err := os.Stat(p); return err == nil },
+		HasContent: hasContent,
+		Disk:       host.DiskOf,
 	}
 	if t.DockerRoot == "" {
 		t.DockerRoot = "/var/lib/docker"
