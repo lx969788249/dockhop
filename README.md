@@ -167,7 +167,7 @@ bash <(curl -fsSL https://dockhop.run) out --port 9000
 
 ## 参与开发
 
-DockHop 用 Go 编写，编译成一个不依赖系统库的程序。设计说明见 [docs/design.md](docs/design.md)。
+DockHop 用 Go 编写，编译成一个不依赖系统库的程序。设计说明见 [docs/design.md](docs/design.md)，每个版本在设计上改了什么、为什么改见 [docs/changelog.md](docs/changelog.md)。
 
 ```bash
 go test ./...                                # 单元测试
@@ -179,6 +179,8 @@ test/apps/run.sh wordpress                   # 在两台模拟服务器之间迁
 ```
 
 一行命令用的 `run.sh` 是发布时由 `scripts/run.sh.in` 生成的，不要直接改它。
+
+改了设计时，design.md 直接改成新的样子，改了什么、为什么改记在 changelog.md。修缺陷和加功能分开提交，方便单独回滚和审查。
 
 ## Star History
 
