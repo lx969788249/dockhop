@@ -243,6 +243,11 @@ func (r *run) createContainer(ctx context.Context, it *citem) error {
 	if err != nil {
 		return fmt.Errorf("容器 %s 创建失败：%v", it.m.Name, err)
 	}
+	// 建好就记下 ID，回滚按它删（见 opCreated）。记不下来就马上删掉它：留着的话，回滚分不清它是不是这次建的。
+	if err := r.j.add(Entry{Op: opCreated, Name: it.m.Name, ID: id}); err != nil {
+		_ = r.Docker.RemoveContainerAndVolumes(context.WithoutCancel(ctx), id)
+		return err
+	}
 	it.newID = id
 	for _, c := range built.Connects {
 		if err := r.Docker.ConnectNetwork(ctx, c.Network, id, c.Endpoint); err != nil {

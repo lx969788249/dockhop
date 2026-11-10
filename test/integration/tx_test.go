@@ -354,14 +354,16 @@ func TestInStartFailureKeepsOld(t *testing.T) {
 	mustContain(t, out, "健康检查没有通过", "迁入的内容已全部删除")
 	checkOld()
 
-	// 附录 C-8：没有健康检查的 web 启动后马上退出——判为失败，旧容器保留。
+	// 附录 C-8：没有健康检查的 web 启动后马上退出——判为失败，旧容器保留。一般等它就绪时就发现了
+	// （“启动后马上退出”）；机器很忙时 Docker 可能过几秒才报告它退出，这时是提交前再查一遍时发现的
+	// （“就绪之后又停了”）。两种都对，要看的是哪个容器、退出码，和迁入的内容全部删除。
 	os.WriteFile(filepath.Join(appFlag, "ok"), nil, 0o644)
 	os.Remove(filepath.Join(webFlag, "ok"))
 	out, code = m.in(t, home, nil)
 	if code == 0 {
 		t.Fatal("应失败")
 	}
-	mustContain(t, out, "启动后马上退出", "迁入的内容已全部删除")
+	mustContain(t, out, "原因：容器 "+f.web+" ", "（退出码 1）", "迁入的内容已全部删除")
 	checkOld()
 }
 

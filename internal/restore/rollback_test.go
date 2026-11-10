@@ -1162,7 +1162,7 @@ func TestEveryOpHandled(t *testing.T) {
 		opOldImages: {Name: "p"}, opVolume: {Name: "v"}, opStage: {Path: filepath.Join(dir, "stage")},
 		opBind: {Path: filepath.Join(dir, "bind")}, opLink: {Path: filepath.Join(dir, "link")},
 		opFile: {Path: filepath.Join(dir, "file")}, opMkdir: {Path: filepath.Join(dir, "mkdir")},
-		opNetwork: {Name: "n"}, opContainer: {Name: "c"}, opHelper: {Name: "dockhop-helper-x"},
+		opNetwork: {Name: "n"}, opContainer: {Name: "c"}, opCreated: {Name: "c", ID: "id-c"}, opHelper: {Name: "dockhop-helper-x"},
 		opImages: {}, opTag: {Name: "app:1"}, opComposeUp: {Name: "p"}, opRebuilt: {Name: "p-app-1", ID: "id-r"},
 		opCommit: {},
 	}
@@ -1199,5 +1199,105 @@ func TestEveryOpHandled(t *testing.T) {
 		if strings.Contains(p, "不认识") {
 			t.Error(p)
 		}
+	}
+}
+
+// 回滚只删这次迁入建的容器，按建好时记下的 ID 删。按名字删会删错：建的时候名字已经被别的容器占着
+// （创建失败），或者中断之后用户自己又建了一个同名的。没记下 ID 的（升级之前的版本写的日志，或者
+// 建好了还没来得及记就被强制结束），只删在“要新建”这条记录之后才建的同名容器。
+func TestRollbackRemovesOnlyCreatedContainers(t *testing.T) {
+	at := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	want := []Entry{{Op: opContainer, Name: "web", Time: at}}
+	created := append(slices.Clone(want), Entry{Op: opCreated, Name: "web", ID: "ours", Time: at})
+	for _, c := range []struct {
+		name    string
+		entries []Entry
+		web     string // 按名字 web 查到的容器
+		deleted string // 应删掉的容器；为空表示一个都不删
+	}{
+		{"建的时候名字被别人占着", want, `{"Id":"theirs","Name":"/web","Created":"2026-11-10T11:00:00Z"}`, ""},
+		{"中断之后用户又建了同名的", created, `{"Id":"theirs","Name":"/web","Created":"2026-11-10T13:00:00Z"}`, "ours"},
+		{"建好了还没记下 ID", want, `{"Id":"ours","Name":"/web","Created":"2026-11-10T12:00:01Z"}`, "ours"},
+		{"建好了", created, `{"Id":"ours","Name":"/web","Created":"2026-11-10T12:00:01Z"}`, "ours"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var deleted []string
+			dc, _ := faultyDocker(t, func(w http.ResponseWriter, q *http.Request) bool {
+				p := strings.TrimPrefix(q.URL.Path, "/v1.44")
+				switch {
+				case q.Method == http.MethodGet && p == "/containers/web/json":
+					io.WriteString(w, c.web)
+				case q.Method == http.MethodDelete && strings.HasPrefix(p, "/containers/"):
+					deleted = append(deleted, strings.TrimPrefix(p, "/containers/"))
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					return false
+				}
+				return true
+			})
+			u := &undo{dc: dc, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+				mountPoint: noMounts, record: func(Entry) error { return nil }}
+			if problems := u.rollback(context.Background(), c.entries); len(problems) > 0 {
+				t.Errorf("不应有问题：%v", problems)
+			}
+			if got := strings.Join(deleted, " "); got != c.deleted {
+				t.Errorf("删掉的容器：%q，应为 %q", got, c.deleted)
+			}
+		})
+	}
+}
+
+// 新建的容器建好就把 ID 记进日志（回滚按它删）。记不下来时马上删掉它：留着的话，回滚分不清它是不是
+// 这次建的。
+func TestCreateContainerRecordsID(t *testing.T) {
+	for _, journalFails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("记不下来=%v", journalFails), func(t *testing.T) {
+			var r *run
+			dc, calls := faultyDocker(t, func(w http.ResponseWriter, q *http.Request) bool {
+				p := strings.TrimPrefix(q.URL.Path, "/v1.44")
+				switch {
+				case q.Method == http.MethodGet && strings.HasPrefix(p, "/images/"):
+					io.WriteString(w, `{"Id":"sha256:img","Config":{}}`)
+				case q.Method == http.MethodPost && p == "/containers/create":
+					if journalFails {
+						r.j.close() // 建好之后磁盘写不进去了
+					}
+					w.WriteHeader(http.StatusCreated)
+					io.WriteString(w, `{"Id":"new-id"}`)
+				case q.Method == http.MethodDelete && p == "/containers/new-id":
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					return false
+				}
+				return true
+			})
+			r = &run{Deps: Deps{Docker: dc, Screen: ui.New(io.Discard, false, nil)}, m: &bundle.Manifest{}, j: testJournal(t)}
+			raw := json.RawMessage(`{"Name":"/web","Config":{"Image":"alpine"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`)
+			it := &citem{m: bundle.Container{Name: "web"}, raw: raw, c: &docker.Container{}, img: "alpine"}
+			err := r.createContainer(context.Background(), it)
+			removed := slices.Contains(calls(), "DELETE /v1.44/containers/new-id")
+			if journalFails {
+				if err == nil || !removed {
+					t.Fatalf("记不下 ID 时应报错并马上删掉新容器：%v %v", err, calls())
+				}
+				return
+			}
+			if err != nil || removed {
+				t.Fatalf("%v %v", err, calls())
+			}
+			entries, err := readJournal(r.j.dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, e := range entries {
+				if e.Op != opStart {
+					got = append(got, string(e.Op)+" "+e.Name+" "+e.ID)
+				}
+			}
+			if strings.Join(got, ", ") != "container web , created web new-id" {
+				t.Errorf("日志：%q", got)
+			}
+		})
 	}
 }

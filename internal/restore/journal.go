@@ -35,7 +35,8 @@ const (
 	opFile       Op = "file"        // 写入 Compose 项目里的文件（Path、Existed、Backup）
 	opMkdir      Op = "mkdir"       // 新建目录（Path）
 	opNetwork    Op = "network"     // 新建网络（Name）
-	opContainer  Op = "container"   // 新建容器（Name）
+	opContainer  Op = "container"   // 要新建容器（Name）：建之前先记下，建好了再记 opCreated
+	opCreated    Op = "created"     // 新建的容器建好了（Name；ID：它的 ID），回滚时按 ID 删
 	opHelper     Op = "helper"      // 新建临时容器（Name），用完就删
 	opImages     Op = "images"      // 加载镜像之前这台服务器上已有的镜像（Names：镜像 ID），回滚时这些一个不删
 	opTag        Op = "tag"         // 镜像名要改为指向迁入的镜像（Name；ID：原来指向的镜像，为空表示原来没有这个名字）
@@ -75,6 +76,7 @@ var opRules = map[Op]opRule{
 	opMkdir:      {hasPath, byGroup},
 	opNetwork:    {hasName, byGroup},
 	opContainer:  {hasName, byGroup},
+	opCreated:    {hasNameID, byGroup},
 	opHelper:     {hasName, byGroup},
 	opImages:     {always, alwaysUndo},
 	opTag:        {hasName, byGroup},

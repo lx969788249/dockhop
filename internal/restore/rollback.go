@@ -48,12 +48,17 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		problems = append(problems, msg)
 		u.logf("回滚：%s", msg)
 	}
-	// 原有的容器，包括上次回滚已经重建的原有 Compose 容器（opRebuilt）：都不能当成这次新建的删掉。
+	// 原有的容器（临时停下的、改名备份的、随 Compose 项目备份的），包括上次回滚已经重建的原有 Compose
+	// 容器（opRebuilt）：都不能当成这次新建的删掉。
 	oldIDs := map[string]bool{}
 	rebuilt := map[string]string{} // 上次回滚重建过的原有 Compose 容器：名字 → 重建后的 ID
+	created := map[string]bool{}   // 建好了、记下了 ID 的新容器（见 opCreated）
 	for _, e := range entries {
-		if e.ID != "" && e.Op != opHelper {
+		switch e.Op {
+		case opStop, opRename, opRebuilt:
 			oldIDs[e.ID] = true
+		case opCreated:
+			created[e.Name] = true
 		}
 		for _, o := range e.Old {
 			oldIDs[o.ID] = true
@@ -69,17 +74,25 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		e := entries[i]
 		switch e.Op {
 		case opContainer:
-			// 只有 Docker 明确说没有这个容器，才算已经删掉；其他错误说明不知道它还在不在写数据。
+			// 建好了的按记下的 ID 删（opCreated），不按名字：名字可能被别的容器占着。没记下 ID 的，可能
+			// 没建成（名字被别的容器占着），也可能建好了还没来得及记就被强制结束（或者日志是升级之前的
+			// 版本写的）：只删在这条记录之后才建的同名容器，之前就有的不是这次建的。
+			if created[e.Name] {
+				continue
+			}
 			c, _, err := u.dc.InspectContainer(ctx, e.Name)
 			switch {
 			case docker.IsNotFound(err):
 			case err != nil:
 				note("没法确认本次新建的容器 %s 已经删除：%v", e.Name, err)
-			case !oldIDs[c.ID]:
-				if err := u.dc.RemoveContainerAndVolumes(ctx, c.ID); err != nil && !docker.IsNotFound(err) {
-					note("本次新建的容器 %s 没能删除：%v", e.Name, err)
-				}
+			case oldIDs[c.ID]:
+			case !c.Created.After(e.Time):
+				u.logf("回滚：容器 %s 在迁入要新建它之前就有了，不是这次建的，没有删除", e.Name)
+			default:
+				u.removeCreated(ctx, e.Name, c.ID, note)
 			}
+		case opCreated:
+			u.removeCreated(ctx, e.Name, e.ID, note)
 		case opHelper:
 			u.removeHelper(ctx, e, note)
 		case opStop:
@@ -171,7 +184,7 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 			tags = append(tags, e)
 		case opImages:
 			had = e.Names
-		case opStart, opStop, opRename, opComposeOld, opOldImages, opContainer, opHelper, opRebuilt, opCommit:
+		case opStart, opStop, opRename, opComposeOld, opOldImages, opContainer, opCreated, opHelper, opRebuilt, opCommit:
 			// 这一遍不用管：容器在第 1 遍，原来的服务在第 3 遍
 		default:
 			note("日志里有不认识的记录 %s，没有撤销", e.Op)
@@ -354,6 +367,14 @@ func (u *undo) restop(ctx context.Context, e Entry, note func(string, ...any)) {
 	}
 	if err := u.dc.StopContainer(ctx, c.ID, nil); err != nil {
 		note("临时停过的容器 %s 又在运行，没能停下：%v", e.Name, err)
+	}
+}
+
+// removeCreated 删掉这次新建的容器 id。只有 Docker 明确说没有这个容器，才算已经删掉；其他错误说明
+// 不知道它还在不在写数据。
+func (u *undo) removeCreated(ctx context.Context, name, id string, note func(string, ...any)) {
+	if err := u.dc.RemoveContainerAndVolumes(ctx, id); err != nil && !docker.IsNotFound(err) {
+		note("本次新建的容器 %s 没能删除：%v", name, err)
 	}
 }
 
@@ -728,7 +749,7 @@ func (u *undo) cleanupCommitted(ctx context.Context, entries []Entry) []string {
 			if err := os.RemoveAll(e.Path); err != nil {
 				left = append(left, fmt.Sprintf("解压用的临时目录 %s：%v", e.Path, err))
 			}
-		case opStart, opStop, opVolume, opLink, opFile, opMkdir, opNetwork, opContainer, opImages, opTag,
+		case opStart, opStop, opVolume, opLink, opFile, opMkdir, opNetwork, opContainer, opCreated, opImages, opTag,
 			opComposeUp, opRebuilt, opCommit:
 			// 没有要删的回滚资料：数据卷、文件的备份在回滚资料目录里，跟着目录一起删
 		default:

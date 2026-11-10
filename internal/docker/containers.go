@@ -13,10 +13,11 @@ import (
 
 // Container 是容器详情里 DockHop 需要读取的部分；完整配置另外按原始 JSON 保存。
 type Container struct {
-	ID           string `json:"Id"`
-	Name         string `json:"Name"`
-	Image        string `json:"Image"`        // 镜像 ID
-	RestartCount int    `json:"RestartCount"` // Docker 按重启策略自动重启的次数
+	ID           string    `json:"Id"`
+	Name         string    `json:"Name"`
+	Created      time.Time `json:"Created"`
+	Image        string    `json:"Image"`        // 镜像 ID
+	RestartCount int       `json:"RestartCount"` // Docker 按重启策略自动重启的次数
 	State        struct {
 		Status    string `json:"Status"`
 		Running   bool   `json:"Running"`

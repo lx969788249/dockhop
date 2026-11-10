@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -87,6 +88,7 @@ type projectInfo struct {
 
 type collected struct {
 	sel        *selection
+	inv        *inventory // 读配置时的全部容器，停机之前按它核对（见 recheck）
 	volumes    []*volumeInfo
 	binds      []*bindInfo
 	networks   []*networkInfo
@@ -96,6 +98,33 @@ type collected struct {
 	shared     []*item         // 没选中、但和选中的容器共用数据并且正在运行的容器
 	systemOnly []string        // 只重建挂载关系、不迁移内容的宿主机路径
 	secrets    []string        // 需要在日志里隐藏的值
+}
+
+// hostPaths 是打包时要读的宿主机上的地方（真实路径）：挂载目录、Compose 项目目录（在挂载目录里的
+// 随挂载目录打包）和项目目录外的文件。
+func (c *collected) hostPaths() []string {
+	var out []string
+	for _, b := range c.binds {
+		out = append(out, b.path)
+	}
+	for _, p := range c.projects {
+		if !p.inBind {
+			out = append(out, host.RealPath(p.u.workingDir))
+		}
+		for _, o := range p.outside {
+			out = append(out, host.RealPath(o))
+		}
+	}
+	return out
+}
+
+// volumeNames 是要打包的数据卷的名字。
+func (c *collected) volumeNames() map[string]bool {
+	m := map[string]bool{}
+	for _, v := range c.volumes {
+		m[v.name] = true
+	}
+	return m
 }
 
 func (c *collected) dataBytes() int64 {
@@ -119,7 +148,7 @@ func (c *collected) dataBytes() int64 {
 
 // collect 读取选中内容的全部配置和大小。只读，不改动任何东西。
 func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *inventory, sel *selection, screen *ui.Screen, ignore map[string]bool) (*collected, error) {
-	out := &collected{sel: sel, layerBytes: map[*item]int64{}}
+	out := &collected{sel: sel, inv: inv, layerBytes: map[*item]int64{}}
 	usage, err := dc.VolumeUsage(ctx)
 	if err != nil {
 		screen.Detail("读取数据卷大小失败：%v", err)
@@ -316,37 +345,43 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		out.projects = append(out.projects, p)
 	}
 
-	// 没选中但正在运行、和选中的容器共用数据的容器：打包时也要临时停止，否则数据不一致。
-	// 菜单里不能选的容器（docker compose run 的临时容器等）也算。
-	selected := map[*item]bool{}
-	for _, it := range sel.items {
-		selected[it] = true
+	shared, err := sharers(inv, sel.items, out.volumeNames(), out.hostPaths(), ignore, screen)
+	if err != nil {
+		return nil, err
 	}
+	out.shared = shared
+	return out, nil
+}
+
+// sharers 找出打包时要和选中的容器 sel 一起临时停止的容器，菜单里不能选的容器（docker compose run
+// 的临时容器等）也算：没选中、正在运行、和选中的容器共用数据的（见 sharesData），否则打包时它还在写，
+// 数据前后对不上；借用要停止的容器的网络、进程空间的（如 VPN 的 sidecar），被借用的容器一停它们就断了，
+// 重启后也不会自己接回去，所以一起临时停止、再一起恢复。Swarm 服务的容器一停就会被重新创建，停不住，
+// 遇到时停下。
+func sharers(inv *inventory, sel []*item, vols map[string]bool, paths []string, ignore map[string]bool, screen *ui.Screen) ([]*item, error) {
 	stopping := map[*item]bool{}
-	for it := range selected {
+	for _, it := range sel {
 		stopping[it] = true
 	}
+	var out []*item
 	share := func(it *item) error {
 		if spec.StopRiskOf(it.c) == spec.StopReplaced {
-			// Swarm 会马上重新创建停掉的容器，停不住。
 			svc := it.c.Config.Labels[labelSwarmService]
 			return screen.StepFailed(fmt.Sprintf("容器 %s 属于 Swarm 服务 %s，和选中的容器共用数据，但它一停就会被 Swarm 重新启动，打包的数据没法保证一致，已取消（什么都没有改动）", it.name(), svc),
 				"", "先执行 docker service scale "+svc+"=0，迁出后再改回原来的个数")
 		}
-		out.shared = append(out.shared, it)
+		out = append(out, it)
 		stopping[it] = true
 		return nil
 	}
 	for _, it := range inv.all {
-		if selected[it] || !it.c.State.Running || ignore[it.name()] || !sharesData(it, vols, out.binds) {
+		if stopping[it] || !it.c.State.Running || ignore[it.name()] || !sharesData(it, vols, paths) {
 			continue
 		}
 		if err := share(it); err != nil {
 			return nil, err
 		}
 	}
-	// 借用要停止的容器的网络、进程空间的容器（如 VPN 的 sidecar）：被借用的容器
-	// 一停，它们就断了，重启后也不会自己接回去，所以一起临时停止、再一起恢复。
 	for changed := true; changed; {
 		changed = false
 		for _, it := range inv.all {
@@ -367,11 +402,90 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 	return out, nil
 }
 
-func sharesData(it *item, vols map[string]*volumeInfo, binds []*bindInfo) bool {
+// recheck 在停机之前再看一次和这次迁出有关的容器：选中的、要一起停的，以及按现在的样子会要一起停的。
+// 从读容器到停机，中间可能隔了好一会儿（选菜单、回答问题），这期间有容器启动、停下、暂停、改名、被重建，
+// 或者新建了共用数据的容器，再按读的时候的样子停机打包就不对了：新启动的共用数据的容器没停下，打包时
+// 它还在写；已经停下的容器打包完会被启动起来；被重建的容器打包的是旧的配置。有变化就停下，什么都不动，
+// 重新运行会按现在的样子重新读。
+func (r *run) recheck(ctx context.Context, col *collected) error {
+	s := r.Screen
+	list, err := r.Docker.Containers(ctx, true)
+	if err != nil {
+		return s.StepFailed("读取容器列表失败，为了安全没有停止任何容器", err.Error(), "")
+	}
+	// 读过的容器照旧用读的时候的配置（配置变了，ID 也会变），名字和状态按现在的；新出现的读一下。
+	now := &inventory{byName: map[string]*item{}, byID: map[string]*item{}}
+	for _, sum := range list {
+		it := col.inv.byID[sum.ID]
+		if it == nil {
+			c, raw, err := r.Docker.InspectContainer(ctx, sum.ID)
+			if docker.IsNotFound(err) {
+				continue // 刚好被删掉了
+			}
+			if err != nil {
+				return s.StepFailed("读取容器 "+sum.Name()+" 失败，为了安全没有停止任何容器", err.Error(), "")
+			}
+			it = &item{c: c, raw: raw}
+		}
+		c := *it.c
+		c.Name = "/" + sum.Name()
+		c.State.Status = sum.State
+		c.State.Running = sum.State == "running" || sum.State == "restarting" || sum.State == "paused"
+		c.State.Paused = sum.State == "paused"
+		cur := &item{c: &c, raw: it.raw}
+		now.all = append(now.all, cur)
+		now.byName[cur.name()] = cur
+		now.byID[c.ID] = cur
+	}
+	var sel []*item
+	for _, it := range col.sel.items {
+		if cur := now.byID[it.c.ID]; cur != nil {
+			sel = append(sel, cur)
+		}
+	}
+	shared, err := sharers(now, sel, col.volumeNames(), col.hostPaths(), r.ignored(), s)
+	if err != nil {
+		return err
+	}
+	before := scene(append(slices.Clone(col.sel.items), col.shared...))
+	after := scene(append(sel, shared...))
+	var changed []string
+	for _, e := range append(slices.Clone(before), after...) {
+		if slices.Contains(before, e) != slices.Contains(after, e) {
+			changed = append(changed, strings.Fields(e)[0])
+		}
+	}
+	if len(changed) > 0 {
+		slices.Sort(changed)
+		return s.StepFailed("容器 "+strings.Join(slices.Compact(changed), "、")+" 在读取配置之后有了变化（启动、停下、暂停、改名或者被重建了），为了安全没有停止任何容器", "",
+			"重新运行迁出，会按现在的样子重新读取")
+	}
+	return nil
+}
+
+// scene 是这些容器的名字、ID 和状态（运行、暂停、停止），比较前后有没有变化用。
+func scene(items []*item) []string {
+	var out []string
+	for _, it := range items {
+		state := "stopped"
+		switch {
+		case it.c.State.Paused:
+			state = "paused"
+		case it.c.State.Running:
+			state = "running"
+		}
+		out = append(out, it.name()+" "+it.c.ID+" "+state)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// sharesData 表示容器有没有用到要打包的数据卷 vols，或者挂载了要打包的宿主机上的地方 paths（真实路径）。
+func sharesData(it *item, vols map[string]bool, paths []string) bool {
 	for _, m := range it.c.Mounts {
 		switch m.Type {
 		case "volume":
-			if vols[m.Name] != nil {
+			if vols[m.Name] {
 				return true
 			}
 		case "bind":
@@ -379,8 +493,8 @@ func sharesData(it *item, vols map[string]*volumeInfo, binds []*bindInfo) bool {
 				continue
 			}
 			src := host.RealPath(m.Source)
-			for _, b := range binds {
-				if spec.PathsOverlap(src, b.path) {
+			for _, p := range paths {
+				if spec.PathsOverlap(src, p) {
 					return true
 				}
 			}

@@ -102,8 +102,10 @@ func TestCancelDuringRecovery(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, name := range []string{"new-a", "new-b"} {
-				if err := j.add(Entry{Op: opContainer, Name: name}); err != nil {
-					t.Fatal(err)
+				for _, e := range []Entry{{Op: opContainer, Name: name}, {Op: opCreated, Name: name, ID: name}} {
+					if err := j.add(e); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 			j.close()

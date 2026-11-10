@@ -60,7 +60,11 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		}
 	}
 
-	// 停机：先登记再停，程序在任何时候被强制结束，下次运行都能恢复它们。
+	// 停机：先核对容器还是读的时候的样子（见 recheck），再登记、再停，程序在任何时候被强制结束，
+	// 下次运行都能恢复它们。
+	if err := r.recheck(ctx, col); err != nil {
+		return nil, 0, "", err
+	}
 	var stopList []StoppedContainer
 	var waves [][]StoppedContainer
 	all := append(append([]*item(nil), col.shared...), col.sel.items...)
