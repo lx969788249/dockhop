@@ -202,8 +202,13 @@ func TestFailureLogRecordsEnvironment(t *testing.T) {
 // 改别的文件的权限。HOME 没设置时按用户信息找，再找不到就停下说明。
 func TestDockhopHomeNotTmp(t *testing.T) {
 	e := &Env{Getenv: func(string) string { return "" }, HomeDir: func() (string, error) { return "", fmt.Errorf("$HOME is not defined") }}
-	if h, err := e.dockhopHome(); err == nil || strings.HasPrefix(h, os.TempDir()) {
-		t.Fatalf("取不到主目录时应停下：%q %v", h, err)
+	if h, err := e.dockhopHome(); err == nil || strings.HasPrefix(h, os.TempDir()) || !strings.Contains(err.Error(), "$HOME is not defined") {
+		t.Fatalf("取不到主目录时应停下，说明原因：%q %v", h, err)
+	}
+	// HOME 写的是相对路径时也要换成绝对路径：锁文件的路径记在临时容器的标签上，从别的目录运行也要认得出。
+	e.HomeDir = func() (string, error) { return "relhome", nil }
+	if h, err := e.dockhopHome(); err != nil || !filepath.IsAbs(h) {
+		t.Fatalf("应是绝对路径：%q %v", h, err)
 	}
 	t.Setenv("HOME", "")
 	if h, err := userHome(); err != nil || h == "" {

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/spec"
@@ -370,7 +371,7 @@ func usesData(c *docker.Container, vols map[string]bool, dirs []writeTarget) boo
 			}
 		case "bind":
 			for _, d := range dirs {
-				if spec.PathsOverlap(preflight.Normalize(m.Source), preflight.Normalize(d.path)) {
+				if spec.PathsOverlap(host.RealPath(m.Source), host.RealPath(d.path)) {
 					return true
 				}
 			}

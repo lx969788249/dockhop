@@ -162,27 +162,27 @@ func TestCompareVersions(t *testing.T) {
 
 // 接口 1.52 起，容器配置里不再写出用户指定的 MAC 地址（网络设置里的 MAC 自动分配的也有，看不出来）：
 // 迁出时按 1.51 的接口再问一次，补进原始配置，其他内容原样不动。老版本的 Docker 不用多问。
-func TestInspectContainerFullAddsFixedMAC(t *testing.T) {
+func TestInspectForRebuildAddsFixedMAC(t *testing.T) {
 	ctx := context.Background()
 	_, host := startFake(t, "1.56")
 	c, err := New(ctx, WithHost(host))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, raw, err := c.InspectContainerFull(ctx, "fixedmac")
+	_, raw, err := c.InspectForRebuild(ctx, "fixedmac")
 	var top struct{ Config map[string]any }
 	if err != nil || json.Unmarshal(raw, &top) != nil || top.Config["MacAddress"] != "02:42:ac:14:00:0a" ||
 		!strings.Contains(string(raw), `"FutureField":{"x":1}`) {
 		t.Fatalf("应在 Config 里补上用户指定的 MAC，其他原样不动：%s %v", raw, err)
 	}
-	if _, raw, err = c.InspectContainerFull(ctx, "web"); err != nil || strings.Contains(string(raw), "MacAddress") {
+	if _, raw, err = c.InspectForRebuild(ctx, "web"); err != nil || strings.Contains(string(raw), "MacAddress") {
 		t.Fatalf("没指定 MAC 的不补：%s %v", raw, err)
 	}
 	f, host := startFake(t, "1.43")
 	if c, err = New(ctx, WithHost(host)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := c.InspectContainerFull(ctx, "web"); err != nil || strings.Contains(strings.Join(f.paths, " "), "/v1.51/") {
+	if _, _, err := c.InspectForRebuild(ctx, "web"); err != nil || strings.Contains(strings.Join(f.paths, " "), "/v1.51/") {
 		t.Fatalf("老版本的 Docker 配置里本来就有，不用多问：%v %v", f.paths, err)
 	}
 }

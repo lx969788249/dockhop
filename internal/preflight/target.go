@@ -2,6 +2,7 @@ package preflight
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"strconv"
@@ -31,7 +32,8 @@ type Target struct {
 	ListenersOK   bool
 	HostIPs       map[string]bool // 本机的地址；为 nil 时不检查
 	Exists        func(path string) bool
-	HasContent    func(path string) bool // path 上已经有东西：文件、软链接，或者不是空的目录
+	HasContent    func(path string) bool              // path 上已经有东西：文件、软链接，或者不是空的目录
+	MountsUnder   func(path string) ([]string, error) // 挂在 path 里面的挂载点（见 host.MountsUnder）
 	Disk          func(path string) (host.Disk, error)
 	Pullable      func(ref string) bool
 }
@@ -59,8 +61,11 @@ type TargetNetwork struct {
 // hasContent 表示 path 上已经有东西：文件、软链接，或者不是空的目录。读不了的目录算有东西。
 func hasContent(path string) bool {
 	st, err := os.Lstat(path)
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		return false
+	}
+	if err != nil {
+		return true
 	}
 	if !st.IsDir() {
 		return true
@@ -86,9 +91,10 @@ func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, e
 		Runtimes: map[string]bool{}, VolumePlugins: map[string]bool{},
 		Containers: map[string]TargetContainer{},
 		Volumes:    map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{},
-		Exists:     func(p string) bool { _, err := os.Stat(p); return err == nil },
-		HasContent: hasContent,
-		Disk:       host.DiskOf,
+		Exists:      func(p string) bool { _, err := os.Stat(p); return err == nil },
+		HasContent:  hasContent,
+		MountsUnder: host.MountsUnder,
+		Disk:        host.DiskOf,
 	}
 	if t.DockerRoot == "" {
 		t.DockerRoot = "/var/lib/docker"

@@ -26,7 +26,7 @@ func (r *run) prepare(ctx context.Context) error {
 			helperBin = ""
 		}
 	}
-	r.vio = &volumeIO{dc: dc, image: r.helperImage, helperBin: helperBin, lock: lockPath(r.Home)}
+	r.vio = &volumeIO{dc: dc, image: r.helperImage(ctx), helperBin: helperBin, lock: lockPath(r.Home)}
 	r.undo.vio = r.vio
 
 	stopped := 0
@@ -129,7 +129,7 @@ func (r *run) backupProject(ctx context.Context, project string, list []docker.C
 	s, dc := r.Screen, r.Docker
 	var old []OldContainer
 	for _, c := range list {
-		full, raw, err := dc.InspectContainer(ctx, c.ID)
+		full, raw, err := dc.InspectForRebuild(ctx, c.ID) // 带上用户指定的 MAC 地址：回滚时原样重建
 		if err != nil {
 			return s.StepFailed("读取已有的 Compose 容器 "+c.Name()+" 失败", err.Error(), "")
 		}

@@ -13,6 +13,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/spec"
 	"github.com/lx969788249/dockhop/internal/ui"
@@ -266,9 +267,10 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		}
 		p := &projectInfo{u: u}
 		// 挂载目录记的是真实路径，项目目录本身是软链接时也按它的真实路径比较。
-		dir := u.workingDir
-		if real, err := filepath.EvalSymlinks(dir); err == nil {
-			dir = real
+		dir, err := projectDir(u.workingDir)
+		if err != nil {
+			return nil, screen.StepFailed("Compose 项目 "+u.project+" 没法迁移："+err.Error(), "",
+				"把项目目录改成普通目录（或者让它指向一个单独的目录）后重新运行，或者不迁移这个项目")
 		}
 		for _, b := range out.binds {
 			if b.path == dir || strings.HasPrefix(dir, b.path+"/") {
@@ -287,7 +289,8 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		}
 		files, unknown := compose.DeclaredFiles(cp)
 		for _, r := range files {
-			if spec.IsSystemPath(r) {
+			// 系统路径不迁移（新服务器上自己有）；本身是软链接、指向系统路径的也一样，打包的会是它指向的内容。
+			if spec.IsSystemPath(r) || spec.IsSystemPath(host.RealPath(r)) {
 				continue
 			}
 			p.outside = append(p.outside, r)
@@ -375,10 +378,7 @@ func sharesData(it *item, vols map[string]*volumeInfo, binds []*bindInfo) bool {
 			if spec.IsSystemPath(m.Source) {
 				continue
 			}
-			src := m.Source
-			if real, err := filepath.EvalSymlinks(src); err == nil {
-				src = real
-			}
+			src := host.RealPath(m.Source)
 			for _, b := range binds {
 				if spec.PathsOverlap(src, b.path) {
 					return true
@@ -387,6 +387,21 @@ func sharesData(it *item, vols map[string]*volumeInfo, binds []*bindInfo) bool {
 		}
 	}
 	return false
+}
+
+// projectDir 返回 Compose 项目目录的真实路径。项目目录可能经过软链接（例如指向数据盘），打包的是它
+// 指向的目录（见 walkRoot）；指向系统目录或者它自己的上级目录时返回错误：那样会把整个系统目录、
+// 或者别的项目和 DockHop 自己的文件一起打进迁移包。不经过软链接的照原样打包。
+func projectDir(workingDir string) (string, error) {
+	real := host.RealPath(workingDir)
+	if real == filepath.Clean(workingDir) {
+		return real, nil
+	}
+	parent := host.RealPath(filepath.Dir(workingDir))
+	if spec.IsSystemPath(real) || parent == real || strings.HasPrefix(parent, real+string(filepath.Separator)) {
+		return "", fmt.Errorf("项目目录 %s 经过软链接指向 %s（系统目录，或者它自己的上级目录），没法只打包这个项目", workingDir, real)
+	}
+	return real, nil
 }
 
 // treeSize 统计目录或文件的大小，和打包时一样，root 本身是软链接时统计它指向的内容（见 walkRoot）。

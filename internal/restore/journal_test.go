@@ -89,3 +89,46 @@ func TestJournalDamagedMiddleLine(t *testing.T) {
 		t.Fatalf("没有 op 的记录应算损坏：%v", err)
 	}
 }
+
+// 写日志时检查每种记录必须有的内容：缺了就报错，不写进日志，调用的地方也就不会接着动手；不认识的
+// 记录类型同样不写。
+func TestJournalChecksEntries(t *testing.T) {
+	j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.close()
+	for _, c := range []struct {
+		why string
+		e   Entry
+	}{
+		{"没有 Path", Entry{Op: opBind}},
+		{"原来就有，却没有备份", Entry{Op: opBind, Path: "/srv/data", Existed: true}},
+		{"没有 ID 和备份的名字", Entry{Op: opRename, Name: "web"}},
+		{"不认识的记录", Entry{Op: "bogus", Name: "x"}},
+	} {
+		if err := j.add(c.e); err == nil {
+			t.Errorf("%s：%+v 应该写不进去", c.why, c.e)
+		}
+	}
+	if err := j.add(Entry{Op: opBind, Path: "/srv/data", Existed: true, Backup: "/srv/.data.old"}); err != nil {
+		t.Fatalf("完整的记录应能写进去：%v", err)
+	}
+}
+
+// 日志里有这个版本不认识的记录（例如更新的版本写的）时，不能自动撤销：撤销时会悄悄跳过它，改动就
+// 永远留下了。和中间有损坏的记录一样，交给人工处理。
+func TestJournalUnknownOp(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "rb")
+	j, err := openJournal(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.close()
+	f, _ := os.OpenFile(journalPath(dir), os.O_APPEND|os.O_WRONLY, 0)
+	f.WriteString(`{"op":"from_the_future","name":"x"}` + "\n")
+	f.Close()
+	if _, err := readJournal(dir); !errors.Is(err, ErrJournalDamaged) {
+		t.Fatalf("不认识的记录应当作损坏处理：%v", err)
+	}
+}

@@ -173,20 +173,17 @@ func TestImageSources(t *testing.T) {
 	}
 }
 
-// 每种镜像都要给出能用来建容器的名字，恢复数据卷的临时容器靠它：以前按摘要固定的镜像
-// 在线补齐成功后没给名字，只有这种镜像又有数据卷时，迁入在恢复数据卷时失败。
-func TestLoadImagesChoosesHelper(t *testing.T) {
+// 按摘要固定的镜像：在线补齐成功时容器直接按摘要创建；补不齐、改用迁移包里的那份时，加载的
+// 镜像没有仓库清单、按摘要找不到，容器改用加上的名字创建。普通的镜像名照原样用。
+func TestLoadImagesNamesPinned(t *testing.T) {
 	digest := "alpine@sha256:" + strings.Repeat("a", 64)
 	cases := []struct {
 		name   string
-		refs   []string
 		pullOK bool
-		want   string
+		want   string // 按摘要固定的镜像改用的名字；为空表示照原样用
 	}{
-		{"只有按摘要固定的、在线补齐", []string{digest}, true, digest},
-		{"只有按摘要固定的、用迁移包里的", []string{digest}, false, "alpine:pinned-aaaaaaaaaaaa"},
-		{"混合", []string{"nginx:1.27", digest}, true, digest},
-		{"只有普通的", []string{"nginx:1.27"}, true, "nginx:1.27"},
+		{"在线补齐", true, ""},
+		{"用迁移包里的", false, "alpine:pinned-aaaaaaaaaaaa"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -202,7 +199,6 @@ func TestLoadImagesChoosesHelper(t *testing.T) {
 				case q.Method == "GET" && strings.HasSuffix(q.URL.Path, "/images/json"):
 					w.Write([]byte(`[]`))
 				case q.Method == "GET" && strings.Contains(q.URL.Path, "@sha256:") && !pulled:
-					// 加载的镜像没有仓库清单，按摘要找不到；拉下来以后才有。
 					http.Error(w, `{"message":"No such image"}`, http.StatusNotFound)
 				case q.Method == "GET" && strings.HasSuffix(q.URL.Path, "/json"):
 					w.Write([]byte(`{"Id":"sha256:` + strings.Repeat("b", 64) + `"}`))
@@ -213,20 +209,44 @@ func TestLoadImagesChoosesHelper(t *testing.T) {
 				}
 				return true
 			})
-			refs := map[string]string{}
-			for _, ref := range c.refs {
-				refs[ref] = "sha256:" + strings.Repeat("b", 64)
-			}
+			id := "sha256:" + strings.Repeat("b", 64)
 			var out bytes.Buffer
 			r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, dataDir: t.TempDir(), imageAs: map[string]string{},
-				m: &bundle.Manifest{Images: bundle.Images{Refs: refs}}, j: testJournal(t)}
+				m: &bundle.Manifest{Images: bundle.Images{Refs: map[string]string{digest: id, "nginx:1.27": id}}}, j: testJournal(t)}
 			if err := r.loadImages(context.Background()); err != nil {
 				t.Fatalf("%v\n%s", err, out.String())
 			}
-			if r.helperImage != c.want {
-				t.Errorf("临时容器用的镜像：%q，期望 %q", r.helperImage, c.want)
+			if got := r.imageAs[digest]; got != c.want {
+				t.Errorf("按摘要固定的镜像改用：%q，期望 %q", got, c.want)
+			}
+			if got := r.imageAs["nginx:1.27"]; got != "" {
+				t.Errorf("普通的镜像名被改成了 %q", got)
 			}
 		})
+	}
+}
+
+// 读写数据卷的临时容器用本机任何一个镜像来建（新服务器上可能一个容器都没有）：优先用名字，
+// 其次用“名字@摘要”，都没有时用 ID。以前只按摘要固定的镜像在线补齐以后没有名字，只有这种
+// 镜像又有数据卷时，迁入在恢复数据卷时失败。
+func TestAnyImage(t *testing.T) {
+	digest := "alpine@sha256:" + strings.Repeat("a", 64)
+	id := "sha256:" + strings.Repeat("b", 64)
+	untagged := docker.Image{ID: id, RepoTags: []string{"<none>:<none>"}, RepoDigests: []string{"<none>@sha256:" + strings.Repeat("c", 64)}}
+	cases := []struct {
+		name string
+		list []docker.Image
+		want string
+	}{
+		{"名字优先", []docker.Image{{ID: id, RepoDigests: []string{digest}}, {ID: id, RepoTags: []string{"nginx:1.27"}}}, "nginx:1.27"},
+		{"只有按摘要固定的", []docker.Image{untagged, {ID: id, RepoDigests: []string{digest}}}, digest},
+		{"没有名字也没有摘要", []docker.Image{untagged}, id},
+		{"一个镜像都没有", nil, ""},
+	}
+	for _, c := range cases {
+		if got := anyImage(c.list); got != c.want {
+			t.Errorf("%s：%q，期望 %q", c.name, got, c.want)
+		}
 	}
 }
 

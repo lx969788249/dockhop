@@ -3,6 +3,7 @@ package restore
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,15 +20,24 @@ import (
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
-// faultyDocker 是一个假 Docker：handle 决定每个请求怎么回答（返回 false 时回答 500），
+// noMounts 是没有任何单独挂载的目录时的 Deps.MountPoint。
+func noMounts(string) (bool, error) { return false, nil }
+
+// faultyDocker 是一个假 Docker（接口版本 1.44）：handle 决定每个请求怎么回答（返回 false 时回答 500），
 // 记下收到的每个请求。
 func faultyDocker(t *testing.T, handle func(w http.ResponseWriter, r *http.Request) bool) (*docker.Client, func() []string) {
+	t.Helper()
+	return faultyDockerAt(t, "1.44", handle)
+}
+
+// faultyDockerAt 和 faultyDocker 一样，只是接口版本是 api。
+func faultyDockerAt(t *testing.T, api string, handle func(w http.ResponseWriter, r *http.Request) bool) (*docker.Client, func() []string) {
 	t.Helper()
 	var mu sync.Mutex
 	var calls []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/version" {
-			w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
+			fmt.Fprintf(w, `{"Version":"29.0.0","ApiVersion":%q}`, api)
 			return
 		}
 		mu.Lock()
@@ -77,7 +87,7 @@ func prepareWith(t *testing.T, d preflight.Decisions, handle func(w http.Respons
 		plan:    &bundle.Plan{Containers: []bundle.PlanContainer{{Name: "kept"}, {Name: "new-app"}}},
 		m:       &bundle.Manifest{Containers: []bundle.Container{{Name: "kept"}, {Name: "new-app"}}, Binds: []bundle.Bind{{Path: shared}}},
 		dataDir: data, rbDir: filepath.Join(home, "rollback", "current"), anonVolumes: map[string]bundle.Volume{},
-		undo: &undo{dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
+		undo: &undo{mountPoint: noMounts, dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
 	err := r.decide(context.Background())
 	if err == nil {
 		err = r.begin()

@@ -244,6 +244,80 @@ func TestInBindIsMountPoint(t *testing.T) {
 	noLeftovers(t, home)
 }
 
+// 新服务器上要替换的目录里面还挂着别的磁盘：整个替换时挂在里面的会跟着挪进备份，提交后删备份会连
+// 那块盘上的东西一起删掉。迁入前停下说明，什么都不动；卸载之后用同一个链接再迁入就行。
+func TestInBindWithNestedMount(t *testing.T) {
+	p := fmt.Sprintf("dmtest_nm%d", os.Getpid())
+	t.Cleanup(func() { removePrefixed(p) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	data := filepath.Join(t.TempDir(), "data")
+	os.MkdirAll(data, 0o755)
+	os.WriteFile(filepath.Join(data, "app.txt"), []byte("migrated"), 0o644)
+	name := p + "_app"
+	sh(t, "docker", "run", "-d", "--name", name, "--label", noWatchtower, "-v", data+":/data", "alpine:3.20", "sleep", "600")
+	m := startOut(t, "--include", name)
+	removeAll(name)
+
+	media := filepath.Join(data, "media")
+	os.MkdirAll(media, 0o755)
+	sh(t, "mount", "-t", "tmpfs", "tmpfs", media)
+	t.Cleanup(func() { try("umount", media) })
+	os.WriteFile(filepath.Join(media, "photo.jpg"), []byte("on another disk"), 0o644)
+
+	home := t.TempDir()
+	out, code := m.in(t, home, nil)
+	if code == 0 {
+		t.Fatalf("目录里面挂着别的磁盘时不应迁入：\n%s", out)
+	}
+	mustContain(t, out, "目录 "+data+" 里面还挂着 "+media)
+	if b, _ := os.ReadFile(filepath.Join(media, "photo.jpg")); string(b) != "on another disk" {
+		t.Fatal("挂在里面的磁盘不应被动")
+	}
+	sh(t, "umount", media)
+	if out, code = m.in(t, home, nil); code != 0 {
+		t.Fatalf("卸载之后应能迁入：%d\n%s", code, out)
+	}
+	m.waitOutSuccess(t)
+	noLeftovers(t, home)
+}
+
+// 新服务器上这个路径本身是软链接（指向数据盘上的目录）：迁移过来的解到它指向的目录里，软链接留着。
+func TestInBindTargetIsLink(t *testing.T) {
+	p := fmt.Sprintf("dmtest_tl%d", os.Getpid())
+	t.Cleanup(func() { removePrefixed(p) })
+	sh(t, "docker", "pull", "-q", "alpine:3.20")
+	root := t.TempDir()
+	data := filepath.Join(root, "data")
+	os.MkdirAll(data, 0o755)
+	os.WriteFile(filepath.Join(data, "app.txt"), []byte("migrated"), 0o644)
+	name := p + "_app"
+	sh(t, "docker", "run", "-d", "--name", name, "--label", noWatchtower, "-v", data+":/data", "alpine:3.20", "sleep", "600")
+	m := startOut(t, "--include", name)
+	removeAll(name)
+
+	disk := filepath.Join(root, "disk", "data")
+	os.RemoveAll(data)
+	os.MkdirAll(disk, 0o755)
+	os.WriteFile(filepath.Join(disk, "old.txt"), []byte("old"), 0o644)
+	os.Symlink(disk, data)
+
+	home := t.TempDir()
+	if out, code := m.in(t, home, nil); code != 0 {
+		t.Fatalf("迁入应成功：%d\n%s", code, out)
+	}
+	if st, err := os.Lstat(data); err != nil || st.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("软链接应留着：%v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(disk, "app.txt")); string(b) != "migrated" {
+		t.Errorf("迁移过来的应在软链接指向的目录里：%v", dirFiles(t, disk))
+	}
+	if v := exec1(t, name, "cat /data/app.txt"); v != "migrated" {
+		t.Errorf("容器看到的数据：%q", v)
+	}
+	m.waitOutSuccess(t)
+	noLeftovers(t, home)
+}
+
 // 1Panel 的样子：应用和数据库是两个 Compose 项目，接在同一个外部网络上，应用的启动命令里写着
 // 数据库的服务名。应用的项目名排在前面，按名字顺序先启动它的话，它连不上数据库、一直在重启，
 // 健康检查过不了。要先启动数据库、等它就绪，再启动应用；日志里写明顺序和原因。

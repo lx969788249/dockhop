@@ -30,9 +30,24 @@ func TestRedact(t *testing.T) {
 		"abc 是普通文字":                                                                            "abc 是普通文字",
 		"MODE=production":                                                                      "MODE=production",
 	}
+	// 写法隐藏只在一行里：引号没有配对时遮到行末，不能把后面的日志吞掉（失败时最需要日志）；
+	// 值里转义的引号算在值里；值后面紧跟的中文标点和文字不算值。
+	for _, c := range []struct{ in, want string }{
+		{"-e \"DB_PASSWORD=abc\n后面这行日志要留着\nMODE=prod\"", "-e \"DB_PASSWORD=***\n后面这行日志要留着\nMODE=prod\""},
+		{"'DB_PASSWORD=abc\n后面这行日志要留着'", "'DB_PASSWORD=***\n后面这行日志要留着'"},
+		{`{"Env":["DB_PASSWORD=pa\"ss","MODE=prod"]}`, `{"Env":["DB_PASSWORD=***","MODE=prod"]}`},
+		{"\"Password\": \"abc\n后面这行日志要留着\"", "\"Password\": \"***\"\n后面这行日志要留着\""},
+		{"API_TOKEN=abc，后面是普通文字", "API_TOKEN=***，后面是普通文字"},
+	} {
+		cases[c.in] = c.want
+	}
 	for in, want := range cases {
-		if got := r.Redact(in); got != want {
+		got := r.Redact(in)
+		if got != want {
 			t.Errorf("Redact(%q)\n实际 %q\n期望 %q", in, got, want)
+		}
+		if again := r.Redact(got); again != got {
+			t.Errorf("隐藏过的再隐藏一次应不变：%q → %q", got, again)
 		}
 	}
 }

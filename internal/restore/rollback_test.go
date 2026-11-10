@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
@@ -106,7 +107,7 @@ func TestFileChangesRollBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u := &undo{screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+	u := &undo{mountPoint: noMounts, screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
 	if problems := u.rollback(context.Background(), entries); len(problems) > 0 {
 		t.Fatalf("还原有问题：%v", problems)
 	}
@@ -129,7 +130,7 @@ func bindStream(t *testing.T, dst string, mode int64, files map[string]string) s
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	base := strings.TrimPrefix(dst, "/")
-	tw.WriteHeader(&tar.Header{Name: base + "/", Typeflag: tar.TypeDir, Mode: mode})
+	tw.WriteHeader(&tar.Header{Name: base + "/", Typeflag: tar.TypeDir, Mode: mode, ModTime: migratedTime})
 	for _, n := range slices.Sorted(maps.Keys(files)) {
 		if strings.HasSuffix(n, "/") {
 			tw.WriteHeader(&tar.Header{Name: base + "/" + n, Typeflag: tar.TypeDir, Mode: 0o755})
@@ -146,6 +147,9 @@ func bindStream(t *testing.T, dst string, mode int64, files map[string]string) s
 	return dir
 }
 
+// migratedTime、originalTime 是迁移过来的目录、新服务器上原来的目录本身的修改时间。
+var migratedTime, originalTime = time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC), time.Date(2019, 5, 6, 7, 8, 9, 0, time.UTC)
+
 func dirNames(dir string) []string {
 	var names []string
 	entries, _ := os.ReadDir(dir)
@@ -157,8 +161,8 @@ func dirNames(dir string) []string {
 
 func bindRun(t *testing.T, root, dataDir string) *run {
 	t.Helper()
-	r := &run{Deps: Deps{Screen: ui.New(io.Discard, false, nil), Home: filepath.Join(root, "home"), Getenv: func(string) string { return "" }},
-		dataDir: dataDir}
+	r := &run{Deps: Deps{Screen: ui.New(io.Discard, false, nil), Home: filepath.Join(root, "home"), Getenv: func(string) string { return "" },
+		MountPoint: noMounts}, dataDir: dataDir}
 	j, err := openJournal(filepath.Join(root, "rb"))
 	if err != nil {
 		t.Fatal(err)
@@ -191,13 +195,82 @@ func TestRestoreBindJournalsStage(t *testing.T) {
 	}
 }
 
+// 判断不了目录是不是单独挂载的（读不到挂载信息）时停下说明，不动这个目录：猜错了，挂载点整个
+// 改名会报“设备忙”，普通目录也不该在里面换内容。
+func TestRestoreBindStopsWhenMountUnknown(t *testing.T) {
+	root := t.TempDir()
+	dst := filepath.Join(root, "world", "data")
+	os.MkdirAll(dst, 0o755)
+	os.WriteFile(filepath.Join(dst, "keep.txt"), []byte("old"), 0o600)
+	r := bindRun(t, root, bindStream(t, dst, 0o755, map[string]string{"new.txt": "migrated"}))
+	r.MountPoint = func(string) (bool, error) { return false, errors.New("读不到挂载信息") }
+	err := r.restoreBind(context.Background(), bundle.Bind{ID: "b1", Path: dst, Dir: true, Parts: 1})
+	if err == nil || !strings.Contains(err.Error(), "读不到挂载信息") {
+		t.Fatalf("应停下说明：%v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dst, "keep.txt")); string(b) != "old" || len(dirNames(filepath.Dir(dst))) != 1 {
+		t.Errorf("不应动这个目录：%v", dirNames(filepath.Dir(dst)))
+	}
+}
+
+// 新服务器上这个路径本身是软链接（例如指向数据盘上的目录）：迁移过来的解到它指向的目录里，软链接
+// 留着（以前软链接被换成了普通目录，数据写到了系统盘上）；回滚后它指向的目录和原来一样。
+func TestRestoreBindThroughTargetLink(t *testing.T) {
+	root := t.TempDir()
+	world := filepath.Join(root, "world")
+	real := filepath.Join(world, "disk", "data")
+	os.MkdirAll(real, 0o755)
+	os.WriteFile(filepath.Join(real, "keep.txt"), []byte("old data"), 0o600)
+	dst := filepath.Join(world, "data")
+	os.Symlink(real, dst)
+	before := snapshotTree(t, world)
+	r := bindRun(t, root, bindStream(t, dst, 0o755, map[string]string{"new.txt": "migrated"}))
+	if err := r.restoreBind(context.Background(), bundle.Bind{ID: "b1", Path: dst, Dir: true, Parts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Lstat(dst); err != nil || st.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("软链接应留着：%v %v", st, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(real, "new.txt")); string(b) != "migrated" {
+		t.Fatalf("迁移过来的应解到软链接指向的目录里：%v", dirNames(real))
+	}
+	r.j.close()
+	entries, err := readJournal(filepath.Join(root, "rb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := &undo{screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }, mountPoint: noMounts}
+	if problems := u.rollback(context.Background(), entries); len(problems) > 0 {
+		t.Fatal(problems)
+	}
+	if after := snapshotTree(t, world); after != before {
+		t.Fatalf("回滚后和原来不一样：\n原来：\n%s\n现在：\n%s", before, after)
+	}
+}
+
+// 新服务器上已经有指向迁移过来的目录的软链接：目录的路径经过软链接（例如 /srv 指向数据盘）时
+// 也算指对了。以前拿解析后的路径和原来的写法比，报“指向不对”，迁入停下。
+func TestRestoreLinkTargetThroughLink(t *testing.T) {
+	root := t.TempDir()
+	world := filepath.Join(root, "world")
+	os.MkdirAll(filepath.Join(world, "disk", "data"), 0o755)
+	os.Symlink(filepath.Join(world, "disk"), filepath.Join(world, "srv"))
+	target := filepath.Join(world, "srv", "data")
+	link := filepath.Join(world, "app-data")
+	os.Symlink(target, link)
+	r := bindRun(t, root, "")
+	if err := r.restoreLink(link, target); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // 留下来的临时目录：回滚时删掉，提交后清理回滚资料时也删掉。
 func TestStageRemoved(t *testing.T) {
 	for _, commit := range []bool{false, true} {
 		stage := filepath.Join(t.TempDir(), ".data.dockhop-stage-x")
 		os.MkdirAll(filepath.Join(stage, "srv", "data"), 0o700)
 		os.WriteFile(filepath.Join(stage, "srv", "data", "big"), []byte("big"), 0o600)
-		u := &undo{screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+		u := &undo{mountPoint: noMounts, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
 		entries := []Entry{{Op: opStage, Path: stage}}
 		if commit {
 			if left := u.cleanupCommitted(context.Background(), entries); len(left) > 0 {
@@ -223,12 +296,11 @@ func TestRestoreBindIntoMountPoint(t *testing.T) {
 	os.WriteFile(filepath.Join(dst, "keep.txt"), []byte("old data"), 0o600)
 	os.WriteFile(filepath.Join(dst, "same.txt"), []byte("old same"), 0o600)
 	os.Chmod(dst, 0o750)
+	os.Chtimes(dst, originalTime, originalTime)
 	before := snapshotTree(t, world)
-	saved := isMountPoint
-	isMountPoint = func(p string) bool { return p == dst }
-	t.Cleanup(func() { isMountPoint = saved })
-
+	mounted := func(p string) (bool, error) { return p == dst, nil }
 	r := bindRun(t, root, bindStream(t, dst, 0o700, map[string]string{"same.txt": "migrated", "new-sub/": ""}))
+	r.MountPoint = mounted
 	if err := r.restoreBind(context.Background(), bundle.Bind{ID: "b1", Path: dst, Dir: true, Parts: 1}); err != nil {
 		t.Fatal(err)
 	}
@@ -241,18 +313,24 @@ func TestRestoreBindIntoMountPoint(t *testing.T) {
 	if kept := dirNames(backups[0]); strings.Join(kept, ",") != "keep.txt,old-sub,same.txt" {
 		t.Fatalf("原来的内容应挪进备份目录：%v", kept)
 	}
+	if st.ModTime().UTC() != migratedTime {
+		t.Errorf("目录本身的修改时间应是迁移过来的：%v", st.ModTime().UTC())
+	}
 	r.j.close()
 	entries, err := readJournal(filepath.Join(root, "rb"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	u := &undo{screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+	u := &undo{screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }, mountPoint: mounted}
 	for i := 1; i <= 2; i++ {
 		if problems := u.rollback(context.Background(), entries); len(problems) > 0 {
 			t.Fatalf("第 %d 次回滚：%v", i, problems)
 		}
 		if after := snapshotTree(t, world); after != before {
 			t.Fatalf("第 %d 次回滚后和原来不一样：\n原来：\n%s\n现在：\n%s", i, before, after)
+		}
+		if st, _ := os.Stat(dst); st.ModTime().UTC() != originalTime {
+			t.Errorf("第 %d 次回滚后目录本身的修改时间应是原来的：%v", i, st.ModTime().UTC())
 		}
 	}
 }
@@ -267,6 +345,7 @@ func TestUndoContentsResumes(t *testing.T) {
 	}{
 		{"原来的挪了一半", map[string]string{"a": "old a"}, map[string]string{"same": "old same"}},
 		{"迁移过来的放了一半", map[string]string{"same": "new same", "c": "new c"}, map[string]string{"a": "old a", "same": "old same"}},
+		{"备份目录刚建好", want, map[string]string{}},
 		{"已经放回去了", want, nil},
 	} {
 		dst := filepath.Join(t.TempDir(), "data")
@@ -276,13 +355,15 @@ func TestUndoContentsResumes(t *testing.T) {
 			os.WriteFile(filepath.Join(dst, n), []byte(s), 0o600)
 		}
 		if c.inBackup != nil {
-			os.Mkdir(backup, 0o750)
+			os.Mkdir(backup, 0o700)
 			for n, s := range c.inBackup {
 				os.WriteFile(filepath.Join(backup, n), []byte(s), 0o600)
 			}
 		}
-		u := &undo{screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
-		e := Entry{Op: opBind, Path: dst, Existed: true, Backup: backup, Names: []string{"a", "same"}}
+		u := &undo{screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+			mountPoint: func(p string) (bool, error) { return p == dst, nil }}
+		e := Entry{Op: opBind, Path: dst, Existed: true, Backup: backup, Names: []string{"a", "same"},
+			Meta: &FileMeta{Mode: 0o750, UID: os.Getuid(), GID: os.Getgid(), MTime: originalTime.UnixNano()}}
 		for i := 1; i <= 2; i++ {
 			if problems := u.rollback(context.Background(), []Entry{e}); len(problems) > 0 {
 				t.Fatalf("%s，第 %d 次回滚：%v", c.name, i, problems)
@@ -296,8 +377,28 @@ func TestUndoContentsResumes(t *testing.T) {
 		if !maps.Equal(got, want) {
 			t.Errorf("%s：回滚后是 %v", c.name, got)
 		}
-		if st, _ := os.Stat(dst); c.inBackup != nil && st.Mode().Perm() != 0o750 {
-			t.Errorf("%s：目录本身的权限应改回原来的：%v", c.name, st.Mode())
+		if st, _ := os.Stat(dst); c.inBackup != nil && (st.Mode().Perm() != 0o750 || st.ModTime().UTC() != originalTime) {
+			t.Errorf("%s：目录本身的权限、修改时间应改回原来的：%v %v", c.name, st.Mode(), st.ModTime().UTC())
+		}
+	}
+}
+
+// 原地换过内容的目录，回滚时备份目录不在：可能是已经放回去了，也可能是数据盘没挂上（备份在盘上）。
+// 目录不是挂载点了就是没挂上：停下说明，保留回滚资料，不能当成已经放回（原来的服务会起在空目录上）。
+func TestUndoContentsDiskNotMounted(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "data")
+	os.MkdirAll(dst, 0o755)
+	e := Entry{Op: opBind, Path: dst, Existed: true, Backup: filepath.Join(dst, ".dockhop-old-x"), Names: []string{"a"},
+		Meta: &FileMeta{Mode: 0o750, UID: os.Getuid(), GID: os.Getgid()}}
+	for _, mounted := range []bool{true, false} {
+		u := &undo{screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+			mountPoint: func(string) (bool, error) { return mounted, nil }}
+		problems := u.rollback(context.Background(), []Entry{e})
+		if mounted && len(problems) > 0 {
+			t.Errorf("还挂着、备份已经放回去了：不应有问题：%v", problems)
+		}
+		if !mounted && (len(problems) == 0 || !strings.Contains(strings.Join(problems, "；"), "没挂上")) {
+			t.Errorf("数据盘没挂上时应停下说明：%v", problems)
 		}
 	}
 }
@@ -312,7 +413,7 @@ func TestRollbackStopsWhenDockerErrors(t *testing.T) {
 	os.MkdirAll(backup, 0o755)
 	os.WriteFile(filepath.Join(backup, "old.txt"), []byte("original"), 0o644)
 	var out bytes.Buffer
-	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
 	problems := u.rollback(context.Background(), []Entry{
 		{Op: opStart},
 		{Op: opBind, Path: dir, Existed: true, Backup: backup},
@@ -383,7 +484,7 @@ func sharedWriters(t *testing.T, stopOK bool) (r *run, dataReplacedWhileRunning 
 		}
 	}
 	r = &run{Deps: Deps{Docker: dc, Screen: screen}, j: j, rbDir: rb, shared: shared,
-		undo: &undo{dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
+		undo: &undo{mountPoint: noMounts, dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
 	if err := r.commit(context.Background()); err == nil {
 		t.Fatal("a 恢复失败时提交应失败")
 	}
@@ -469,7 +570,7 @@ func TestRollbackStopsRebuiltOldCompose(t *testing.T) {
 		tw.Close()
 		f.Close()
 		var out bytes.Buffer
-		u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+		u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
 			record: func(Entry) error { return nil }, vio: &volumeIO{dc: dc, image: "alpine", helperBin: "/unused"}}
 		problems := u.rollback(context.Background(), []Entry{
 			{Op: opComposeOld, Name: "stack", Old: []OldContainer{{ID: "old-app", Name: "stack-app-1", State: "running",
@@ -561,7 +662,7 @@ func TestRollbackAgainKeepsRebuiltOldCompose(t *testing.T) {
 	}
 	j.close()
 	var out bytes.Buffer
-	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
 		record: func(e Entry) error { return appendJournal(j.dir, e) }}
 	for i := 1; i <= 2; i++ { // 第二次：上次回滚做完了，回滚资料还没删
 		entries, err := readJournal(j.dir)
@@ -600,7 +701,7 @@ func TestRollbackRebuiltNotRecorded(t *testing.T) {
 		return true
 	})
 	var out bytes.Buffer
-	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
 		record: func(Entry) error { return errors.New("磁盘满了") }}
 	problems := u.rollback(context.Background(), []Entry{{Op: opComposeOld, Name: "stack", Old: []OldContainer{{ID: "old-app", Name: "stack-app-1", State: "running",
 		Raw: json.RawMessage(`{"Id":"old-app","Name":"/stack-app-1","Image":"sha256:original","Config":{"Image":"alpine"},"HostConfig":{}}`)}}}})
@@ -639,7 +740,7 @@ func TestRollbackRestoresVolumeOnce(t *testing.T) {
 	tw.Close()
 	f.Close()
 	var out bytes.Buffer
-	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
 		vio: &volumeIO{dc: dc, image: "alpine", helperBin: "/unused"}}
 	for i := 1; i <= 2; i++ {
 		if problems := u.rollback(context.Background(), []Entry{{Op: opVolume, Name: "data", Existed: true, Backup: backup}}); len(problems) > 0 {
@@ -684,7 +785,7 @@ func TestRollbackOldComposeNamespace(t *testing.T) {
 		return b
 	}
 	var out bytes.Buffer
-	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
 		record: func(Entry) error { return nil }}
 	// 原来是停着的：只重建，不启动。sidecar 排在前面，检查重建的顺序。
 	u.rollback(context.Background(), []Entry{{Op: opComposeOld, Name: "stack", Old: []OldContainer{
@@ -722,7 +823,7 @@ func TestUndoRenameResumes(t *testing.T) {
 			return true
 		})
 		var out bytes.Buffer
-		u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+		u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
 		problems := u.rollback(context.Background(), []Entry{{Op: opRename, Name: "web", ID: "old-web", Backup: "web.dockhop-backup-x",
 			Networks: json.RawMessage(`{"front":{"IPAMConfig":{"IPv4Address":"172.30.9.10"},"Aliases":["web"]}}`)}})
 		if len(problems) > 0 {
@@ -764,7 +865,7 @@ func TestUndoTag(t *testing.T) {
 		return true
 	})
 	var out bytes.Buffer
-	u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
 	problems := u.rollback(context.Background(), []Entry{
 		{Op: opTag, Name: "nginx:1.27", ID: "sha256:original"}, // 原来指向别的镜像
 		{Op: opTag, Name: "app:dev"},                           // 原来没有这个名字
@@ -841,7 +942,7 @@ func TestRollbackRestoresAcrossProjects(t *testing.T) {
 				entries = append(entries, Entry{Op: opComposeOld, Name: p, Old: []OldContainer{old[p]}})
 			}
 			var out bytes.Buffer
-			u := &undo{dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+			u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
 				record: func(Entry) error { return nil }}
 			problems := u.rollback(context.Background(), entries)
 			if len(problems) > 0 || strings.Join(events, "，") != "建 avpn-vpn-1，建 zside-sidecar-1，启动 avpn-vpn-1，启动 zside-sidecar-1" {
@@ -984,7 +1085,7 @@ func TestRollbackKeepsImagesThatWereThere(t *testing.T) {
 				d.ids[id] = true
 			}
 			var out bytes.Buffer
-			u := &undo{dc: d.docker(t), screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+			u := &undo{mountPoint: noMounts, dc: d.docker(t), screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
 			problems := u.rollback(context.Background(), append([]Entry{{Op: opImages, Names: c.had}}, c.entries...))
 			if len(problems) > 0 || !maps.Equal(d.tags, c.want) || strings.Join(d.deleted, ",") != c.deleted {
 				t.Fatalf("镜像名 %v，删掉的 %v，问题 %v", d.tags, d.deleted, problems)
@@ -1013,7 +1114,7 @@ func TestCleanupRemovesOldAnonymousVolumes(t *testing.T) {
 		w.WriteHeader(204)
 		return true
 	})
-	u := &undo{dc: dc, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
 	entries := []Entry{
 		{Op: opRename, Name: "web", ID: "old-web", Backup: "web.dockhop-backup-1"},
 		{Op: opComposeOld, Name: "stack", Old: []OldContainer{
@@ -1027,5 +1128,76 @@ func TestCleanupRemovesOldAnonymousVolumes(t *testing.T) {
 	want := "/containers/old-web?force=1&v=1 /volumes/anon1 /volumes/shared /images/dockhop-rollback:1?noprune=0"
 	if got := strings.Join(deleted, " "); got != want {
 		t.Fatalf("删掉了：%s\n应为：%s", got, want)
+	}
+}
+
+// 回滚时不管日志里怎么记的，都绝不整个删除一个挂载点（单独挂载的磁盘）：原地换内容的记录要是被
+// 当成整个改名的（例如以后有人改了路径的写法），先删再挪回的做法会把整块盘上的东西删掉。
+func TestUndoBindNeverRemovesMountPoint(t *testing.T) {
+	root := t.TempDir()
+	dst, old := filepath.Join(root, "data"), filepath.Join(root, ".data.dockhop-old-x")
+	for _, e := range []Entry{
+		{Op: opBind, Path: dst, Existed: true, Backup: old}, // 整个改名的记录
+		{Op: opBind, Path: dst},                             // 新建的目录
+	} {
+		os.MkdirAll(dst, 0o755)
+		os.WriteFile(filepath.Join(dst, "on-disk.txt"), []byte("disk data"), 0o644)
+		os.MkdirAll(old, 0o755)
+		u := &undo{screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+			mountPoint: func(p string) (bool, error) { return p == dst, nil }}
+		problems := u.rollback(context.Background(), []Entry{e})
+		if b, _ := os.ReadFile(filepath.Join(dst, "on-disk.txt")); string(b) != "disk data" || len(problems) == 0 {
+			t.Errorf("%+v：挂载点不能整个删除，要说明：%v", e, problems)
+		}
+	}
+}
+
+// 每一种记录都要写明约定（必须有的内容、只提交一部分时归哪边），回滚、提交后清理时也都要有着落：
+// 以后新加一种记录、忘了改哪一处，这里会失败，而不是回滚时悄悄跳过它、把改动永远留下。
+func TestEveryOpHandled(t *testing.T) {
+	dir := t.TempDir()
+	examples := map[Op]Entry{ // 每种记录一条完整的
+		opStart: {PID: 1}, opStop: {Name: "a", ID: "id-a", State: "running"},
+		opRename: {Name: "b", ID: "id-b", Backup: "b.dockhop-backup-1"}, opComposeOld: {Name: "p"},
+		opOldImages: {Name: "p"}, opVolume: {Name: "v"}, opStage: {Path: filepath.Join(dir, "stage")},
+		opBind: {Path: filepath.Join(dir, "bind")}, opLink: {Path: filepath.Join(dir, "link")},
+		opFile: {Path: filepath.Join(dir, "file")}, opMkdir: {Path: filepath.Join(dir, "mkdir")},
+		opNetwork: {Name: "n"}, opContainer: {Name: "c"}, opHelper: {Name: "dockhop-helper-x"},
+		opImages: {}, opTag: {Name: "app:1"}, opComposeUp: {Name: "p"}, opRebuilt: {Name: "p-app-1", ID: "id-r"},
+		opCommit: {},
+	}
+	var entries []Entry
+	for op, rule := range opRules {
+		e, ok := examples[op]
+		if !ok {
+			t.Errorf("%s 没有例子：新加的记录要在这里补一条", op)
+			continue
+		}
+		e.Op = op
+		if rule.check == nil || rule.partial == 0 || !rule.check(e) {
+			t.Errorf("%s 的约定不完整，或者例子不合约定", op)
+		}
+		entries = append(entries, e)
+	}
+	for op := range examples {
+		if _, ok := opRules[op]; !ok {
+			t.Errorf("%s 没有写在 opRules 里", op)
+		}
+	}
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		if strings.HasSuffix(req.URL.Path, "/json") && !strings.Contains(req.URL.Path, "/containers/") && !strings.Contains(req.URL.Path, "/images/") ||
+			strings.HasSuffix(req.URL.Path, "/containers/json") {
+			io.WriteString(w, "[]")
+		} else {
+			http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+		}
+		return true
+	})
+	u := &undo{dc: dc, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
+		mountPoint: noMounts, record: func(Entry) error { return nil }}
+	for _, p := range append(u.rollback(context.Background(), entries), u.cleanupCommitted(context.Background(), entries)...) {
+		if strings.Contains(p, "不认识") {
+			t.Error(p)
+		}
 	}
 }

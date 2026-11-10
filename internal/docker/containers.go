@@ -141,21 +141,26 @@ func (c *Client) InspectContainer(ctx context.Context, id string) (*Container, j
 	return &ct, raw, nil
 }
 
-// InspectContainerFull 和 InspectContainer 一样，只是原始配置里补上用户指定的 MAC 地址，迁出时读
-// 要迁移的容器用：接口 1.52 起配置里不再写出 MacAddress，网络设置里的 MAC 自动分配的也有，看不出
-// 哪个是用户指定的。按 1.51 的接口再问一次，有就补进 Config，其他内容原样不动；问不到时（以后的
-// Docker 不再支持 1.51）和不补一样。
-func (c *Client) InspectContainerFull(ctx context.Context, id string) (*Container, json.RawMessage, error) {
+// lastAPIWithConfigMAC 是读容器时配置里还写着 MacAddress（用户指定的 MAC 地址）的最后一个接口版本。
+// 从下一个版本（Docker 29）起只有网络设置里的 MAC，自动分配的也在那里，看不出哪个是用户指定的。
+const lastAPIWithConfigMAC = "1.51"
+
+// InspectForRebuild 读一个以后要原样重建的容器（迁出时要迁移的容器、迁入前要替换的原有容器）：
+// 和 InspectContainer 一样，只是原始配置里补上用户指定的 MAC 地址（见 lastAPIWithConfigMAC）。
+// 接口版本比它新时按它再问一次，有就补进 Config，其他内容原样不动；问不到时（以后的 Docker 不再
+// 支持这个版本）和不补一样。
+func (c *Client) InspectForRebuild(ctx context.Context, id string) (*Container, json.RawMessage, error) {
 	ct, raw, err := c.InspectContainer(ctx, id)
-	if err != nil || !c.AtLeast("1.52") {
-		return ct, raw, err
+	if err != nil || CompareVersions(c.api, lastAPIWithConfigMAC) <= 0 {
+		return ct, raw, err // 配置里本来就有
 	}
 	var old struct {
 		Config struct {
 			MacAddress string `json:"MacAddress"`
 		} `json:"Config"`
 	}
-	if c.do(ctx, http.MethodGet, "/v1.51/containers/"+url.PathEscape(id)+"/json", nil, nil, "", &old) != nil || old.Config.MacAddress == "" {
+	path := "/v" + lastAPIWithConfigMAC + "/containers/" + url.PathEscape(id) + "/json"
+	if c.do(ctx, http.MethodGet, path, nil, nil, "", &old) != nil || old.Config.MacAddress == "" {
 		return ct, raw, nil
 	}
 	var top map[string]json.RawMessage

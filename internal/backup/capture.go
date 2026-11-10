@@ -17,6 +17,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/helper"
+	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/spec"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -231,10 +232,7 @@ func (c *cleanupReader) Close() error {
 // 数据盘上的 /data/app）遍历它指向的内容：WalkDir 不进入软链接，以前项目目录什么都没打包。fn 收到
 // 两个路径：按 root 写的（名字、给人看的都用它），和真实的（读文件用）。
 func walkRoot(root string, fn func(p, real string, d fs.DirEntry, err error) error) error {
-	resolved, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		resolved = root
-	}
+	resolved := host.RealPath(root)
 	return filepath.WalkDir(resolved, func(p string, d fs.DirEntry, err error) error {
 		return fn(root+strings.TrimPrefix(p, resolved), p, d, err)
 	})

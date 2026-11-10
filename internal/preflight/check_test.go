@@ -38,7 +38,8 @@ func testTarget() *Target {
 		Runtimes: map[string]bool{"runc": true}, Containers: map[string]TargetContainer{},
 		Volumes: map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{},
 		ListenersOK: true, Exists: func(string) bool { return true }, HasContent: func(string) bool { return false },
-		Disk: func(string) (host.Disk, error) { return host.Disk{Path: "/", Free: 100 << 30, Dev: 1}, nil },
+		Disk:        func(string) (host.Disk, error) { return host.Disk{Path: "/", Free: 100 << 30, Dev: 1}, nil },
+		MountsUnder: func(string) ([]string, error) { return nil, nil },
 	}
 }
 
@@ -258,7 +259,7 @@ func TestEvaluateStops(t *testing.T) {
 	p.Containers[0].GPU = true
 	p.Containers[0].Devices = []string{"/dev/ttyUSB0"}
 	tg.Exists = func(string) bool { return false }
-	r := Evaluate(p, tg, &Decisions{}, Options{Home: "/root/.dockhop"})
+	r := Evaluate(p, tg, &Decisions{}, Options{Home: "/root/.dockhop", LocalWork: func(Writes, *Target) []string { return []string{"放目录"} }})
 	got := strings.Join(kinds(r, Stop), ",")
 	for _, want := range []string{"arch", "compose", "remote_docker", "gpu", "device", "bind_home"} {
 		if !strings.Contains(got, want) {
@@ -267,34 +268,36 @@ func TestEvaluateStops(t *testing.T) {
 	}
 }
 
-// Docker 不在这台服务器上时，替换已有的数据卷（包括写进匿名卷：新建的匿名卷里有镜像带的文件）要先
-// 清空，清空要把本机的程序放进临时容器，做不到：没有目录和项目也要在下载之前停下。只写进新建的
-// 有名字的卷不用清空，不停。
-func TestEvaluateRemoteDockerVolumes(t *testing.T) {
-	const anon = "3977206abb71f8aa4677d89b605e71e99ae3db6773688b6f62e61fbbadf9c34c"
-	for _, c := range []struct {
-		name     string
-		existing bool   // 新服务器上已经有 data 这个卷
-		volume   string // web 用的卷
-		stop     bool
-	}{
-		{"替换已有的卷", true, "data", true},
-		{"写进匿名卷", false, anon, true},
-		{"新建的卷", false, "data", false},
-	} {
-		p := testPlan()
-		p.Containers = p.Containers[:1] // 只有 web：没有 Compose 项目
-		p.Containers[0].Volumes = []string{c.volume}
-		p.Volumes = []bundle.PlanVolume{{Name: c.volume, Driver: "local", Bytes: 1 << 20}}
-		tg := testTarget()
-		tg.Local = false
-		if c.existing {
-			tg.Volumes["data"] = &docker.Volume{Name: "data", Driver: "local"}
-		}
-		i := find(Evaluate(p, tg, &Decisions{}, Options{}), "remote_docker")
-		if got := i != nil && i.Level == Stop; got != c.stop {
-			t.Errorf("%s：应停下 %v，实际 %+v", c.name, c.stop, i)
-		}
+// Docker 不在这台服务器上时，按迁入给出的“只能在 Docker 所在的机器上做的事”在下载之前停下。交给它的
+// 是按眼下的选择真正要写的东西：跳过的容器独占的目录、保留的卷不算。
+func TestEvaluateRemoteDocker(t *testing.T) {
+	p := testPlan()
+	p.Containers = append(p.Containers, bundle.PlanContainer{Name: "cron", State: "running", Image: "busybox", Volumes: []string{"cache"}, Binds: []string{"/srv/cron"}})
+	p.Containers[0].Binds = []string{"/srv/web"}
+	p.Volumes = append(p.Volumes, bundle.PlanVolume{Name: "cache", Driver: "local"})
+	p.Binds = []bundle.PlanBind{{Path: "/srv/web"}, {Path: "/srv/cron"}}
+	d := &Decisions{SkipContainers: []string{"cron"}, KeepVolumes: []string{"data"}}
+	var got []Writes
+	o := Options{LocalWork: func(w Writes, _ *Target) []string {
+		got = append(got, w)
+		return []string{"放目录", "放 Compose 项目文件"}
+	}}
+	tg := testTarget()
+	if i := find(Evaluate(p, tg, d, o), "remote_docker"); i != nil || len(got) > 0 {
+		t.Fatalf("Docker 在本机时不用问：%+v %v", i, got)
+	}
+	tg.Local = false
+	i := find(Evaluate(p, tg, d, o), "remote_docker")
+	if i == nil || i.Level != Stop || !strings.Contains(i.Title, "放目录、放 Compose 项目文件") {
+		t.Fatalf("应停下并说明要做的事：%+v", i)
+	}
+	want := Writes{Binds: []string{"/srv/web"}, Projects: []string{"site"}}
+	if len(got) != 1 || !slices.Equal(got[0].Binds, want.Binds) || !slices.Equal(got[0].Projects, want.Projects) || len(got[0].Volumes) != 0 {
+		t.Errorf("交给迁入的：%+v，应为 %+v", got, want)
+	}
+	o.LocalWork = func(Writes, *Target) []string { return nil }
+	if i := find(Evaluate(p, tg, d, o), "remote_docker"); i != nil {
+		t.Errorf("没有只能在本机做的事，不用停：%+v", i)
 	}
 }
 
@@ -693,9 +696,49 @@ func TestHasContent(t *testing.T) {
 	os.WriteFile(filepath.Join(full, "a"), nil, 0o644)
 	os.WriteFile(file, nil, 0o644)
 	os.Symlink(empty, link)
-	for path, want := range map[string]bool{empty: false, full: true, file: true, link: true, filepath.Join(dir, "none"): false} {
+	// 读不了的（没有权限进到它所在的目录）也算有东西：宁可多提示一句。
+	locked := filepath.Join(dir, "locked")
+	os.Mkdir(locked, 0o755)
+	os.Mkdir(filepath.Join(locked, "inner"), 0o755)
+	os.Chmod(locked, 0)
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+	cases := map[string]bool{empty: false, full: true, file: true, link: true, filepath.Join(dir, "none"): false}
+	if os.Geteuid() != 0 {
+		cases[filepath.Join(locked, "inner")] = true
+	}
+	for path, want := range cases {
 		if got := hasContent(path); got != want {
 			t.Errorf("hasContent(%s) = %v", filepath.Base(path), got)
+		}
+	}
+}
+
+// 新服务器上要替换的目录里面还挂着别的磁盘：整个替换时，挂在里面的会跟着挪进备份，提交后删备份
+// 会连那块盘上的东西一起删掉（原地换内容时也会碰到）。迁入前停下说明；读不到挂载信息时也停下。
+func TestEvaluateNestedMounts(t *testing.T) {
+	p := testPlan()
+	p.Containers[0].Binds = []string{"/srv/web"}
+	p.Binds = []bundle.PlanBind{{Path: "/srv/web", Bytes: 1 << 20}}
+	for _, c := range []struct {
+		name  string
+		inner []string
+		err   error
+		stop  bool
+	}{
+		{"里面挂着别的磁盘", []string{"/srv/web/media"}, nil, true},
+		{"读不到挂载信息", nil, fmt.Errorf("读不到挂载信息"), true},
+		{"里面没有挂别的", nil, nil, false},
+	} {
+		tg := testTarget()
+		tg.MountsUnder = func(path string) ([]string, error) {
+			if path == "/srv/web" {
+				return c.inner, c.err
+			}
+			return nil, nil
+		}
+		i := find(Evaluate(p, tg, &Decisions{}, Options{}), "nested_mount")
+		if got := i != nil && i.Level == Stop; got != c.stop {
+			t.Errorf("%s：应停下 %v，实际 %+v", c.name, c.stop, i)
 		}
 	}
 }

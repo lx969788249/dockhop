@@ -58,6 +58,8 @@ type Deps struct {
 	Home     string
 	Version  string
 	Getenv   func(string) string
+	// MountPoint 判断一个目录本身是不是挂载点（见 host.IsMountPoint）：挂载点只能原地换内容。
+	MountPoint func(path string) (bool, error)
 	// Succeeded 在迁入成功（已经提交，不会再回滚）时调用一次，Failed 在迁入失败（包括只迁入了
 	// 一部分）时调用一次，都可以为空；还没改动就取消、按 Ctrl+C 中断时都不调用（见 ending）。
 	// 之后还有收尾：回滚、删除临时文件、通知旧服务器、显示结果。
@@ -89,7 +91,6 @@ type run struct {
 	anonVolumes map[string]bundle.Volume // 旧的匿名卷编号 → 迁移包里的数据
 	imageAs     map[string]string        // 镜像名 → 实际使用的镜像名（digest 改用迁移包里的镜像时）
 	images      map[string]imageSource   // 镜像文件 → 镜像从哪里来（见 images.go）；nil 表示还没决定
-	helperImage string                   // 创建临时容器用的镜像（名字）
 
 	j       *Journal
 	rbDir   string
@@ -170,7 +171,7 @@ func (r *run) steps(ctx context.Context) error {
 		return s.StepFailed("读取 Docker 信息失败", err.Error(), "")
 	}
 	r.info = info
-	r.undo = &undo{dc: r.Docker, screen: s, logf: r.Log.Printf, fail: r.testFail,
+	r.undo = &undo{dc: r.Docker, screen: s, logf: r.Log.Printf, fail: r.testFail, mountPoint: r.MountPoint,
 		record:   func(e Entry) error { return appendJournal(r.rbDir, e) },
 		defaults: spec.SourceDefaults{CgroupVersion: info.CgroupVersion, LoggingDriver: info.LoggingDriver, DefaultRuntime: info.DefaultRuntime}}
 	summary := "Docker " + info.ServerVersion

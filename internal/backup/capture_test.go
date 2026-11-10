@@ -127,3 +127,46 @@ func TestHostTarFollowsLinkedRoots(t *testing.T) {
 		t.Errorf("项目目录的大小：%d", size)
 	}
 }
+
+// 项目目录本身是软链接时，打包的是它指向的目录：指向系统目录或者它自己的上级目录时不能这样打包
+// （会把整个系统目录、或者别的项目和 DockHop 自己的文件一起打进去），要停下说明。
+func TestProjectDirLinkGuard(t *testing.T) {
+	root := t.TempDir()
+	apps := filepath.Join(root, "apps")
+	os.MkdirAll(filepath.Join(root, "disk", "app"), 0o755)
+	os.MkdirAll(apps, 0o755)
+	for name, target := range map[string]string{"ok": filepath.Join(root, "disk", "app"), "parent": apps, "system": "/usr"} {
+		link := filepath.Join(apps, name)
+		os.Symlink(target, link)
+		_, err := projectDir(link)
+		if (name == "ok") != (err == nil) {
+			t.Errorf("%s：%v", name, err)
+		}
+	}
+	if real, err := projectDir(filepath.Join(root, "disk", "app")); err != nil || !strings.HasSuffix(real, filepath.Join("disk", "app")) {
+		t.Errorf("普通目录：%s %v", real, err)
+	}
+	// 不经过软链接的项目目录照原样打包，哪怕它是系统目录（例如 compose.yml 直接放在 /root 下）。
+	if real, err := projectDir("/usr"); err != nil || real != "/usr" {
+		t.Errorf("普通的系统目录：%s %v", real, err)
+	}
+}
+
+// DockHop 自己的目录在项目目录（软链接）指向的目录里时，也要排除：按真实路径比较。
+func TestOwnDirsThroughLink(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "disk", "app")
+	home := filepath.Join(real, ".dockhop")
+	os.MkdirAll(filepath.Join(home, "work", "out-1"), 0o755)
+	os.WriteFile(filepath.Join(real, "compose.yml"), []byte("services: {}\n"), 0o644)
+	link := filepath.Join(root, "app")
+	os.Symlink(real, link)
+	r := &run{Deps: Deps{Home: home}, workdir: filepath.Join(home, "work", "out-1")}
+	var buf bytes.Buffer
+	if err := (hostTar{ctx: context.Background(), roots: []string{link}, base: link, excludes: r.ownDirs(link), logf: t.Logf}).write(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), ".dockhop") {
+		t.Errorf("DockHop 自己的目录不应打进迁移包：%v", r.ownDirs(link))
+	}
+}

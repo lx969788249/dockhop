@@ -51,8 +51,11 @@ func (r *run) waitReady(ctx context.Context, it *citem) error {
 	for {
 		w.see(c)
 		elapsed := time.Since(since)
-		switch {
-		case c.State.Status == "exited" || c.State.Status == "dead":
+		switch p := phaseOf(c); {
+		case p == phaseDone:
+			r.Log.Printf("容器 %s 正常做完退出了（退出码 0），Docker 也没有重启它：是一次性的任务，算正常", name)
+			return nil
+		case p == phaseStopped:
 			how := "启动后退出了"
 			if elapsed < 10*time.Second {
 				how = "启动后马上退出了"
@@ -247,28 +250,71 @@ func (r *run) confirmReady(ctx context.Context) error {
 			if !it.running() {
 				continue
 			}
-			c, _, err := r.Docker.InspectContainer(docker.Quiet(ctx), it.newID)
+			c, err := r.inspectRetry(ctx, it.newID)
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			problem := ""
+			var fail error
 			switch {
 			case err != nil:
-				problem = fmt.Sprintf("就绪之后读不到了：%v", err)
-			case c.State.Status == "restarting":
-				problem = "就绪之后又退出了，Docker 正在重启它（" + exitInfo(c) + "）"
-			case c.State.Status != "running" && c.State.Status != "paused":
-				problem = "就绪之后又停了（" + exitInfo(c) + "）"
-			case c.State.Health != nil && c.State.Health.Status == "unhealthy":
-				problem = "就绪之后健康检查又没通过"
+				fail = r.notReady(ctx, it, fmt.Sprintf("容器 %s 就绪之后读不到了：%v", it.m.Name, err))
+			case phaseOf(c) == phaseStopped:
+				fail = r.notReady(ctx, it, "容器 "+it.m.Name+" 就绪之后又停了（"+exitInfo(c)+"）")
+			case phaseOf(c) == phaseWaiting:
+				// 在重启、不健康：和等它就绪时一样接着等，从现在重新算时间。可能只是重启了一下。
+				it.startedAt = time.Time{}
+				if fail = r.waitReady(ctx, it); fail != nil && ctx.Err() != nil {
+					return ctx.Err()
+				}
 			}
-			if problem != "" {
-				err := r.notReady(ctx, it, "容器 "+it.m.Name+" "+problem)
-				r.groupFailed(g, err.Error(), groupHint(err))
+			if fail != nil {
+				r.groupFailed(g, fail.Error(), groupHint(fail))
 			}
 		}
 	}
 	return nil
+}
+
+// inspectRetry 读容器的状态，Docker 偶尔回不了话时隔一秒重试，最多三次。
+func (r *run) inspectRetry(ctx context.Context, id string) (*docker.Container, error) {
+	var err error
+	for i := 0; i < 3; i++ {
+		var c *docker.Container
+		if c, _, err = r.Docker.InspectContainer(docker.Quiet(ctx), id); err == nil || docker.IsNotFound(err) {
+			return c, err
+		}
+		if sleep(ctx, time.Second) != nil {
+			break
+		}
+	}
+	return nil, err
+}
+
+// phase 是容器眼下处在哪个阶段：等它就绪（waitReady）和提交前复查（confirmReady）都按它判断。
+type phase int
+
+const (
+	// phaseUp：在运行（健康检查没判它不健康），或者暂停着。
+	phaseUp phase = iota + 1
+	// phaseDone：自己正常做完退出了（退出码 0），Docker 也没有重启它（要重启的，状态会是
+	// “正在重启”）：一次性的任务，算正常。
+	phaseDone
+	// phaseStopped：退出了（退出码不是 0），或者坏了。
+	phaseStopped
+	// phaseWaiting：在重启、被判不健康、刚创建，要接着等。
+	phaseWaiting
+)
+
+func phaseOf(c *docker.Container) phase {
+	switch s := c.State.Status; {
+	case s == "exited" && c.State.ExitCode == 0:
+		return phaseDone
+	case s == "exited" || s == "dead":
+		return phaseStopped
+	case s == "paused", s == "running" && (c.State.Health == nil || c.State.Health.Status != "unhealthy"):
+		return phaseUp
+	}
+	return phaseWaiting
 }
 
 // notReady 是容器没能就绪的报错。容器最后的输出写进日志，报错里接上最能说明问题的一行；

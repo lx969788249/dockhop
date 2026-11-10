@@ -16,6 +16,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/backup"
 	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/restore"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -90,10 +91,13 @@ func (e *Env) dockhopHome() (string, error) {
 		return h, nil
 	}
 	home, err := e.HomeDir()
-	if err != nil || home == "" {
-		return "", errors.New("找不到当前用户的主目录")
+	if err == nil && home == "" {
+		err = errors.New("是空的")
 	}
-	return filepath.Join(home, ".dockhop"), nil
+	if err != nil {
+		return "", fmt.Errorf("找不到当前用户的主目录：%v", err)
+	}
+	return filepath.Abs(filepath.Join(home, ".dockhop"))
 }
 
 const helpText = `DockHop：只需两步，完整迁移你的 Docker。
@@ -274,7 +278,7 @@ func runIn(env *Env, opts InOptions) error {
 	wait := func() {} // 迁入成功、失败时发出的计数，退出前等它结束
 	err = restore.Run(env.Context, restore.Deps{
 		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
-		Home: t.home, Version: env.Version, Getenv: env.Getenv,
+		Home: t.home, Version: env.Version, Getenv: env.Getenv, MountPoint: host.IsMountPoint,
 		Succeeded: func() { wait = countSucceeded(env) },
 		Failed:    func() { wait = countFailed(env) },
 	}, restore.Options{Link: link, Yes: opts.Yes, Existing: opts.Existing, KeepSucceeded: opts.KeepSucceeded})

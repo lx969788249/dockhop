@@ -201,7 +201,7 @@ type quietKey struct{}
 // 状态的变化。出错照常记。
 func Quiet(ctx context.Context) context.Context { return context.WithValue(ctx, quietKey{}, true) }
 
-// do 发出请求。path 以 / 开头且不含版本前缀时原样请求；body 为 io.Reader 时
+// do 发出请求。path 原样请求，不会加上接口版本的前缀（要加用 versioned）；body 为 io.Reader 时
 // 原样发送，否则编码成 JSON；out 为 *json.RawMessage、*[]byte 或其他结构体。
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, body any, contentType string, out any) error {
 	resp, err := c.send(ctx, method, path, q, body, contentType)

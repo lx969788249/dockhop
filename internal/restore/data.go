@@ -22,9 +22,6 @@ import (
 // 恢复数据：数据卷、目录（连同软链接）、Compose 项目文件。写之前先把原来的备份好、记进事务日志，
 // 文件操作见 files.go，读写数据卷见 volumes.go。
 
-// isMountPoint 判断一个目录本身是不是挂载点（测试时换掉）。
-var isMountPoint = host.IsMountPoint
-
 func (r *run) restoreData(ctx context.Context) error {
 	s, dc := r.Screen, r.Docker
 	vols, binds := r.dataTargets()
@@ -74,7 +71,7 @@ func (r *run) restoreData(ctx context.Context) error {
 		rc := bundle.OpenStream(r.dataDir, "volumes/"+v.Name, v.Parts)
 		p := s.StartProgress("卷 "+v.Name, v.Bytes, "")
 		var werr error
-		if existed {
+		if mustClear(v.Name, existed) {
 			werr = r.vio.replace(ctx, v.Name, io.TeeReader(rc, p))
 		} else {
 			werr = r.vio.write(ctx, v.Name, io.TeeReader(rc, p))
@@ -164,16 +161,39 @@ func (r *run) saveVolume(ctx context.Context, name, path string) error {
 }
 
 func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
-	parent := filepath.Dir(b.Path)
+	// 新服务器上这个路径本身是软链接时（例如指向数据盘上的目录），解到它指向的地方，软链接留着：
+	// 换掉软链接，数据就写到系统盘上了。
+	dst := b.Path
+	if st, err := os.Lstat(b.Path); err == nil && st.Mode()&os.ModeSymlink != 0 {
+		real, err := filepath.EvalSymlinks(b.Path)
+		if err != nil {
+			return fmt.Errorf("新服务器上的 %s 是软链接，但它指向的地方不在了：%v", b.Path, err)
+		}
+		dst = real
+	}
+	// 单独挂载的目录（例如一块数据盘）不能改名，只能在原地换里面的内容（见 replaceContents），
+	// 解压也解在它里面：和它在同一块盘上。判断不了时不动它：选错了办法，挂载点改名会失败，
+	// 普通目录也不该在里面换。
+	inPlace := false
+	if b.Dir {
+		mp, err := r.MountPoint(dst)
+		if err != nil {
+			return fmt.Errorf("没法判断 %s 是不是单独挂载的目录：%v", dst, err)
+		}
+		inPlace = mp
+	}
+	parent := filepath.Dir(dst)
 	if err := r.mkdirAll(parent, 0o755); err != nil {
 		return err
 	}
-	// 单独挂载的目录（例如一块数据盘）不能改名，只能在原地换里面的内容（见 replaceContents），
-	// 解压也解在它里面：和它在同一块盘上。
-	inPlace := b.Dir && isMountPoint(b.Path)
-	stage := siblingName(b.Path, "stage")
+	stage := siblingName(dst, "stage")
+	var contents Entry // 原地换内容时，日志里记着原来有哪些东西的那一条
 	if inPlace {
-		stage = innerName(b.Path, "stage")
+		stage = innerName(dst, "stage")
+		var err error
+		if contents, err = r.recordContents(dst); err != nil {
+			return err
+		}
 	}
 	// 解压用的临时目录先记进日志：程序被强制结束时它会留下来，回滚时删掉。
 	if err := r.j.add(Entry{Op: opStage, Path: stage}); err != nil {
@@ -204,9 +224,9 @@ func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
 		return fmt.Errorf("迁移包里的 %s 是软链接，拒绝使用", b.Path)
 	}
 	if inPlace {
-		err = r.replaceContents(stage, staged, b.Path)
+		err = r.replaceContents(contents, stage, staged)
 	} else {
-		err = r.replaceDir(staged, b.Path)
+		err = r.replaceDir(staged, dst)
 	}
 	if err != nil {
 		return err
@@ -227,7 +247,7 @@ func (r *run) restoreLink(link, target string) error {
 	}
 	if st, err := os.Lstat(link); err == nil {
 		if st.Mode()&os.ModeSymlink != 0 {
-			if cur, _ := filepath.EvalSymlinks(link); cur == target {
+			if host.RealPath(link) == host.RealPath(target) {
 				return nil
 			}
 			dest, _ := os.Readlink(link)

@@ -7,16 +7,51 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/helper"
+	"github.com/lx969788249/dockhop/internal/spec"
 )
 
 // 数据卷的读写都通过临时容器和 Docker 接口完成，不需要 alpine 之类的辅助镜像：
 //   - 读、写：创建一个不启动的临时容器挂载这个卷，用“容器文件归档”接口读出或写入；
 //   - 清空：接口没有删除文件的功能，所以启动一个临时容器，在里面运行 DockHop 自己
 //     （程序是静态编译的，任何镜像里都能运行）来删除卷里的文件。
+
+// helperImage 挑一个本机的镜像来建读写数据卷的临时容器（见 anyImage）；一个都没有时为空。
+func (r *run) helperImage(ctx context.Context) string {
+	list, err := r.Docker.Images(ctx)
+	if err != nil {
+		return ""
+	}
+	return anyImage(list)
+}
+
+// anyImage 从本机的镜像里挑一个：临时容器只用来挂上数据卷、放进 DockHop 程序，哪个镜像都行。
+// 优先用名字，其次用“名字@摘要”（按 ID 创建时 containerd 存储会给多平台镜像选错平台），
+// 都没有时用 ID；一个镜像都没有时为空。
+func anyImage(list []docker.Image) string {
+	for _, im := range list {
+		for _, tag := range im.RepoTags {
+			if tag != "<none>:<none>" {
+				return tag
+			}
+		}
+	}
+	for _, im := range list {
+		for _, d := range im.RepoDigests {
+			if !strings.HasPrefix(d, "<none>@") {
+				return d
+			}
+		}
+	}
+	if len(list) > 0 {
+		return list[0].ID
+	}
+	return ""
+}
 
 type volumeIO struct {
 	dc        *docker.Client
@@ -115,6 +150,11 @@ func (v *volumeIO) replace(ctx context.Context, volume string, r io.Reader) erro
 	}
 	return v.write(ctx, volume, r)
 }
+
+// mustClear 表示写进卷之前要不要先清空：已有的卷要清空，匿名卷也要（新容器创建时 Docker 新建的
+// 匿名卷里可能有镜像带的文件，见 transplantAnonymous）。清空要把本机的 DockHop 程序放进临时容器
+// （见 clear），Docker 不在本机时做不到（见 localWork）。
+func mustClear(volume string, existed bool) bool { return existed || spec.IsAnonymousVolume(volume) }
 
 // helperPath 是复制给临时容器挂载的 DockHop 程序（见 prepareHelper）。
 func helperPath(home string) string { return filepath.Join(home, "bin", "dockhop-helper") }

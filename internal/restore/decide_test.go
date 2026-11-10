@@ -128,7 +128,7 @@ func TestReplaceFollowsProject(t *testing.T) {
 				plan:    &bundle.Plan{Containers: plan},
 				m:       &bundle.Manifest{Containers: containers, Projects: []bundle.Project{{Name: "site", WorkingDir: filepath.Join(home, "site")}}},
 				dataDir: data, rbDir: filepath.Join(home, "rollback", "current"), anonVolumes: map[string]bundle.Volume{},
-				undo: &undo{dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
+				undo: &undo{mountPoint: noMounts, dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
 			ctx := context.Background()
 			err := r.decide(ctx)
 			if err == nil {
@@ -293,7 +293,7 @@ func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.D
 	r = &run{Deps: Deps{Docker: dc, Home: home, Screen: screen, Getenv: func(string) string { return "" }},
 		opts: Options{Existing: policy}, d: d, plan: &bundle.Plan{Containers: plan}, m: m,
 		dataDir: data, rbDir: filepath.Join(home, "rollback", "current"), anonVolumes: map[string]bundle.Volume{},
-		undo: &undo{dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
+		undo: &undo{mountPoint: noMounts, dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
 	ctx := context.Background()
 	err := r.decide(ctx)
 	if err == nil {

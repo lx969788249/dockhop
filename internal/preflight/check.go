@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"maps"
 	"net"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -289,6 +288,16 @@ type Options struct {
 	Existing string // replace、skip、fail；空表示有同名服务时询问
 	BaseDir  string // 存放下载和解压文件的目录
 	Home     string // DockHop 自己的目录，挂载目录不能和它重叠
+	// LocalWork 由迁入给出：要写的这些东西（w）里，哪些事只能在 Docker 所在的机器上做。
+	// Docker 不在这台服务器上、又有这样的事时，在下载之前停下。
+	LocalWork func(w Writes, t *Target) []string
+}
+
+// Writes 是按眼下的选择，这次迁入要写到新服务器上的东西：跳过的容器独占的、保留已有的不算。
+type Writes struct {
+	Binds    []string // 宿主机上的目录和文件（真实路径）
+	Projects []string // Compose 项目
+	Volumes  []string // 数据卷，包括匿名卷
 }
 
 var archAlias = map[string]string{"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64",
@@ -354,23 +363,24 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 			Title: fmt.Sprintf("新服务器的 docker-compose 是老版本 %s，旧服务器用的是 Compose %s；有些写法老版本读不懂，迁入时可能失败（失败会自动删除迁入的内容）。"+
 				"建议先在新服务器安装新版 Docker Compose", t.Compose, plan.Source.Compose)})
 	}
-	if !t.Local {
-		// 替换已有的数据卷要先清空（写进匿名卷也是：新建的匿名卷里有镜像带的文件），清空要把本机的
-		// 程序放进临时容器，Docker 在别的机器上时做不到。只写进新建的有名字的卷不用清空。
-		var what []string
-		if len(plan.Binds) > 0 {
-			what = append(what, "放目录")
-		}
-		if hasProject {
-			what = append(what, "放 Compose 项目文件")
-		}
-		for _, v := range plan.Volumes {
-			if usedVolumes[v.Name] && !d.KeepVolume(v.Name) && (spec.IsAnonymousVolume(v.Name) || t.Volumes[v.Name] != nil) {
-				what = append(what, "替换已有的数据卷")
-				break
+	if !t.Local && o.LocalWork != nil {
+		var w Writes
+		for _, b := range plan.Binds {
+			if usedBinds[b.Path] {
+				w.Binds = append(w.Binds, b.Path)
 			}
 		}
-		if len(what) > 0 {
+		for _, c := range containers {
+			if c.Project != "" && !slices.Contains(w.Projects, c.Project) {
+				w.Projects = append(w.Projects, c.Project)
+			}
+		}
+		for _, v := range plan.Volumes {
+			if usedVolumes[v.Name] && !d.KeepVolume(v.Name) {
+				w.Volumes = append(w.Volumes, v.Name)
+			}
+		}
+		if what := o.LocalWork(w, t); len(what) > 0 {
 			addIssue(Issue{Level: Stop, Kind: "remote_docker",
 				Title: "Docker 不在这台服务器上（DOCKER_HOST 指向了别的机器），没法在 Docker 所在的服务器上" + strings.Join(what, "、"),
 				Hint:  "请在 Docker 所在的服务器上直接运行 DockHop"})
@@ -513,10 +523,24 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		}
 	}
 	// 目录和数据卷一样整个替换，迁入成功后原来的内容就删了，所以里面有东西时也要说一声。
+	// 里面还挂着别的磁盘时不能替换：挂在里面的会跟着挪进备份，提交后删备份会连那块盘上的东西一起删掉。
 	for _, b := range plan.Binds {
-		if usedBinds[b.Path] && t.HasContent(b.Path) {
+		if !usedBinds[b.Path] {
+			continue
+		}
+		if t.HasContent(b.Path) {
 			addIssue(Issue{Level: Info, Kind: "bind_replace",
 				Title: "目录 " + b.Path + " 已存在，迁移过来的内容会替换它（失败时放回原来的）"})
+		}
+		switch inner, err := t.MountsUnder(b.Path); {
+		case err != nil:
+			addIssue(Issue{Level: Stop, Kind: "nested_mount",
+				Title: "没法确认目录 " + b.Path + " 里面有没有挂着别的磁盘：" + err.Error(),
+				Hint:  "确认 /proc 可以读取后重新检查"})
+		case len(inner) > 0:
+			addIssue(Issue{Level: Stop, Kind: "nested_mount",
+				Title: fmt.Sprintf("目录 %s 里面还挂着 %s：迁入要整个替换这个目录，会连带动到挂在里面的东西", b.Path, strings.Join(inner, "、")),
+				Hint:  "先把它们卸载（umount），或者挂到这个目录外面，再重新检查"})
 		}
 	}
 
@@ -553,7 +577,7 @@ func keptDataIssues(plan *bundle.Plan, t *Target, d *Decisions, containers []bun
 		}
 		for _, b := range binds {
 			if !spec.IsSystemPath(b) {
-				keptBinds = append(keptBinds, owner{normalize(b), who})
+				keptBinds = append(keptBinds, owner{host.RealPath(b), who})
 			}
 		}
 	}
@@ -576,7 +600,7 @@ func keptDataIssues(plan *bundle.Plan, t *Target, d *Decisions, containers []bun
 		}
 		for _, b := range c.Binds {
 			for _, k := range keptBinds {
-				if !spec.IsSystemPath(b) && spec.PathsOverlap(normalize(b), k.path) {
+				if !spec.IsSystemPath(b) && spec.PathsOverlap(host.RealPath(b), k.path) {
 					return k.who, "目录 " + b
 				}
 			}
@@ -962,32 +986,10 @@ func shortRef(ref string) string {
 	return ref
 }
 
-// normalize 把路径里的软链接解析掉（不存在的部分原样接在后面），用来判断两个路径
-// 是否重叠：经过软链接父目录指过来的路径也要算重叠。
-func normalize(p string) string {
-	p = filepath.Clean(p)
-	rest := ""
-	cur := p
-	for {
-		if real, err := filepath.EvalSymlinks(cur); err == nil {
-			return filepath.Join(real, rest)
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return p
-		}
-		rest = filepath.Join(filepath.Base(cur), rest)
-		cur = parent
-	}
-}
-
-// Normalize 供迁入时再次核对路径。
-func Normalize(p string) string { return normalize(p) }
-
 // HomeClash 检查迁入的目录 p 会不会盖住 DockHop 存放迁移文件、回滚资料的目录 home。
 // 迁入前检查按迁移计划查一遍，解开迁移包后按实际要写的目录再查一遍，用的是这同一条规则。
 func HomeClash(p, home string) *Issue {
-	if p == "" || home == "" || spec.IsSystemPath(p) || !spec.PathsOverlap(normalize(p), normalize(home)) {
+	if p == "" || home == "" || spec.IsSystemPath(p) || !spec.PathsOverlap(host.RealPath(p), host.RealPath(home)) {
 		return nil
 	}
 	return &Issue{Level: Stop, Kind: "bind_home",

@@ -85,3 +85,40 @@ func TestPrepareUnreadableContainer(t *testing.T) {
 		}
 	}
 }
+
+// 回滚时要原样重建原有的 Compose 容器：读它们的配置时也要带上用户指定的 MAC 地址（Docker 29 起读出来
+// 的配置里没有了，见 docker.InspectForRebuild），不然回滚后网卡用的是随机的 MAC。
+func TestBackupProjectKeepsFixedMAC(t *testing.T) {
+	dc, _ := faultyDockerAt(t, "1.56", func(w http.ResponseWriter, r *http.Request) bool {
+		switch {
+		case r.URL.Path == "/v1.51/containers/abcdef1234567890/json":
+			w.Write([]byte(`{"Id":"abcdef1234567890","Config":{"Image":"alpine","MacAddress":"02:42:ac:14:00:0a"}}`))
+		case strings.HasSuffix(r.URL.Path, "/changes"):
+			return false
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/json"):
+			w.Write([]byte(`{"Id":"abcdef1234567890","Name":"/blog-app-1","State":{"Status":"running","Running":true},"Config":{"Image":"alpine"}}`))
+		case r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			return false
+		}
+		return true
+	})
+	j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, j: j}
+	r.backupProject(context.Background(), "blog", []docker.ContainerSummary{{ID: "abcdef1234567890", Names: []string{"/blog-app-1"}}})
+	j.close()
+	entries, err := readJournal(j.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Op == opComposeOld && (len(e.Old) != 1 || !strings.Contains(string(e.Old[0].Raw), `"MacAddress":"02:42:ac:14:00:0a"`)) {
+			t.Fatalf("原有容器的配置里应带上指定的 MAC：%s", e.Old[0].Raw)
+		}
+	}
+}

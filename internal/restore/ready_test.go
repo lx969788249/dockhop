@@ -3,12 +3,14 @@ package restore
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -130,14 +132,28 @@ func TestWaitReadyStableRunning(t *testing.T) {
 // 没有健康检查的容器稳定运行几秒就算就绪，之后还可能停掉。决定提交之前把就绪了的容器再查一遍：
 // 停了、在重启、不健康了的，它所在的组按没能启动处理；还在运行的不受影响。
 func TestConfirmReady(t *testing.T) {
-	for _, c := range []struct{ state, want string }{
-		{`{"Id":"new-app","Name":"/app","State":{"Status":"exited","ExitCode":1}}`, "容器 app 就绪之后又停了（退出码 1），最后的输出：panic: boom"},
-		{`{"Id":"new-app","Name":"/app","State":{"Status":"restarting","Running":true,"ExitCode":2}}`, "容器 app 就绪之后又退出了，Docker 正在重启它（退出码 2），最后的输出：panic: boom"},
-		{`{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true,"Health":{"Status":"unhealthy"}}}`, "容器 app 就绪之后健康检查又没通过，最后的输出：panic: boom"},
-		{`{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true,"Health":{"Status":"healthy"}}}`, ""},
-		{`{"Id":"new-app","Name":"/app","State":{"Status":"paused","Running":true,"Paused":true}}`, ""},
+	minHealthWait = 3 * time.Second
+	t.Cleanup(func() { minHealthWait = 60 * time.Second })
+	old := time.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339Nano)
+	running := `{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true,"StartedAt":"` + old + `"}}`
+	restarting := `{"Id":"new-app","Name":"/app","RestartCount":1,"State":{"Status":"restarting","Running":true,"ExitCode":2}}`
+	check := `"Config":{"Healthcheck":{"Test":["CMD","true"],"Interval":1000000000}}`
+	for _, c := range []struct {
+		name   string
+		states []string
+		want   string // 为空表示算正常
+	}{
+		{"又停了", []string{`{"Id":"new-app","Name":"/app","State":{"Status":"exited","ExitCode":1}}`},
+			"容器 app 就绪之后又停了（退出码 1），最后的输出：panic: boom"},
+		{"一次性任务正常做完了", []string{`{"Id":"new-app","Name":"/app","State":{"Status":"exited","ExitCode":0}}`}, ""},
+		{"重启了一下又好了", []string{restarting, running}, ""},
+		{"一直在重启", []string{restarting}, "容器 app 没能稳定运行"},
+		{"不健康了一下又好了", []string{`{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true,"Health":{"Status":"unhealthy"}},` + check + `}`,
+			`{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true,"Health":{"Status":"healthy"}},` + check + `}`}, ""},
+		{"健康", []string{`{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true,"Health":{"Status":"healthy"}}}`}, ""},
+		{"暂停着", []string{`{"Id":"new-app","Name":"/app","State":{"Status":"paused","Running":true,"Paused":true}}`}, ""},
 	} {
-		_, _, r := fakeContainer(t, "panic: boom", c.state)
+		_, _, r := fakeContainer(t, "panic: boom", c.states...)
 		src := &docker.Container{}
 		src.State.Running = true
 		g := &group{id: "g", items: []*citem{{m: bundle.Container{Name: "app"}, c: src, newID: "new-app", ready: true}}}
@@ -145,9 +161,71 @@ func TestConfirmReady(t *testing.T) {
 		if err := r.confirmReady(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if g.reason != c.want {
-			t.Errorf("%s\n  原因：%q\n  应为：%q", c.state, g.reason, c.want)
+		if c.want == "" && g.reason != "" || c.want != "" && !strings.HasPrefix(g.reason, c.want) {
+			t.Errorf("%s：原因 %q，应为 %q", c.name, g.reason, c.want)
 		}
+	}
+}
+
+// 容器眼下处在哪个阶段：等它就绪（waitReady）和提交前复查（confirmReady）都按这个判断。
+func TestPhaseOf(t *testing.T) {
+	for _, c := range []struct {
+		state string
+		want  phase
+	}{
+		{`{"Status":"exited","ExitCode":0}`, phaseDone},
+		{`{"Status":"exited","ExitCode":1}`, phaseStopped},
+		{`{"Status":"dead"}`, phaseStopped},
+		{`{"Status":"running"}`, phaseUp},
+		{`{"Status":"running","Health":{"Status":"healthy"}}`, phaseUp},
+		{`{"Status":"running","Health":{"Status":"starting"}}`, phaseUp},
+		{`{"Status":"paused"}`, phaseUp},
+		{`{"Status":"running","Health":{"Status":"unhealthy"}}`, phaseWaiting},
+		{`{"Status":"restarting","ExitCode":2}`, phaseWaiting},
+		{`{"Status":"created"}`, phaseWaiting},
+	} {
+		var ct docker.Container
+		if err := json.Unmarshal([]byte(`{"State":`+c.state+`}`), &ct); err != nil {
+			t.Fatal(err)
+		}
+		if got := phaseOf(&ct); got != c.want {
+			t.Errorf("%s：%d，应为 %d", c.state, got, c.want)
+		}
+	}
+}
+
+// 提交前再查一遍时，Docker 偶尔回不了话不算失败：重试几次。
+func TestConfirmReadyRetriesInspect(t *testing.T) {
+	var mu sync.Mutex
+	n := 0
+	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+		if !strings.HasSuffix(req.URL.Path, "/containers/new-app/json") {
+			return false
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if n++; n < 3 {
+			return false // 前两次出错
+		}
+		io.WriteString(w, `{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true}}`)
+		return true
+	})
+	_, _, r := fakeContainer(t, "", "{}")
+	r.Docker = dc
+	src := &docker.Container{}
+	src.State.Running = true
+	g := &group{id: "g", items: []*citem{{m: bundle.Container{Name: "app"}, c: src, newID: "new-app", ready: true}}}
+	r.groups = []*group{g}
+	if err := r.confirmReady(context.Background()); err != nil || g.reason != "" {
+		t.Fatalf("偶尔查不到不应算失败：%v %q", err, g.reason)
+	}
+}
+
+// 等待就绪时，一次性任务正常做完了（退出码 0，Docker 也没有重启它）算正常；退出码不是 0 的照样失败。
+func TestWaitReadyFinishedJob(t *testing.T) {
+	_, _, r := fakeContainer(t, "", `{"Id":"new-app","Name":"/app","State":{"Status":"exited","ExitCode":0}}`)
+	if err := r.waitReady(context.Background(), &citem{m: bundle.Container{Name: "app"}, newID: "new-app", startedAt: time.Now()}); err != nil {
+		t.Fatalf("正常做完的一次性任务应算就绪：%v", err)
 	}
 }
 
@@ -226,7 +304,7 @@ func TestStartupFailureHidesEnvSecrets(t *testing.T) {
 		case "/v1.44/containers/json":
 			io.WriteString(w, `[]`)
 		case "/v1.44/containers/new-web/json":
-			io.WriteString(w, `{"Id":"new-web","Name":"/web","State":{"Status":"exited"}}`)
+			io.WriteString(w, `{"Id":"new-web","Name":"/web","State":{"Status":"exited","ExitCode":1}}`)
 		case "/v1.44/containers/new-web/logs":
 			io.WriteString(w, "cannot connect using "+secret)
 		default:
@@ -247,7 +325,7 @@ func TestStartupFailureHidesEnvSecrets(t *testing.T) {
 	defer log.Finish(logging.Failed, true)
 	var out bytes.Buffer
 	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: rd, Home: root, Getenv: func(string) string { return "" }},
-		dataDir: data, rbDir: filepath.Join(root, "rollback"), undo: &undo{}, anonVolumes: map[string]bundle.Volume{},
+		dataDir: data, rbDir: filepath.Join(root, "rollback"), undo: &undo{mountPoint: noMounts}, anonVolumes: map[string]bundle.Volume{},
 		plan: &bundle.Plan{Containers: []bundle.PlanContainer{{Name: "web"}}},
 		m:    &bundle.Manifest{Containers: []bundle.Container{{Name: "web", Image: "alpine", State: "running"}}}}
 	if err := r.decide(context.Background()); err != nil {

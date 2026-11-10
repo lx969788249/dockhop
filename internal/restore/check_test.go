@@ -14,7 +14,9 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/logging"
+	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/transfer"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -72,5 +74,27 @@ func TestCheckStopsOnCancel(t *testing.T) {
 	start := time.Now()
 	if _, err := r.check(ctx); !ui.Canceled(err) || time.Since(start) > 2*time.Second {
 		t.Fatalf("应马上停下、当作取消：%v（用了 %s）", err, time.Since(start))
+	}
+}
+
+// 只能在 Docker 所在的机器上做的事：写宿主机上的目录、放 Compose 项目文件，以及清空数据卷——替换
+// 已有的卷、写进匿名卷（新建的匿名卷里有镜像带的文件）都要先清空，清空要把本机的程序放进临时容器。
+// 只写进新建的有名字的卷不用清空。
+func TestLocalWork(t *testing.T) {
+	const anon = "3977206abb71f8aa4677d89b605e71e99ae3db6773688b6f62e61fbbadf9c34c"
+	tg := &preflight.Target{Volumes: map[string]*docker.Volume{"data": {Name: "data"}}}
+	for _, c := range []struct {
+		name string
+		w    preflight.Writes
+		want string
+	}{
+		{"替换已有的卷", preflight.Writes{Volumes: []string{"data"}}, "替换已有的数据卷"},
+		{"写进匿名卷", preflight.Writes{Volumes: []string{anon}}, "替换已有的数据卷"},
+		{"新建的卷", preflight.Writes{Volumes: []string{"fresh"}}, ""},
+		{"目录和项目", preflight.Writes{Binds: []string{"/srv/web"}, Projects: []string{"site"}, Volumes: []string{"fresh"}}, "放目录 放 Compose 项目文件"},
+	} {
+		if got := strings.Join(localWork(c.w, tg), " "); got != c.want {
+			t.Errorf("%s：%q，应为 %q", c.name, got, c.want)
+		}
 	}
 }

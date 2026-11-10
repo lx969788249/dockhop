@@ -24,13 +24,13 @@ type Op string
 
 const (
 	opStart      Op = "start"       // 事务开始：记下进程号和时间
-	opStop       Op = "stop"        // 临时停止了新服务器上已有的容器（Name、ID、State）
-	opRename     Op = "rename"      // 已有的同名容器改名备份（Name、ID、Backup、State、Networks）
+	opStop       Op = "stop"        // 临时停止了新服务器上已有的容器（Name、ID、State：停之前的状态）
+	opRename     Op = "rename"      // 已有的同名容器改名备份（Name、ID、Backup：备份用的名字、Networks：原来连着的网络）
 	opComposeOld Op = "compose_old" // 已有的同名 Compose 项目，即将停止并删除（Name、Old）
 	opOldImages  Op = "old_images"  // 上一条里的容器已经存成回滚镜像，接下来删除容器（Name、Images）
 	opVolume     Op = "volume"      // 写入数据卷（Name、Existed、Backup）
 	opStage      Op = "stage"       // 新建解压用的临时目录（Path），回滚、提交后都整个删掉
-	opBind       Op = "bind"        // 替换目录（Path、Existed、Backup；Backup 在 Path 里面时是原地换内容，Names：原来有哪些东西）
+	opBind       Op = "bind"        // 替换目录（Path、Existed、Backup；Backup 在 Path 里面时是原地换内容：Names 是原来有哪些东西，Meta 是目录本身原来的属性，记在建解压目录之前）
 	opLink       Op = "link"        // 新建软链接（Path）
 	opFile       Op = "file"        // 写入 Compose 项目里的文件（Path、Existed、Backup）
 	opMkdir      Op = "mkdir"       // 新建目录（Path）
@@ -39,10 +39,60 @@ const (
 	opHelper     Op = "helper"      // 新建临时容器（Name），用完就删
 	opImages     Op = "images"      // 加载镜像之前这台服务器上已有的镜像（Names：镜像 ID），回滚时这些一个不删
 	opTag        Op = "tag"         // 镜像名要改为指向迁入的镜像（Name；ID：原来指向的镜像，为空表示原来没有这个名字）
-	opComposeUp  Op = "compose_up"  // 启动 Compose 项目（Name、Networks：启动前已有的项目网络）
+	opComposeUp  Op = "compose_up"  // 启动 Compose 项目（Name、Names：启动前已有的项目网络）
 	opRebuilt    Op = "rebuilt"     // 回滚时重建了原有的 Compose 容器（Name；ID：重建后的 ID），再回滚时它就是原来的服务
 	opCommit     Op = "commit"      // 已提交：新服务都验证通过，不再撤销（Names：只保留一部分服务时，保留下来的组）
 )
+
+// partialSide 是只提交了一部分（保留了几组服务）时，一条记录归哪边（见 splitPartial）。
+type partialSide int
+
+const (
+	byGroup    partialSide = iota + 1 // 跟着它的组：组没保留就撤销，保留了就清理回滚资料；Group 为空的是共用的，算保留
+	alwaysUndo                        // 撤销没保留的组时要用到：事务开始、加载镜像之前已有的镜像、上次撤销时重建的原有容器
+	noSide                            // 不是改动，两边都不放：提交标记
+)
+
+// opRule 是一种记录的约定：check 检查必须有的内容（写日志时检查，缺了就不写、不动手），partial
+// 说明只提交了一部分时归哪边。新加一种记录，要在 opRules 里写明这两样；回滚、提交后清理时怎么处理
+// 见 rollback.go，TestEveryOpHandled 检查每一种都有着落。
+type opRule struct {
+	check   func(Entry) bool
+	partial partialSide
+}
+
+var opRules = map[Op]opRule{
+	opStart:      {func(e Entry) bool { return e.PID > 0 }, alwaysUndo},
+	opStop:       {func(e Entry) bool { return hasNameID(e) && e.State != "" }, byGroup},
+	opRename:     {func(e Entry) bool { return hasNameID(e) && e.Backup != "" }, byGroup},
+	opComposeOld: {hasName, byGroup},
+	opOldImages:  {hasName, byGroup},
+	opVolume:     {func(e Entry) bool { return hasName(e) && backedUp(e) }, byGroup},
+	opStage:      {hasPath, byGroup},
+	opBind:       {bindOK, byGroup},
+	opLink:       {hasPath, byGroup},
+	opFile:       {func(e Entry) bool { return hasPath(e) && backedUp(e) }, byGroup},
+	opMkdir:      {hasPath, byGroup},
+	opNetwork:    {hasName, byGroup},
+	opContainer:  {hasName, byGroup},
+	opHelper:     {hasName, byGroup},
+	opImages:     {always, alwaysUndo},
+	opTag:        {hasName, byGroup},
+	opComposeUp:  {hasName, byGroup},
+	opRebuilt:    {hasNameID, alwaysUndo},
+	opCommit:     {always, noSide},
+}
+
+func hasName(e Entry) bool   { return e.Name != "" }
+func hasNameID(e Entry) bool { return e.Name != "" && e.ID != "" }
+func hasPath(e Entry) bool   { return e.Path != "" }
+func always(Entry) bool      { return true }
+
+// backedUp：原来就有的（Existed），要记下备份放在哪里。
+func backedUp(e Entry) bool { return !e.Existed || e.Backup != "" }
+
+// bindOK：原地换内容的还要记下目录本身原来的属性（见 recordContents）。
+func bindOK(e Entry) bool { return hasPath(e) && backedUp(e) && (!e.inPlace() || e.Meta != nil) }
 
 // Entry 是日志里的一条记录。
 type Entry struct {
@@ -55,11 +105,27 @@ type Entry struct {
 	Path     string            `json:"path,omitempty"`
 	Backup   string            `json:"backup,omitempty"`
 	Existed  bool              `json:"existed,omitempty"`
-	Networks json.RawMessage   `json:"networks,omitempty"`
+	Networks json.RawMessage   `json:"networks,omitempty"` // 只有 opRename 用
 	Old      []OldContainer    `json:"old,omitempty"`
 	Images   map[string]string `json:"images,omitempty"` // 容器 ID → 回滚镜像
-	Names    []string          `json:"names,omitempty"`
-	Group    string            `json:"group,omitempty"` // 属于哪一组服务（见 groups.go）；为空表示整次迁入共用
+	Names    []string          `json:"names,omitempty"`  // 按记录类型各有含义，见上面每种记录的说明
+	Group    string            `json:"group,omitempty"`  // 属于哪一组服务（见 groups.go）；为空表示整次迁入共用
+	Meta     *FileMeta         `json:"meta,omitempty"`   // 原地换内容时，目录本身原来的属主、权限、修改时间
+}
+
+// inPlace 表示这是原地换内容的记录（见 recordContents）：备份目录在 Path 里面。只有这里判断，
+// 别处都用它：这条记录被当成整个改名的，回滚时就会去整个删除一个挂载点。
+func (e Entry) inPlace() bool {
+	return e.Op == opBind && e.Existed && filepath.Dir(e.Backup) == e.Path
+}
+
+// FileMeta 是一个文件或目录本身的属主、权限和修改时间（纳秒）；Link 表示它是软链接（没有自己的权限）。
+type FileMeta struct {
+	Mode  os.FileMode `json:"mode"`
+	UID   int         `json:"uid"`
+	GID   int         `json:"gid"`
+	MTime int64       `json:"mtime"`
+	Link  bool        `json:"link,omitempty"`
 }
 
 // OldContainer 是新服务器上原有的 Compose 容器，回滚时据此原样重建。
@@ -120,6 +186,13 @@ func appendJournal(dir string, e Entry) error {
 
 // add 追加一条记录并写到磁盘。写不进去时不能继续改动。
 func (j *Journal) add(e Entry) error {
+	rule, ok := opRules[e.Op]
+	if !ok {
+		return fmt.Errorf("写入事务日志失败：不认识的记录 %q", e.Op)
+	}
+	if !rule.check(e) {
+		return fmt.Errorf("写入事务日志失败：记录 %s 少了必须有的内容（%+v）", e.Op, e)
+	}
 	e.Time = time.Now()
 	if e.Group == "" {
 		e.Group = j.group
@@ -175,6 +248,10 @@ func readJournal(dir string) ([]Entry, error) {
 			bad = n
 			continue
 		}
+		if _, ok := opRules[e.Op]; !ok {
+			// 这个版本不认识的记录（例如更新的版本写的）：撤销时会悄悄跳过它，改动就永远留下了。
+			return nil, fmt.Errorf("%w（第 %d 行是这个版本不认识的记录 %q）", ErrJournalDamaged, n, e.Op)
+		}
 		out = append(out, e)
 	}
 	if err := sc.Err(); err != nil {
@@ -211,24 +288,4 @@ func rewriteJournal(dir string, entries []Entry) error {
 		return err
 	}
 	return host.SyncDir(dir)
-}
-
-// committed 表示全部提交了：只差删除回滚资料。
-func committed(entries []Entry) bool {
-	for _, e := range entries {
-		if e.Op == opCommit && len(e.Names) == 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// partialCommit 返回只提交了一部分时保留下来的组（见 commitPartial）。
-func partialCommit(entries []Entry) ([]string, bool) {
-	for _, e := range entries {
-		if e.Op == opCommit && len(e.Names) > 0 {
-			return e.Names, true
-		}
-	}
-	return nil, false
 }

@@ -1,4 +1,4 @@
-// Package host 读取本机信息：系统、磁盘空间、挂载点、正在监听的端口。
+// Package host 读取本机信息：系统、磁盘空间、挂载点、路径的真实位置、正在监听的端口。
 // 只读系统文件和系统调用，不依赖 ss、df 等外部命令。
 package host
 
@@ -94,29 +94,86 @@ func DiskOf(path string) (Disk, error) {
 
 // IsMountPoint 表示 path 本身是不是挂载点（单独挂载的磁盘、绑定挂载的目录等）。挂载点不能改名、
 // 不能删除，只能改它里面的内容。path 的上级目录里有软链接时按真实路径找；path 本身是软链接时
-// 不算（改名改的是软链接）。
-func IsMountPoint(path string) bool {
+// 不算（改名改的是软链接）。读不到挂载信息时返回错误，不猜：猜错了会选错替换的办法。
+func IsMountPoint(path string) (bool, error) {
 	f, err := os.Open("/proc/self/mountinfo")
 	if err != nil {
-		return false
+		return false, fmt.Errorf("读不到挂载信息：%w", err)
 	}
 	defer f.Close()
-	if dir, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
-		path = filepath.Join(dir, filepath.Base(path))
-	}
-	return mountedAt(f, path)
+	return mountedAt(f, filepath.Join(RealPath(filepath.Dir(path)), filepath.Base(path)))
 }
 
-// mountedAt 在 /proc/self/mountinfo 的内容里找挂载点 path：第 5 列是挂载点，空格、制表符、
-// 换行和反斜杠写成 \040 这样的三位八进制。
-func mountedAt(r io.Reader, path string) bool {
-	sc := bufio.NewScanner(r)
-	for sc.Scan() {
-		if f := strings.Fields(sc.Text()); len(f) > 4 && unescapeOctal(f[4]) == path {
-			return true
+// MountsUnder 返回挂在 path 里面（不含 path 本身）的挂载点。path 里有软链接时按真实路径找。
+// 读不到挂载信息时返回错误。
+func MountsUnder(path string) ([]string, error) {
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil, fmt.Errorf("读不到挂载信息：%w", err)
+	}
+	defer f.Close()
+	return mountsUnder(f, RealPath(path))
+}
+
+// RealPath 是 p 在本机的真实位置：解析掉路径里的软链接（自己或者上级目录），不存在的部分原样
+// 接在后面。判断两个路径是不是同一处、是不是互相包含都按它：经过软链接指过来的也是同一处。
+// 要求路径必须存在、读不到要报错的地方直接用 filepath.EvalSymlinks。
+func RealPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	p = filepath.Clean(p)
+	rest := ""
+	for cur := p; ; {
+		if real, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(real, rest)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return p
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
+}
+
+func mountedAt(r io.Reader, path string) (bool, error) {
+	found := false
+	err := eachMount(r, func(mp string) bool {
+		found = mp == path
+		return found
+	})
+	return found, err
+}
+
+func mountsUnder(r io.Reader, path string) ([]string, error) {
+	var out []string
+	err := eachMount(r, func(mp string) bool {
+		if strings.HasPrefix(mp, path+"/") {
+			out = append(out, mp)
+		}
+		return false
+	})
+	return out, err
+}
+
+// eachMount 把 /proc/self/mountinfo 里的每个挂载点交给 fn，fn 返回 true 时停下：第 5 列是挂载点，
+// 空格、制表符、换行和反斜杠写成 \040 这样的三位八进制。一行可能很长（overlay 的 lowerdir 列着
+// 每一层），不限长度。读到一半出错时返回错误。
+func eachMount(r io.Reader, fn func(mountPoint string) bool) error {
+	br := bufio.NewReader(r)
+	for {
+		line, err := br.ReadString('\n')
+		if f := strings.Fields(line); len(f) > 4 && fn(unescapeOctal(f[4])) {
+			return nil
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("读挂载信息失败：%w", err)
 		}
 	}
-	return false
 }
 
 func unescapeOctal(s string) string {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -172,7 +173,7 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 			packed += n
 		}
 		if len(p.outside) > 0 {
-			rc := hostTar{ctx: ctx, roots: p.outside, base: "/", logf: r.Log.Printf}.stream()
+			rc := hostTar{ctx: ctx, roots: p.outside, base: "/", excludes: r.ownDirs(p.outside...), logf: r.Log.Printf}.stream()
 			parts, n, err := r.addStream(w, "compose/"+p.u.project+"/outside", "Compose 项目 "+p.u.project+" 引用的文件", rc, p.outBytes)
 			rc.Close()
 			if err != nil {
@@ -346,11 +347,15 @@ func (c *countWriter) Write(p []byte) (int, error) { *c += countWriter(len(p)); 
 
 // ownDirs 是 root 里面属于 DockHop 自己的目录（日志、工作目录、正在写的迁移包），
 // 打包挂载目录或项目目录时跳过，例如项目目录就是 /root、DockHop 的目录是 /root/.dockhop。
-func (r *run) ownDirs(root string) []string {
+// 按真实路径比较、返回真实路径：root 可能是软链接，打包的是它指向的目录（见 walkRoot）。
+func (r *run) ownDirs(roots ...string) []string {
 	var out []string
-	for _, d := range []string{r.Home, filepath.Dir(r.workdir)} {
-		if d != "" && (d == root || strings.HasPrefix(d, root+"/")) {
-			out = append(out, d)
+	for _, root := range roots {
+		root = host.RealPath(root)
+		for _, d := range []string{r.Home, filepath.Dir(r.workdir)} {
+			if d = host.RealPath(d); d != "" && (d == root || strings.HasPrefix(d, root+"/")) {
+				out = append(out, d)
+			}
 		}
 	}
 	return out

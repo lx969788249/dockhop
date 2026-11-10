@@ -25,6 +25,8 @@ type undo struct {
 	vio    *volumeIO
 	fail   func(point string) bool // 测试用：在指定的位置模拟失败
 	record func(Entry) error       // 把回滚自己做的改动追加到事务日志（见 opRebuilt）
+	// mountPoint 判断一个目录本身是不是挂载点（见 Deps.MountPoint）。
+	mountPoint func(path string) (bool, error)
 	// 回滚重建旧容器时用的默认值（就是这台服务器自己的）。
 	defaults spec.SourceDefaults
 }
@@ -106,6 +108,11 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 					note("Compose 项目 %s 的新容器 %s 没能删除：%v", e.Name, c.Name(), err)
 				}
 			}
+		case opStart, opRename, opOldImages, opVolume, opStage, opBind, opLink, opFile, opMkdir, opNetwork,
+			opImages, opTag, opRebuilt, opCommit:
+			// 这一遍不用管：数据在第 2 遍，原来的服务在第 3 遍，opRebuilt 在最前面已经看过
+		default:
+			note("日志里有不认识的记录 %s，没有撤销", e.Op)
 		}
 	}
 	if len(problems) > 0 || u.fail("rollback-remove") {
@@ -164,6 +171,10 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 			tags = append(tags, e)
 		case opImages:
 			had = e.Names
+		case opStart, opStop, opRename, opComposeOld, opOldImages, opContainer, opHelper, opRebuilt, opCommit:
+			// 这一遍不用管：容器在第 1 遍，原来的服务在第 3 遍
+		default:
+			note("日志里有不认识的记录 %s，没有撤销", e.Op)
 		}
 	}
 	u.undoTags(ctx, tags, had, note)
@@ -377,8 +388,14 @@ func (u *undo) undoBind(e Entry, note func(string, ...any)) {
 	if e.Path == "" || e.Path == "/" {
 		return
 	}
-	if e.Existed && filepath.Dir(e.Backup) == e.Path {
+	if e.inPlace() {
 		u.undoContents(e, note)
+		return
+	}
+	// 下面的做法会整个删除 Path：它是挂载点（单独挂载的磁盘）时绝不能这样做，那样会把整块盘上的
+	// 东西删掉；挂载点只会原地换内容。判断不了时也不动。
+	if mounted, err := u.mountPoint(e.Path); err != nil || mounted {
+		note("%s 是单独挂载的目录（或者判断不了：%v），不能整个删除再放回，没有动它，请按回滚资料人工处理", e.Path, err)
 		return
 	}
 	_, curErr := os.Lstat(e.Path)
@@ -409,21 +426,39 @@ func (u *undo) undoBind(e Entry, note func(string, ...any)) {
 }
 
 // undoContents 撤销原地换内容（见 replaceContents）：Path 里迁移过来的东西删掉，备份目录里原来的
-// 挪回去，Path 的属主、权限改回原来的，最后删掉空了的备份目录。日志里记着 Path 原来有哪些东西
-// （Names）：名字不在里面的，或者原来的那个已经挪进了备份目录的，才是迁移过来的；原来的那个还没
-// 挪走（或者已经挪回来了）的留着。所以换到一半、回滚到一半被打断，从头再来一遍都是安全的。
+// 挪回去，Path 本身改回日志里记的属主、权限、修改时间，最后删掉空了的备份目录。日志里记着 Path
+// 原来有哪些东西（Names）：名字不在里面的，或者原来的那个已经挪进了备份目录的，才是迁移过来的；
+// 原来的那个还没挪走（或者已经挪回来了）的留着。所以换到一半、回滚到一半被打断，从头再来一遍都
+// 是安全的。
 func (u *undo) undoContents(e Entry, note func(string, ...any)) {
 	backed, err := os.ReadDir(e.Backup)
 	if errors.Is(err, os.ErrNotExist) {
-		return // 还没开始挪原来的东西，或者已经全部放回去了
+		// 还没开始挪原来的东西，或者已经全部放回去了（可能刚删掉备份目录就被打断，属性还没改回，
+		// 再改一遍）；也可能是数据盘没挂上（备份在盘上，看不到）。只有 Path 还是挂载点，才能当成前两种。
+		switch mounted, err := u.mountPoint(e.Path); {
+		case err != nil:
+			note("没法确认 %s 还挂着：%v", e.Path, err)
+		case !mounted:
+			note("%s 现在不是单独挂载的目录（数据盘没挂上？），原来的内容在盘上的 %s 里，挂上之后重新运行就会放回去",
+				e.Path, filepath.Base(e.Backup))
+		case e.Meta != nil:
+			if err := applyMeta(e.Path, *e.Meta); err != nil {
+				note("目录 %s 没能改回原来的属主、权限和修改时间：%v", e.Path, err)
+			}
+		}
+		return
 	}
 	if err != nil {
 		note("目录 %s 的备份读不了：%v", e.Path, err)
 		return
 	}
-	inBackup := map[string]bool{}
+	inBackup := make(map[string]bool, len(backed))
 	for _, b := range backed {
 		inBackup[b.Name()] = true
+	}
+	original := make(map[string]bool, len(e.Names))
+	for _, n := range e.Names {
+		original[n] = true
 	}
 	cur, err := os.ReadDir(e.Path)
 	if err != nil {
@@ -432,7 +467,7 @@ func (u *undo) undoContents(e Entry, note func(string, ...any)) {
 	}
 	for _, c := range cur {
 		p := filepath.Join(e.Path, c.Name())
-		if p == e.Backup || slices.Contains(e.Names, c.Name()) && !inBackup[c.Name()] {
+		if p == e.Backup || original[c.Name()] && !inBackup[c.Name()] {
 			continue
 		}
 		if err := os.RemoveAll(p); err != nil {
@@ -446,12 +481,15 @@ func (u *undo) undoContents(e Entry, note func(string, ...any)) {
 			return
 		}
 	}
-	if err := copyDirMeta(e.Backup, e.Path); err != nil {
-		note("目录 %s 没能改回原来的属主和权限：%v", e.Path, err)
-		return
-	}
+	// 先删空了的备份目录再改属性：删它会改掉 Path 的修改时间。
 	if err := os.Remove(e.Backup); err != nil {
 		note("目录 %s 的备份目录没能删除：%v", e.Path, err)
+		return
+	}
+	if e.Meta != nil {
+		if err := applyMeta(e.Path, *e.Meta); err != nil {
+			note("目录 %s 没能改回原来的属主、权限和修改时间：%v", e.Path, err)
+		}
 	}
 }
 
@@ -690,6 +728,11 @@ func (u *undo) cleanupCommitted(ctx context.Context, entries []Entry) []string {
 			if err := os.RemoveAll(e.Path); err != nil {
 				left = append(left, fmt.Sprintf("解压用的临时目录 %s：%v", e.Path, err))
 			}
+		case opStart, opStop, opVolume, opLink, opFile, opMkdir, opNetwork, opContainer, opImages, opTag,
+			opComposeUp, opRebuilt, opCommit:
+			// 没有要删的回滚资料：数据卷、文件的备份在回滚资料目录里，跟着目录一起删
+		default:
+			left = append(left, fmt.Sprintf("日志里有不认识的记录 %s，没有清理", e.Op))
 		}
 	}
 	return left

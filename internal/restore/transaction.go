@@ -7,7 +7,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -102,22 +101,6 @@ func (r *run) rollback(ctx context.Context) {
 	}
 }
 
-// anyImage 从本机的镜像里挑一个，优先用名字（用 ID 时 containerd 存储会给多平台镜像选错平台，
-// 见 loadImages）；都没有名字时用 ID；一个镜像都没有时为空。
-func anyImage(list []docker.Image) string {
-	for _, im := range list {
-		for _, tag := range im.RepoTags {
-			if tag != "<none>:<none>" {
-				return tag
-			}
-		}
-	}
-	if len(list) > 0 {
-		return list[0].ID
-	}
-	return ""
-}
-
 // recoverInterrupted 检查上次迁入有没有被强制结束、留下没删除的改动。
 func (r *run) recoverInterrupted(ctx context.Context) error {
 	s := r.Screen
@@ -129,32 +112,14 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 		return s.StepFailed("上次迁入的事务日志读不了，没法自动删除上次迁入的内容", err.Error(),
 			"回滚资料都保留在 "+r.rbDir+"（journal.jsonl 记着每一处改动），请人工处理后删除这个目录再重新运行")
 	}
-	// 恢复数据卷的临时容器用本机的任何一个镜像来建：新服务器上可能一个容器都没有。
-	img := ""
-	if list, err := r.Docker.Images(ctx); err == nil {
-		img = anyImage(list)
-	}
+	img := r.helperImage(ctx) // 新服务器上可能一个容器都没有
 	helperBin := ""
 	if r.Docker.Local() {
 		helperBin, _ = prepareHelper(r.Home)
 	}
 	r.undo.vio = &volumeIO{dc: r.Docker, image: img, helperBin: helperBin, lock: lockPath(r.Home)}
 	if kept, ok := partialCommit(entries); ok {
-		// 用户已经选了只保留正常运行的服务，删除没启动的服务时被结束了：接着做完，不再问。
-		s.Hold()
-		s.Println("上次迁入只保留了正常运行的服务，删除没启动的服务时被结束了，现在接着删除……")
-		ctx = context.WithoutCancel(ctx)
-		issues, left := r.finishPartial(ctx, entries, kept)
-		r.cleanHelpers(ctx)
-		if len(left) > 0 {
-			s.Warn("上次迁入保留下来的服务有些回滚资料没能删除：%s", strings.Join(left, "；"))
-		}
-		if len(issues) > 0 {
-			r.rollbackIssues, r.rollbackDone = issues, true
-			return s.StepFailed("上次迁入时没启动的服务没能全部删除", "", "")
-		}
-		s.Info("已删除上次迁入时没启动的服务")
-		return nil
+		return r.resumePartial(ctx, entries, kept)
 	}
 	if committed(entries) {
 		if left := r.undo.cleanupCommitted(ctx, entries); len(left) > 0 {

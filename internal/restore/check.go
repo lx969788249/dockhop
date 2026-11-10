@@ -62,7 +62,7 @@ func (r *run) check(ctx context.Context) (string, error) {
 			}
 			return preflight.Collect(ctx, r.Docker, v)
 		}}
-	res, err := runner.Run(r.plan, &r.d, preflight.Options{Existing: r.opts.Existing, BaseDir: r.workBase(), Home: r.Home})
+	res, err := runner.Run(r.plan, &r.d, preflight.Options{Existing: r.opts.Existing, BaseDir: r.workBase(), Home: r.Home, LocalWork: localWork})
 	if ui.Canceled(err) {
 		return "", err
 	}
@@ -83,4 +83,24 @@ func (r *run) check(ctx context.Context) (string, error) {
 		summary += " · 需要约 " + ui.HumanBytes(res.NeedBytes) + " 磁盘空间"
 	}
 	return summary, nil
+}
+
+// localWork 列出要写的这些东西里只能在 Docker 所在的机器上做的事，Docker 不在本机时迁入前检查
+// 据此停下：往宿主机上写目录（restoreBind）、放 Compose 项目文件（installProject），以及写之前要先
+// 清空的数据卷（见 mustClear）。只写进新建的有名字的卷不用清空，Docker 在别的机器上也能做。
+func localWork(w preflight.Writes, t *preflight.Target) []string {
+	var what []string
+	if len(w.Binds) > 0 {
+		what = append(what, "放目录")
+	}
+	if len(w.Projects) > 0 {
+		what = append(what, "放 Compose 项目文件")
+	}
+	for _, v := range w.Volumes {
+		if mustClear(v, t.Volumes[v] != nil) {
+			what = append(what, "替换已有的数据卷")
+			break
+		}
+	}
+	return what
 }

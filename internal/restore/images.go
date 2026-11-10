@@ -389,32 +389,27 @@ func (r *run) loadImages(ctx context.Context) error {
 	}
 	sort.Strings(refs)
 	for _, ref := range refs {
-		name, err := r.resolveImage(ctx, ref)
-		if err != nil {
+		if err := r.resolveImage(ctx, ref); err != nil {
 			return err
-		}
-		// 恢复数据卷的临时容器用第一个镜像来建。用名字而不是 ID：containerd 存储里
-		// 按多平台镜像的 ID 创建容器会选错平台。
-		if r.helperImage == "" {
-			r.helperImage = name
 		}
 	}
 	s.End(fmt.Sprintf("%d 个镜像 · %s", len(refs), ui.HumanBytes(r.m.Images.Bytes)))
 	return nil
 }
 
-// resolveImage 确认迁移包里的一个镜像在这台服务器上能用，返回用来创建容器的名字。
-func (r *run) resolveImage(ctx context.Context, ref string) (string, error) {
+// resolveImage 确认迁移包里的一个镜像在这台服务器上能用。按摘要固定、只能用迁移包里那份的镜像
+// 加上名字，用它的容器改用这个名字创建（记在 imageAs 里）。
+func (r *run) resolveImage(ctx context.Context, ref string) error {
 	s := r.Screen
 	if !strings.Contains(ref, "@sha256:") {
 		if _, err := r.Docker.InspectImage(ctx, ref); err != nil {
-			return "", s.StepFailed("镜像 "+ref+" 没有加载成功", err.Error(), "")
+			return s.StepFailed("镜像 "+ref+" 没有加载成功", err.Error(), "")
 		}
-		return ref, nil
+		return nil
 	}
 	// digest 固定的镜像：本机已经有这个摘要的镜像（原来就有，或者刚按摘要拉下来的）就直接用。
 	if _, err := r.Docker.InspectImage(ctx, ref); err == nil {
-		return ref, nil
+		return nil
 	}
 	// 导出文件里没有仓库清单，加载后按摘要找不到（实验 3、6）。
 	if !r.d.UseBundleImage(ref) {
@@ -423,7 +418,7 @@ func (r *run) resolveImage(ctx context.Context, ref string) (string, error) {
 		err := r.Docker.PullImage(pctx, ref, nil)
 		cancel()
 		if err == nil {
-			return ref, nil
+			return nil
 		}
 		s.Warn("镜像 %s 没能按摘要补齐（%v），改用迁移包里的镜像", ref, err)
 	}
@@ -437,20 +432,20 @@ func (r *run) resolveImage(ctx context.Context, ref string) (string, error) {
 		}
 	}
 	if id == "" {
-		return "", s.StepFailed("镜像 "+ref+" 没有加载成功", "", "")
+		return s.StepFailed("镜像 "+ref+" 没有加载成功", "", "")
 	}
 	// 用 ref 的容器会改用名字 as 创建，名字跟着它们走。
 	as := preflight.StripDigest(ref)
 	r.in(r.imageKey(r.m.Images.Refs[ref], ref))
 	if err := r.noteTag(ctx, as); err != nil {
-		return "", err
+		return err
 	}
 	repo, tag := splitTag(as)
 	if err := r.Docker.TagImage(ctx, id, repo, tag); err != nil {
-		return "", s.StepFailed("给镜像 "+ref+" 加名字失败", err.Error(), "")
+		return s.StepFailed("给镜像 "+ref+" 加名字失败", err.Error(), "")
 	}
 	r.imageAs[ref] = as
-	return as, nil
+	return nil
 }
 
 func splitTag(ref string) (string, string) {

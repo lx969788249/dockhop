@@ -153,7 +153,7 @@ func TestPartialRollbackKeepsOtherGroup(t *testing.T) {
 			drop = append(drop, e)
 		}
 	}
-	u := &undo{screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+	u := &undo{mountPoint: noMounts, screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
 	if problems := u.rollback(context.Background(), drop); len(problems) > 0 {
 		t.Fatal(problems)
 	}
@@ -180,7 +180,7 @@ func TestPartialRollbackRestoresImageNames(t *testing.T) {
 	}
 	d := &images{tags: map[string]string{"good:1": "sha256:new-good", "bad:1": "sha256:new-bad", "base:1": "sha256:new-base"},
 		ids: map[string]bool{"sha256:old-bad": true, "sha256:new-good": true, "sha256:new-bad": true, "sha256:new-base": true}}
-	r.undo = &undo{dc: d.docker(t), screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+	r.undo = &undo{mountPoint: noMounts, dc: d.docker(t), screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
 	j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
 	if err != nil {
 		t.Fatal(err)
@@ -247,7 +247,7 @@ func TestPartialRollbackImageNameUsers(t *testing.T) {
 				}
 				r.images[f.File] = imageSource{local: f.ID} // 本机已经有，只加名字
 			}
-			r.undo = &undo{dc: r.Docker, screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+			r.undo = &undo{mountPoint: noMounts, dc: r.Docker, screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
 			j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
 			if err != nil {
 				t.Fatal(err)
@@ -313,7 +313,7 @@ func partialRun(t *testing.T, dir string) *run {
 	t.Cleanup(func() { log.Finish(logging.Failed, true) })
 	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(io.Discard, false, nil), Prompt: ui.NewPrompter(nil, io.Discard), Log: log,
 		Home: t.TempDir(), Getenv: func(string) string { return "" }}, rbDir: dir}
-	r.undo = &undo{dc: dc, screen: r.Screen, logf: t.Logf, record: func(e Entry) error { return appendJournal(dir, e) },
+	r.undo = &undo{mountPoint: noMounts, dc: dc, screen: r.Screen, logf: t.Logf, record: func(e Entry) error { return appendJournal(dir, e) },
 		fail: func(string) bool { return false }}
 	return r
 }
@@ -369,6 +369,9 @@ func TestRecoverPartialCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkPartialDone(t, root)
+	if !r.changed() {
+		t.Error("接着做完了上次的迁入，这次运行改动过这台服务器（之后取消、失败时结果里不能说没有改动）")
+	}
 	if _, err := os.Lstat(r.rbDir); !errors.Is(err, os.ErrNotExist) {
 		t.Error("做完之后回滚资料目录应删掉")
 	}
