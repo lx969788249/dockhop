@@ -127,11 +127,13 @@ func TestReplaceFollowsProject(t *testing.T) {
 			}
 			var out bytes.Buffer
 			screen := ui.New(&out, false, nil)
-			r := &run{Deps: Deps{Docker: dc, Home: home, Screen: screen, Getenv: func(string) string { return "" }}, d: d,
-				plan:    &bundle.Plan{Containers: plan},
-				m:       &bundle.Manifest{Containers: containers, Projects: []bundle.Project{{Name: "site", WorkingDir: filepath.Join(home, "site")}}},
-				dataDir: data, rbDir: filepath.Join(home, "rollback", "current"), anonVolumes: map[string]bundle.Volume{},
-				undo: &undo{mountPoint: noMounts, dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
+			r := testRun(t, Deps{Docker: dc, Home: home, Screen: screen}, Options{})
+			r.d = d
+			r.plan = &bundle.Plan{Containers: plan}
+			r.m = &bundle.Manifest{Containers: containers, Projects: []bundle.Project{{Name: "site", WorkingDir: filepath.Join(home, "site")}}}
+			r.dataDir = data
+			r.rbDir = filepath.Join(home, "rollback", "current")
+			r.undo = testUndo(t, dc, screen)
 			ctx := context.Background()
 			err := r.decide(ctx)
 			if err == nil {
@@ -294,10 +296,13 @@ func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.D
 	}
 	var out bytes.Buffer
 	screen := ui.New(&out, false, nil)
-	r = &run{Deps: Deps{Docker: dc, Home: home, Screen: screen, Getenv: func(string) string { return "" }},
-		opts: Options{Existing: policy}, d: d, plan: &bundle.Plan{Containers: plan}, m: m,
-		dataDir: data, rbDir: filepath.Join(home, "rollback", "current"), anonVolumes: map[string]bundle.Volume{},
-		undo: &undo{mountPoint: noMounts, dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
+	r = testRun(t, Deps{Docker: dc, Home: home, Screen: screen}, Options{Existing: policy})
+	r.d = d
+	r.plan = &bundle.Plan{Containers: plan}
+	r.m = m
+	r.dataDir = data
+	r.rbDir = filepath.Join(home, "rollback", "current")
+	r.undo = testUndo(t, dc, screen)
 	ctx := context.Background()
 	err := r.decide(ctx)
 	if err == nil {

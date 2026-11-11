@@ -85,7 +85,7 @@ type run struct {
 // Run 执行迁出。不管成功、失败还是被中断，都会把源容器恢复原状、删除临时文件，
 // 最后打印结果摘要。
 func Run(ctx context.Context, d Deps, o Options) error {
-	r := &run{Deps: d, opts: o, started: time.Now(), rid: randomID()}
+	r := newRun(d, o)
 	lock, err := host.TryLock(lockPath(d.Home))
 	if err != nil {
 		d.Screen.Problem(err.Error(), "")
@@ -102,6 +102,11 @@ func Run(ctx context.Context, d Deps, o Options) error {
 		d.Failed()
 	}
 	return r.report(end)
+}
+
+// newRun 按 d、o 准备一次迁出。
+func newRun(d Deps, o Options) *run {
+	return &run{Deps: d, opts: o, started: time.Now(), rid: randomID()}
 }
 
 // dropStale 删掉以前的迁出被强制结束时留下的工作目录（迁移包和镜像文件）。正常结束时 cleanup

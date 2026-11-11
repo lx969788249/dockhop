@@ -70,25 +70,32 @@ func TestEnding(t *testing.T) {
 	bg := context.Background()
 	stopped, cancel := context.WithCancel(bg)
 	cancel()
+	// state 是这次迁入走到了哪里：开始了事务（began）、提交了、只保留了一部分、删过上次留下的内容。
+	type state struct{ began, committed, partial, rollbackDone bool }
 	cases := []struct {
 		name string
 		ctx  context.Context
 		err  error
-		r    *run
+		st   state
 		want ending
 	}{
-		{"迁入完成", bg, nil, &run{j: &Journal{}, committed: true}, endSucceeded},
-		{"已经提交，清理没做完", bg, ui.ErrReported, &run{j: &Journal{}, committed: true}, endCommitted},
-		{"只迁入了一部分", bg, errPartial, &run{j: &Journal{}, committed: true, partial: true}, endPartial},
-		{"还没改动就停下（检查发现问题、动手前核对发现变了）", bg, ui.ErrReported, &run{}, endStopped},
-		{"改动之后失败", bg, ui.ErrReported, &run{j: &Journal{}}, endFailed},
-		{"还没改动就按了 Ctrl+C", stopped, ui.ErrReported, &run{}, endCancelled},
-		{"回答问题时按了 Ctrl+D", bg, io.EOF, &run{}, endCancelled},
-		{"改动之后按了 Ctrl+C", stopped, ui.ErrReported, &run{j: &Journal{}}, endInterrupted},
-		{"删除上次留下的内容之后按了 Ctrl+C", stopped, ui.ErrReported, &run{rollbackDone: true}, endInterrupted},
+		{"迁入完成", bg, nil, state{began: true, committed: true}, endSucceeded},
+		{"已经提交，清理没做完", bg, ui.ErrReported, state{began: true, committed: true}, endCommitted},
+		{"只迁入了一部分", bg, errPartial, state{began: true, committed: true, partial: true}, endPartial},
+		{"还没改动就停下（检查发现问题、动手前核对发现变了）", bg, ui.ErrReported, state{}, endStopped},
+		{"改动之后失败", bg, ui.ErrReported, state{began: true}, endFailed},
+		{"还没改动就按了 Ctrl+C", stopped, ui.ErrReported, state{}, endCancelled},
+		{"回答问题时按了 Ctrl+D", bg, io.EOF, state{}, endCancelled},
+		{"改动之后按了 Ctrl+C", stopped, ui.ErrReported, state{began: true}, endInterrupted},
+		{"删除上次留下的内容之后按了 Ctrl+C", stopped, ui.ErrReported, state{rollbackDone: true}, endInterrupted},
 	}
 	for _, c := range cases {
-		if got := c.r.ending(c.ctx, c.err); got != c.want {
+		r := testRun(t, Deps{}, Options{})
+		if c.st.began {
+			r.j = &Journal{}
+		}
+		r.committed, r.partial, r.rollbackDone = c.st.committed, c.st.partial, c.st.rollbackDone
+		if got := r.ending(c.ctx, c.err); got != c.want {
 			t.Errorf("%s：%v，应为 %v", c.name, got, c.want)
 		}
 	}

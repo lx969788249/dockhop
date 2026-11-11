@@ -18,7 +18,7 @@ func TestVerifyDownload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "image-1")
 	os.WriteFile(path, []byte("image-2 的内容"), 0o600)
 	var out bytes.Buffer
-	r := &run{Deps: Deps{Screen: ui.New(&out, false, nil)}}
+	r := testRun(t, Deps{Screen: ui.New(&out, false, nil)}, Options{})
 	want, _ := fileSHA256(path)
 	if err := r.verifyDownload(path, want, "镜像文件"); err != nil {
 		t.Fatal(err)
@@ -57,7 +57,9 @@ func TestCheckSums(t *testing.T) {
 				}
 			}
 			var out bytes.Buffer
-			r := &run{Deps: Deps{Screen: ui.New(&out, false, nil)}, plan: plan, images: c.images}
+			r := testRun(t, Deps{Screen: ui.New(&out, false, nil)}, Options{})
+			r.plan = plan
+			r.images = c.images
 			if err := r.checkSums(); (err == nil) != c.ok || !c.ok && !strings.Contains(out.String(), "1.1.6 之前的版本") {
 				t.Fatalf("结果：%v\n%s", err, out.String())
 			}
@@ -76,7 +78,7 @@ func TestDropStale(t *testing.T) {
 		os.MkdirAll(filepath.Dir(full), 0o700)
 		os.WriteFile(full, []byte("x"), 0o600)
 	}
-	r := &run{Deps: Deps{Home: home}, opts: Options{Link: link}}
+	r := testRun(t, Deps{Home: home}, Options{Link: link})
 	r.dropStale()
 	for p, keep := range map[string]bool{"work/in-old": false, "state/in-old.json": false, "work/" + cur: true,
 		"state/" + cur + ".json": true, "work/out-abc": true, "state/out-stopped.json": true} {

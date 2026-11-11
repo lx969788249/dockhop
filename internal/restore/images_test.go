@@ -134,8 +134,10 @@ func TestImageSources(t *testing.T) {
 	dc := fake.Client()
 
 	var out bytes.Buffer
-	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Getenv: func(string) string { return "" }},
-		opts: Options{Link: link}, workdir: t.TempDir(), m: &bundle.Manifest{ImageFiles: files}, j: testJournal(t)}
+	r := testRun(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, Options{Link: link})
+	r.workdir = t.TempDir()
+	r.m = &bundle.Manifest{ImageFiles: files}
+	r.j = testJournal(t)
 	r.decideImages(context.Background(), files)
 	want := map[string]imageSource{"image-1": {local: "sha256:here"}, "image-2": {pull: true}, "image-3": {pull: true}, "image-5": {pull: true}}
 	for _, f := range files {
@@ -214,8 +216,10 @@ func TestLoadImagesNamesPinned(t *testing.T) {
 			dc := fake.Client()
 			id := "sha256:" + strings.Repeat("b", 64)
 			var out bytes.Buffer
-			r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, dataDir: t.TempDir(), imageAs: map[string]string{},
-				m: &bundle.Manifest{Images: bundle.Images{Refs: map[string]string{digest: id, "nginx:1.27": id}}}, j: testJournal(t)}
+			r := testRun(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, Options{})
+			r.dataDir = t.TempDir()
+			r.m = &bundle.Manifest{Images: bundle.Images{Refs: map[string]string{digest: id, "nginx:1.27": id}}}
+			r.j = testJournal(t)
 			if err := r.loadImages(context.Background()); err != nil {
 				t.Fatalf("%v\n%s", err, out.String())
 			}
@@ -271,8 +275,9 @@ func TestImageNamesFollowGroups(t *testing.T) {
 	d := &images{tags: map[string]string{"bad:1": "sha256:old-bad"}, ids: map[string]bool{"sha256:old-bad": true,
 		"sha256:good": true, "sha256:bad": true, "sha256:base": true, "sha256:pair": true}}
 	var out bytes.Buffer
-	r := &run{Deps: Deps{Docker: d.docker(t), Screen: ui.New(&out, false, nil)}, imageAs: map[string]string{},
-		m: &bundle.Manifest{Images: bundle.Images{Refs: map[string]string{}}}, images: map[string]imageSource{}}
+	r := testRun(t, Deps{Docker: d.docker(t), Screen: ui.New(&out, false, nil)}, Options{})
+	r.m = &bundle.Manifest{Images: bundle.Images{Refs: map[string]string{}}}
+	r.images = map[string]imageSource{}
 	// good、bad 各用自己的镜像；base:1 两个互不相干（分在不同组）的容器都用；left、right 用
 	// 同一个镜像的两个名字，这个镜像还有一个谁都没用的名字 pair:latest。
 	for _, x := range [][3]string{{"good", "good:1"}, {"bad", "bad:1"}, {"tool-a", "base:1"}, {"tool-b", "base:1"},

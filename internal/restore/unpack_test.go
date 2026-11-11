@@ -68,8 +68,11 @@ func TestBadBundleDropsDownload(t *testing.T) {
 			plan.BundleSHA256, _ = fileSHA256(path)
 		}
 		var out bytes.Buffer
-		r := &run{Deps: Deps{Screen: ui.New(&out, false, nil), Home: dir}, opts: Options{Link: link}, plan: plan,
-			downloaded: true, bundlePath: path, dataDir: filepath.Join(dir, "data")}
+		r := testRun(t, Deps{Screen: ui.New(&out, false, nil), Home: dir}, Options{Link: link})
+		r.plan = plan
+		r.downloaded = true
+		r.bundlePath = path
+		r.dataDir = filepath.Join(dir, "data")
 		_, err := r.unpack(context.Background())
 		got := r.Screen.Failure()
 		if err == nil || got == nil || !strings.Contains(got.Hint, "在旧服务器重新运行迁出") || strings.Contains(got.Hint, "重新下载") != c.redownload {
@@ -87,7 +90,8 @@ func TestHomeClash(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "dockhop")
 	app := filepath.Join(root, "app")
-	r := &run{Deps: Deps{Home: home}, m: &bundle.Manifest{Binds: []bundle.Bind{{Path: app}}}}
+	r := testRun(t, Deps{Home: home}, Options{})
+	r.m = &bundle.Manifest{Binds: []bundle.Bind{{Path: app}}}
 	if is := r.homeClash(); is != nil {
 		t.Fatalf("不重叠时不应拦下：%s", is.Title)
 	}

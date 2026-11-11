@@ -161,7 +161,8 @@ func TestOwnDirsThroughLink(t *testing.T) {
 	os.WriteFile(filepath.Join(real, "compose.yml"), []byte("services: {}\n"), 0o644)
 	link := filepath.Join(root, "app")
 	os.Symlink(real, link)
-	r := &run{Deps: Deps{Home: home}, workdir: filepath.Join(home, "work", "out-1")}
+	r := testRun(t, Deps{Home: home}, Options{})
+	r.workdir = filepath.Join(home, "work", "out-1")
 	var buf bytes.Buffer
 	if err := (hostTar{ctx: context.Background(), roots: []string{link}, base: link, excludes: r.ownDirs(link), logf: t.Logf}).write(&buf); err != nil {
 		t.Fatal(err)

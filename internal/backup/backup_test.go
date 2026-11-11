@@ -85,25 +85,36 @@ func TestEnding(t *testing.T) {
 	stopped, cancel := context.WithCancel(bg)
 	cancel()
 	serving := &transfer.Server{}
+	// state 是这次迁出走到了哪里：开始了传输（serving）、新服务器报告的结果、停下了几个容器、恢复了几个。
+	type state struct {
+		serving             bool
+		status              string
+		toRestore, restored int
+	}
 	cases := []struct {
 		name string
 		ctx  context.Context
 		err  error
-		r    *run
+		st   state
 		want ending
 	}{
-		{"新服务器迁入成功", bg, nil, &run{server: serving, status: "success"}, endSucceeded},
-		{"新服务器迁入失败后结束传输", bg, nil, &run{server: serving, status: "failed"}, endSucceeded},
-		{"传输时按 Ctrl+C 结束", stopped, nil, &run{server: serving}, endSucceeded},
-		{"还没改动就停下（检查发现问题、停机前核对发现变了）", bg, ui.ErrReported, &run{}, endStopped},
-		{"停机打包之后失败", bg, ui.ErrReported, &run{toRestore: 2, restored: 2}, endFailed},
-		{"停下的容器没能全部恢复", bg, nil, &run{toRestore: 2, restored: 1}, endFailed},
-		{"还没改动就按了 Ctrl+C", stopped, ui.ErrReported, &run{}, endCancelled},
-		{"回答问题时按了 Ctrl+D", bg, io.EOF, &run{}, endCancelled},
-		{"停机打包时按了 Ctrl+C", stopped, ui.ErrReported, &run{toRestore: 2, restored: 2}, endInterrupted},
+		{"新服务器迁入成功", bg, nil, state{serving: true, status: "success"}, endSucceeded},
+		{"新服务器迁入失败后结束传输", bg, nil, state{serving: true, status: "failed"}, endSucceeded},
+		{"传输时按 Ctrl+C 结束", stopped, nil, state{serving: true}, endSucceeded},
+		{"还没改动就停下（检查发现问题、停机前核对发现变了）", bg, ui.ErrReported, state{}, endStopped},
+		{"停机打包之后失败", bg, ui.ErrReported, state{toRestore: 2, restored: 2}, endFailed},
+		{"停下的容器没能全部恢复", bg, nil, state{toRestore: 2, restored: 1}, endFailed},
+		{"还没改动就按了 Ctrl+C", stopped, ui.ErrReported, state{}, endCancelled},
+		{"回答问题时按了 Ctrl+D", bg, io.EOF, state{}, endCancelled},
+		{"停机打包时按了 Ctrl+C", stopped, ui.ErrReported, state{toRestore: 2, restored: 2}, endInterrupted},
 	}
 	for _, c := range cases {
-		if got := c.r.ending(c.ctx, c.err); got != c.want {
+		r := testRun(t, Deps{}, Options{})
+		if c.st.serving {
+			r.server = serving
+		}
+		r.status, r.toRestore, r.restored = c.st.status, c.st.toRestore, c.st.restored
+		if got := r.ending(c.ctx, c.err); got != c.want {
 			t.Errorf("%s：%v，应为 %v", c.name, got, c.want)
 		}
 	}

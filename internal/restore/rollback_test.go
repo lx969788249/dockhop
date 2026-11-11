@@ -63,7 +63,7 @@ func TestFileChangesRollBack(t *testing.T) {
 	before := snapshotTree(t, world)
 
 	var out bytes.Buffer
-	r := &run{Deps: Deps{Screen: ui.New(&out, false, nil), Home: filepath.Join(root, "home")}}
+	r := testRun(t, Deps{Screen: ui.New(&out, false, nil), Home: filepath.Join(root, "home")}, Options{})
 	j, err := openJournal(filepath.Join(root, "rb"))
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +108,7 @@ func TestFileChangesRollBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u := &undo{mountPoint: noMounts, screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+	u := testUndo(t, nil, r.Screen)
 	if problems := u.rollback(context.Background(), entries); len(problems) > 0 {
 		t.Fatalf("还原有问题：%v", problems)
 	}
@@ -162,8 +162,9 @@ func dirNames(dir string) []string {
 
 func bindRun(t *testing.T, root, dataDir string) *run {
 	t.Helper()
-	r := &run{Deps: Deps{Screen: ui.New(io.Discard, false, nil), Home: filepath.Join(root, "home"), Getenv: func(string) string { return "" },
-		MountPoint: noMounts}, dataDir: dataDir}
+	r := testRun(t, Deps{Home: filepath.Join(root, "home"),
+		MountPoint: noMounts}, Options{})
+	r.dataDir = dataDir
 	j, err := openJournal(filepath.Join(root, "rb"))
 	if err != nil {
 		t.Fatal(err)
@@ -293,7 +294,7 @@ func TestStageRemoved(t *testing.T) {
 		stage := filepath.Join(t.TempDir(), ".data.dockhop-stage-x")
 		os.MkdirAll(filepath.Join(stage, "srv", "data"), 0o700)
 		os.WriteFile(filepath.Join(stage, "srv", "data", "big"), []byte("big"), 0o600)
-		u := &undo{mountPoint: noMounts, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+		u := testUndo(t, nil, nil)
 		entries := []Entry{{Op: opStage, Path: stage}}
 		if commit {
 			if left := u.cleanupCommitted(context.Background(), entries); len(left) > 0 {
@@ -344,7 +345,8 @@ func TestRestoreBindIntoMountPoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u := &undo{screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }, mountPoint: mounted}
+	u := testUndo(t, nil, r.Screen)
+	u.mountPoint = mounted
 	for i := 1; i <= 2; i++ {
 		if problems := u.rollback(context.Background(), entries); len(problems) > 0 {
 			t.Fatalf("第 %d 次回滚：%v", i, problems)
@@ -383,8 +385,8 @@ func TestUndoContentsResumes(t *testing.T) {
 				os.WriteFile(filepath.Join(backup, n), []byte(s), 0o600)
 			}
 		}
-		u := &undo{screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
-			mountPoint: func(p string) (bool, error) { return p == dst, nil }}
+		u := testUndo(t, nil, nil)
+		u.mountPoint = func(p string) (bool, error) { return p == dst, nil }
 		e := Entry{Op: opContents, Path: dst, Backup: backup, Names: []string{"a", "same"},
 			Meta: &FileMeta{Mode: 0o750, UID: os.Getuid(), GID: os.Getgid(), MTime: originalTime.UnixNano()}}
 		for i := 1; i <= 2; i++ {
@@ -414,8 +416,8 @@ func TestUndoContentsDiskNotMounted(t *testing.T) {
 	e := Entry{Op: opContents, Path: dst, Backup: filepath.Join(dst, ".dockhop-old-x"), Names: []string{"a"},
 		Meta: &FileMeta{Mode: 0o750, UID: os.Getuid(), GID: os.Getgid()}}
 	for _, mounted := range []bool{true, false} {
-		u := &undo{screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
-			mountPoint: func(string) (bool, error) { return mounted, nil }}
+		u := testUndo(t, nil, nil)
+		u.mountPoint = func(string) (bool, error) { return mounted, nil }
 		problems := u.rollback(context.Background(), []Entry{e})
 		if mounted && len(problems) > 0 {
 			t.Errorf("还挂着、备份已经放回去了：不应有问题：%v", problems)
@@ -437,7 +439,7 @@ func TestRollbackStopsWhenDockerErrors(t *testing.T) {
 	os.MkdirAll(backup, 0o755)
 	os.WriteFile(filepath.Join(backup, "old.txt"), []byte("original"), 0o644)
 	var out bytes.Buffer
-	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+	u := testUndo(t, dc, ui.New(&out, false, nil))
 	problems := u.rollback(context.Background(), []Entry{
 		{Op: opStart},
 		{Op: opBind, Path: dir, Existed: true, Backup: backup},
@@ -508,8 +510,11 @@ func sharedWriters(t *testing.T, stopOK bool) (r *run, dataReplacedWhileRunning 
 			t.Fatal(err)
 		}
 	}
-	r = &run{Deps: Deps{Docker: dc, Screen: screen}, j: j, rbDir: rb, shared: shared,
-		undo: &undo{mountPoint: noMounts, dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
+	r = testRun(t, Deps{Docker: dc, Screen: screen}, Options{})
+	r.j = j
+	r.rbDir = rb
+	r.shared = shared
+	r.undo = testUndo(t, dc, screen)
 	if err := r.commit(context.Background()); err == nil {
 		t.Fatal("a 恢复失败时提交应失败")
 	}
@@ -596,8 +601,9 @@ func TestRollbackStopsRebuiltOldCompose(t *testing.T) {
 		tw.Close()
 		f.Close()
 		var out bytes.Buffer
-		u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
-			record: func(Entry) error { return nil }, vio: &volumeIO{dc: dc, image: "alpine", helperBin: "/unused"}}
+		u := testUndo(t, dc, ui.New(&out, false, nil))
+		u.record = func(Entry) error { return nil }
+		u.vio = &volumeIO{dc: dc, image: "alpine", helperBin: "/unused"}
 		problems := u.rollback(context.Background(), []Entry{
 			{Op: opComposeOld, Name: "stack", Old: []OldContainer{{ID: "old-app", Name: "stack-app-1", State: "running",
 				Raw: json.RawMessage(`{"Id":"old-app","Name":"/stack-app-1","Image":"sha256:original","Config":{"Image":"alpine"},"HostConfig":{}}`)}}},
@@ -689,8 +695,8 @@ func TestRollbackAgainKeepsRebuiltOldCompose(t *testing.T) {
 	}
 	j.close()
 	var out bytes.Buffer
-	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
-		record: func(e Entry) error { return appendJournal(j.dir, e) }}
+	u := testUndo(t, dc, ui.New(&out, false, nil))
+	u.record = func(e Entry) error { return appendJournal(j.dir, e) }
 	for i := 1; i <= 2; i++ { // 第二次：上次回滚做完了，回滚资料还没删
 		entries, err := readJournal(j.dir)
 		if err != nil {
@@ -729,8 +735,8 @@ func TestRollbackRebuiltNotRecorded(t *testing.T) {
 	})
 	dc := fake.Client()
 	var out bytes.Buffer
-	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
-		record: func(Entry) error { return errors.New("磁盘满了") }}
+	u := testUndo(t, dc, ui.New(&out, false, nil))
+	u.record = func(Entry) error { return errors.New("磁盘满了") }
 	problems := u.rollback(context.Background(), []Entry{{Op: opComposeOld, Name: "stack", Old: []OldContainer{{ID: "old-app", Name: "stack-app-1", State: "running",
 		Raw: json.RawMessage(`{"Id":"old-app","Name":"/stack-app-1","Image":"sha256:original","Config":{"Image":"alpine"},"HostConfig":{}}`)}}}})
 	if len(problems) > 0 {
@@ -769,8 +775,8 @@ func TestRollbackRestoresVolumeOnce(t *testing.T) {
 	tw.Close()
 	f.Close()
 	var out bytes.Buffer
-	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
-		vio: &volumeIO{dc: dc, image: "alpine", helperBin: "/unused"}}
+	u := testUndo(t, dc, ui.New(&out, false, nil))
+	u.vio = &volumeIO{dc: dc, image: "alpine", helperBin: "/unused"}
 	for i := 1; i <= 2; i++ {
 		if problems := u.rollback(context.Background(), []Entry{{Op: opVolume, Name: "data", Existed: true, Backup: backup}}); len(problems) > 0 {
 			t.Fatalf("第 %d 次回滚：%v", i, problems)
@@ -815,8 +821,8 @@ func TestRollbackOldComposeNamespace(t *testing.T) {
 		return b
 	}
 	var out bytes.Buffer
-	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
-		record: func(Entry) error { return nil }}
+	u := testUndo(t, dc, ui.New(&out, false, nil))
+	u.record = func(Entry) error { return nil }
 	// 原来是停着的：只重建，不启动。sidecar 排在前面，检查重建的顺序。
 	u.rollback(context.Background(), []Entry{{Op: opComposeOld, Name: "stack", Old: []OldContainer{
 		{ID: sideID, Name: "stack-sidecar-1", State: "exited", Raw: raw(sideID, "stack-sidecar-1", "container:"+vpnID)},
@@ -854,7 +860,7 @@ func TestUndoRenameResumes(t *testing.T) {
 		})
 		dc := fake.Client()
 		var out bytes.Buffer
-		u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+		u := testUndo(t, dc, ui.New(&out, false, nil))
 		problems := u.rollback(context.Background(), []Entry{{Op: opRename, Name: "web", ID: "old-web", Backup: "web.dockhop-backup-x",
 			Networks: json.RawMessage(`{"front":{"IPAMConfig":{"IPv4Address":"172.30.9.10"},"Aliases":["web"]}}`)}})
 		if len(problems) > 0 {
@@ -897,7 +903,7 @@ func TestUndoTag(t *testing.T) {
 	})
 	dc := fake.Client()
 	var out bytes.Buffer
-	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+	u := testUndo(t, dc, ui.New(&out, false, nil))
 	problems := u.rollback(context.Background(), []Entry{
 		{Op: opTag, Name: "nginx:1.27", ID: "sha256:original"}, // 原来指向别的镜像
 		{Op: opTag, Name: "app:dev"},                           // 原来没有这个名字
@@ -975,8 +981,8 @@ func TestRollbackRestoresAcrossProjects(t *testing.T) {
 				entries = append(entries, Entry{Op: opComposeOld, Name: p, Old: []OldContainer{old[p]}})
 			}
 			var out bytes.Buffer
-			u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
-				record: func(Entry) error { return nil }}
+			u := testUndo(t, dc, ui.New(&out, false, nil))
+			u.record = func(Entry) error { return nil }
 			problems := u.rollback(context.Background(), entries)
 			if len(problems) > 0 || strings.Join(events, "，") != "建 avpn-vpn-1，建 zside-sidecar-1，启动 avpn-vpn-1，启动 zside-sidecar-1" {
 				t.Fatalf("顺序：%v；问题：%v", events, problems)
@@ -1119,7 +1125,7 @@ func TestRollbackKeepsImagesThatWereThere(t *testing.T) {
 				d.ids[id] = true
 			}
 			var out bytes.Buffer
-			u := &undo{mountPoint: noMounts, dc: d.docker(t), screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+			u := testUndo(t, d.docker(t), ui.New(&out, false, nil))
 			problems := u.rollback(context.Background(), append([]Entry{{Op: opImages, Names: c.had}}, c.entries...))
 			if len(problems) > 0 || !maps.Equal(d.tags, c.want) || strings.Join(d.deleted, ",") != c.deleted {
 				t.Fatalf("镜像名 %v，删掉的 %v，问题 %v", d.tags, d.deleted, problems)
@@ -1149,7 +1155,7 @@ func TestCleanupRemovesOldAnonymousVolumes(t *testing.T) {
 		return true
 	})
 	dc := fake.Client()
-	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
+	u := testUndo(t, dc, nil)
 	entries := []Entry{
 		{Op: opRename, Name: "web", ID: "old-web", Backup: "web.dockhop-backup-1"},
 		{Op: opComposeOld, Name: "stack", Old: []OldContainer{
@@ -1178,8 +1184,8 @@ func TestUndoBindNeverRemovesMountPoint(t *testing.T) {
 		os.MkdirAll(dst, 0o755)
 		os.WriteFile(filepath.Join(dst, "on-disk.txt"), []byte("disk data"), 0o644)
 		os.MkdirAll(old, 0o755)
-		u := &undo{screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
-			mountPoint: func(p string) (bool, error) { return p == dst, nil }}
+		u := testUndo(t, nil, nil)
+		u.mountPoint = func(p string) (bool, error) { return p == dst, nil }
 		problems := u.rollback(context.Background(), []Entry{e})
 		if b, _ := os.ReadFile(filepath.Join(dst, "on-disk.txt")); string(b) != "disk data" || len(problems) == 0 {
 			t.Errorf("%+v：挂载点不能整个删除，要说明：%v", e, problems)
@@ -1231,8 +1237,8 @@ func TestEveryOpHandled(t *testing.T) {
 		return true
 	})
 	dc := fake.Client()
-	u := &undo{dc: dc, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
-		mountPoint: noMounts, record: func(Entry) error { return nil }}
+	u := testUndo(t, dc, nil)
+	u.record = func(Entry) error { return nil }
 	for _, p := range append(u.rollback(context.Background(), entries), u.cleanupCommitted(context.Background(), entries)...) {
 		if strings.Contains(p, "不认识") {
 			t.Error(p)
@@ -1274,8 +1280,8 @@ func TestRollbackRemovesOnlyCreatedContainers(t *testing.T) {
 				return true
 			})
 			dc := fake.Client()
-			u := &undo{dc: dc, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
-				mountPoint: noMounts, record: func(Entry) error { return nil }}
+			u := testUndo(t, dc, nil)
+			u.record = func(Entry) error { return nil }
 			if problems := u.rollback(context.Background(), c.entries); len(problems) > 0 {
 				t.Errorf("不应有问题：%v", problems)
 			}
@@ -1311,7 +1317,9 @@ func TestCreateContainerRecordsID(t *testing.T) {
 				return true
 			})
 			dc, calls := fake.Client(), fake.Calls
-			r = &run{Deps: Deps{Docker: dc, Screen: ui.New(io.Discard, false, nil)}, m: &bundle.Manifest{}, j: testJournal(t)}
+			r = testRun(t, Deps{Docker: dc}, Options{})
+			r.m = &bundle.Manifest{}
+			r.j = testJournal(t)
 			raw := json.RawMessage(`{"Name":"/web","Config":{"Image":"alpine"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`)
 			it := &citem{m: bundle.Container{Name: "web"}, raw: raw, c: &docker.Container{}, img: "alpine"}
 			err := r.createContainer(context.Background(), it)

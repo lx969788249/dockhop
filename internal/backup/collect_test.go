@@ -235,7 +235,7 @@ func TestRecheckBeforeStop(t *testing.T) {
 			mu.Lock()
 			c.change(cur)
 			mu.Unlock()
-			r := &run{Deps: Deps{Docker: dc, Screen: s, Getenv: func(string) string { return "" }}}
+			r := testRun(t, Deps{Docker: dc, Screen: s}, Options{})
 			err = r.recheck(context.Background(), col)
 			switch {
 			case c.want == "" && err != nil:

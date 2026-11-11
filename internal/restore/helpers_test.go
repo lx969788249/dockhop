@@ -22,6 +22,35 @@ import (
 // noMounts 是没有任何单独挂载的目录时的 Deps.MountPoint。
 func noMounts(string) (bool, error) { return false, nil }
 
+// testRun 是测试用的 run，和迁入时一样用 newRun 造；没给的依赖补上测试用的：屏幕丢掉输出、环境变量都是空的、
+// DockHop 的目录放在临时目录里、没有单独挂载的目录。迁入走到哪一步才有的内容（迁移计划、清单、要迁的容器……）
+// 由测试自己填。
+func testRun(t *testing.T, d Deps, o Options) *run {
+	t.Helper()
+	if d.Screen == nil {
+		d.Screen = ui.New(io.Discard, false, nil)
+	}
+	if d.Getenv == nil {
+		d.Getenv = func(string) string { return "" }
+	}
+	if d.Home == "" {
+		d.Home = t.TempDir()
+	}
+	if d.MountPoint == nil {
+		d.MountPoint = noMounts
+	}
+	return newRun(d, o)
+}
+
+// testUndo 是测试用的 undo：日志写到 t.Logf，不模拟失败，没有单独挂载的目录；screen 为空时丢掉输出。
+// 别的按需要再填。
+func testUndo(t *testing.T, dc *docker.Client, screen *ui.Screen) *undo {
+	if screen == nil {
+		screen = ui.New(io.Discard, false, nil)
+	}
+	return &undo{dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }, mountPoint: noMounts}
+}
+
 // prepareWith 用要写入目录 shared 的容器 new-app（和一个不用数据的 kept）按迁入的顺序调用
 // decide、begin、prepare。新服务器上的已有容器由 handle 回答（shared 是那个目录的完整路径）。
 // 返回屏幕上的输出（失败时有原因）和停过的容器。
@@ -47,12 +76,14 @@ func prepareWith(t *testing.T, d preflight.Decisions, handle func(w http.Respons
 	os.WriteFile(filepath.Join(data, "containers", "kept.json"), []byte(`{"Id":"source-kept","Name":"/kept","Config":{"Image":"alpine"}}`), 0o600)
 	var out bytes.Buffer
 	screen := ui.New(&out, false, nil)
-	r := &run{Deps: Deps{Docker: dc, Home: home, Screen: screen, Getenv: func(string) string { return "" }}, d: d,
-		plan: &bundle.Plan{Containers: []bundle.PlanContainer{{Name: "kept"}, {Name: "new-app", Binds: []string{shared}}},
-			Binds: []bundle.PlanBind{{Path: shared}}},
-		m:       &bundle.Manifest{Containers: []bundle.Container{{Name: "kept"}, {Name: "new-app"}}, Binds: []bundle.Bind{{Path: shared}}},
-		dataDir: data, rbDir: filepath.Join(home, "rollback", "current"), anonVolumes: map[string]bundle.Volume{},
-		undo: &undo{mountPoint: noMounts, dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }}}
+	r := testRun(t, Deps{Docker: dc, Home: home, Screen: screen}, Options{})
+	r.d = d
+	r.plan = &bundle.Plan{Containers: []bundle.PlanContainer{{Name: "kept"}, {Name: "new-app", Binds: []string{shared}}},
+		Binds: []bundle.PlanBind{{Path: shared}}}
+	r.m = &bundle.Manifest{Containers: []bundle.Container{{Name: "kept"}, {Name: "new-app"}}, Binds: []bundle.Bind{{Path: shared}}}
+	r.dataDir = data
+	r.rbDir = filepath.Join(home, "rollback", "current")
+	r.undo = testUndo(t, dc, screen)
 	err := r.decide(context.Background())
 	if err == nil {
 		err = r.begin()
@@ -97,12 +128,12 @@ func fakeContainer(t *testing.T, logs string, states ...string) (*docker.Client,
 	}
 	t.Cleanup(func() { log.Finish(logging.Failed, true) })
 	var out bytes.Buffer
-	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: &logging.Redactor{},
+	r := testRun(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: &logging.Redactor{},
 		Getenv: func(k string) string {
 			if k == "DOCKHOP_TEST_STARTUP_GRACE" {
 				return "1s"
 			}
 			return ""
-		}}}
+		}}, Options{})
 	return dc, &out, r
 }

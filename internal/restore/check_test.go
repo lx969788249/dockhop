@@ -44,7 +44,7 @@ func TestRefusesWithoutPlan(t *testing.T) {
 	}
 	defer log.Finish(logging.Failed, true)
 	var out bytes.Buffer
-	r := &run{Deps: Deps{Screen: ui.New(&out, false, nil), Log: log, Getenv: func(string) string { return "" }}, opts: Options{Link: link}}
+	r := testRun(t, Deps{Screen: ui.New(&out, false, nil), Log: log}, Options{Link: link})
 	if err := r.fetchPlan(context.Background()); err == nil || r.plan != nil || !strings.Contains(out.String(), "没有提供迁移计划") {
 		t.Fatalf("没有迁移计划时应拒绝迁入：%v\n%s", err, out.String())
 	}
@@ -72,7 +72,7 @@ func TestRefusesOtherPlanVersions(t *testing.T) {
 		}
 		go srv.Serve()
 		var out bytes.Buffer
-		r := &run{Deps: Deps{Screen: ui.New(&out, false, nil), Log: &logging.Logger{}, Getenv: func(string) string { return "" }}, opts: Options{Link: link}}
+		r := testRun(t, Deps{Screen: ui.New(&out, false, nil), Log: &logging.Logger{}}, Options{Link: link})
 		if err := r.fetchPlan(context.Background()); err == nil || r.plan != nil || !strings.Contains(out.String(), want) {
 			t.Errorf("迁移计划的版本是 %d 时应拒绝，说明%s：%v\n%s", v, want, err, out.String())
 		}
@@ -99,8 +99,9 @@ func TestCheckStopsOnCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer log.Finish(logging.Failed, true)
-	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(io.Discard, false, nil), Prompt: ui.NewPrompter(nil, io.Discard), Log: log,
-		Home: dir, Getenv: func(string) string { return "" }}, plan: &bundle.Plan{}}
+	r := testRun(t, Deps{Docker: dc, Prompt: ui.NewPrompter(nil, io.Discard), Log: log,
+		Home: dir, Getenv: func(string) string { return "" }}, Options{})
+	r.plan = &bundle.Plan{}
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(100*time.Millisecond, cancel)
 	start := time.Now()

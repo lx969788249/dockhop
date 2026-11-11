@@ -28,7 +28,7 @@ func TestInstructions(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	r := &run{Deps: Deps{Screen: ui.New(&out, true, nil), Prompt: ui.NewPrompter(strings.NewReader(""), &out)}}
+	r := testRun(t, Deps{Screen: ui.New(&out, true, nil), Prompt: ui.NewPrompter(strings.NewReader(""), &out)}, Options{})
 	text := r.instructions(context.Background(), link)
 
 	if strings.Count(text, link.String()) != 1 || strings.Contains(text, "dockhop.run) in") {

@@ -31,11 +31,12 @@ func TestBuildGroups(t *testing.T) {
 		c.Name = "/" + name
 		return &citem{m: bundle.Container{Name: name, Project: project}, c: &c}
 	}
-	r := &run{m: &bundle.Manifest{
+	r := testRun(t, Deps{}, Options{})
+	r.m = &bundle.Manifest{
 		Binds:    []bundle.Bind{{Path: "/srv/shared"}, {Path: "/srv/blog"}, {Path: "/var/run/docker.sock"}},
 		Volumes:  []bundle.Volume{{Name: "dbdata"}, {Name: "cache"}},
 		Projects: []bundle.Project{{Name: "blog", WorkingDir: "/srv/blog/app"}},
-	}}
+	}
 	r.projects = r.m.Projects
 	// 迁移计划里记的和迁移包里的一致（见 preflight.WritesOf）。
 	r.plan = &bundle.Plan{
@@ -97,7 +98,9 @@ func TestBuildGroupsSharedPaths(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			r := &run{m: &bundle.Manifest{Projects: c.projects}, projects: c.projects}
+			r := testRun(t, Deps{}, Options{})
+			r.m = &bundle.Manifest{Projects: c.projects}
+			r.projects = c.projects
 			for _, p := range c.projects {
 				r.items = append(r.items, &citem{m: bundle.Container{Name: p.Name + "-web-1", Project: p.Name}, c: &docker.Container{}})
 			}
@@ -120,7 +123,9 @@ func TestBuildGroupsSymlinkParent(t *testing.T) {
 		"目录外的文件": {{Name: "a", WorkingDir: filepath.Join(root, "a"), Outside: []string{filepath.Join(root, "alias", "shared.env")}},
 			{Name: "b", WorkingDir: filepath.Join(root, "b"), Outside: []string{filepath.Join(root, "real", "shared.env")}}},
 	} {
-		r := &run{m: &bundle.Manifest{Projects: projects}, projects: projects}
+		r := testRun(t, Deps{}, Options{})
+		r.m = &bundle.Manifest{Projects: projects}
+		r.projects = projects
 		for _, p := range projects {
 			r.items = append(r.items, &citem{m: bundle.Container{Name: p.Name + "-web-1", Project: p.Name}, c: &docker.Container{}})
 		}
@@ -139,7 +144,9 @@ func TestPartialRollbackKeepsOtherGroup(t *testing.T) {
 	os.WriteFile(filepath.Join(stage, "compose.yml"), []byte("services: {}"), 0o600)
 	projects := []bundle.Project{{Name: "a", WorkingDir: filepath.Join(root, "a")}, {Name: "b", WorkingDir: filepath.Join(root, "b")}}
 	var out bytes.Buffer
-	r := &run{Deps: Deps{Screen: ui.New(&out, false, nil)}, m: &bundle.Manifest{Projects: projects}, projects: projects}
+	r := testRun(t, Deps{Screen: ui.New(&out, false, nil)}, Options{})
+	r.m = &bundle.Manifest{Projects: projects}
+	r.projects = projects
 	for _, p := range projects {
 		r.items = append(r.items, &citem{m: bundle.Container{Name: p.Name + "-web-1", Project: p.Name}, c: &docker.Container{}})
 	}
@@ -166,7 +173,7 @@ func TestPartialRollbackKeepsOtherGroup(t *testing.T) {
 			drop = append(drop, e)
 		}
 	}
-	u := &undo{mountPoint: noMounts, screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+	u := testUndo(t, nil, r.Screen)
 	if problems := u.rollback(context.Background(), drop); len(problems) > 0 {
 		t.Fatal(problems)
 	}
@@ -182,7 +189,8 @@ func TestPartialRollbackKeepsOtherGroup(t *testing.T) {
 // 几组都用的镜像名留着。
 func TestPartialRollbackRestoresImageNames(t *testing.T) {
 	var out bytes.Buffer
-	r := &run{Deps: Deps{Screen: ui.New(&out, false, nil)}, m: &bundle.Manifest{}}
+	r := testRun(t, Deps{Screen: ui.New(&out, false, nil)}, Options{})
+	r.m = &bundle.Manifest{}
 	for _, name := range []string{"good", "bad"} {
 		r.items = append(r.items, &citem{m: bundle.Container{Name: name, ImageID: "sha256:src-" + name}, c: &docker.Container{}})
 	}
@@ -193,7 +201,7 @@ func TestPartialRollbackRestoresImageNames(t *testing.T) {
 	}
 	d := &images{tags: map[string]string{"good:1": "sha256:new-good", "bad:1": "sha256:new-bad", "base:1": "sha256:new-base"},
 		ids: map[string]bool{"sha256:old-bad": true, "sha256:new-good": true, "sha256:new-bad": true, "sha256:new-base": true}}
-	r.undo = &undo{mountPoint: noMounts, dc: d.docker(t), screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+	r.undo = testUndo(t, d.docker(t), r.Screen)
 	j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
 	if err != nil {
 		t.Fatal(err)
@@ -246,8 +254,9 @@ func TestPartialRollbackImageNameUsers(t *testing.T) {
 			d := &images{tags: map[string]string{dockerName(c.bad.Image): "sha256:target"},
 				ids: map[string]bool{"sha256:target": true, "sha256:src": true, "sha256:src-old": true}}
 			var out bytes.Buffer
-			r := &run{Deps: Deps{Docker: d.docker(t), Screen: ui.New(&out, false, nil), Home: t.TempDir()}, imageAs: map[string]string{},
-				m: &bundle.Manifest{ImageFiles: c.files, Images: bundle.Images{Refs: map[string]string{}}}, images: map[string]imageSource{}}
+			r := testRun(t, Deps{Docker: d.docker(t), Screen: ui.New(&out, false, nil), Home: t.TempDir()}, Options{})
+			r.m = &bundle.Manifest{ImageFiles: c.files, Images: bundle.Images{Refs: map[string]string{}}}
+			r.images = map[string]imageSource{}
 			for _, x := range []bundle.Container{c.good, c.bad} {
 				it := &citem{m: x, c: &docker.Container{}}
 				it.c.Config.Image = x.Image
@@ -260,7 +269,7 @@ func TestPartialRollbackImageNameUsers(t *testing.T) {
 				}
 				r.images[f.File] = imageSource{local: f.ID} // 本机已经有，只加名字
 			}
-			r.undo = &undo{mountPoint: noMounts, dc: r.Docker, screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }}
+			r.undo = testUndo(t, r.Docker, r.Screen)
 			j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
 			if err != nil {
 				t.Fatal(err)
@@ -325,10 +334,11 @@ func partialRun(t *testing.T, dir string) *run {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { log.Finish(logging.Failed, true) })
-	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(io.Discard, false, nil), Prompt: ui.NewPrompter(nil, io.Discard), Log: log,
-		Home: t.TempDir(), Getenv: func(string) string { return "" }}, rbDir: dir}
-	r.undo = &undo{mountPoint: noMounts, dc: dc, screen: r.Screen, logf: t.Logf, record: func(e Entry) error { return appendJournal(dir, e) },
-		fail: func(string) bool { return false }}
+	r := testRun(t, Deps{Docker: dc, Prompt: ui.NewPrompter(nil, io.Discard), Log: log,
+		Home: t.TempDir(), Getenv: func(string) string { return "" }}, Options{})
+	r.rbDir = dir
+	r.undo = testUndo(t, dc, r.Screen)
+	r.undo.record = func(e Entry) error { return appendJournal(dir, e) }
 	return r
 }
 

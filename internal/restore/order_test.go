@@ -43,7 +43,10 @@ func TestStartOrderFollowsReferences(t *testing.T) {
 		"NetworkSettings":{"Networks":{"1panel-network":{"Aliases":null}}}}`)
 
 	projects := []bundle.Project{{Name: "halo"}, {Name: "nginx-proxy-manager"}, {Name: "postgresql"}}
-	r := &run{items: []*citem{halo, npm, pg, probe, backup}, projects: projects, m: &bundle.Manifest{}}
+	r := testRun(t, Deps{}, Options{})
+	r.items = []*citem{halo, npm, pg, probe, backup}
+	r.projects = projects
+	r.m = &bundle.Manifest{}
 	units := r.units(&group{projects: projects, items: r.items})
 	deps := depsOf(units)
 	want := map[string]string{
@@ -77,8 +80,10 @@ func TestServiceOrderFollowsContainerReferences(t *testing.T) {
 	side := oldContainer(t, `{"Name":"/stack-asidecar-1","Config":{"Labels":{"com.docker.compose.project":"stack","com.docker.compose.service":"asidecar"}},
 		"HostConfig":{"NetworkMode":"container:old-vpn"}}`)
 	projects := []bundle.Project{{Name: "stack"}}
-	r := &run{items: []*citem{side, vpn}, projects: projects,
-		m: &bundle.Manifest{Containers: []bundle.Container{{Name: "stack-asidecar-1"}, {Name: "stack-vpn-1", ID: "old-vpn"}}}}
+	r := testRun(t, Deps{}, Options{})
+	r.items = []*citem{side, vpn}
+	r.projects = projects
+	r.m = &bundle.Manifest{Containers: []bundle.Container{{Name: "stack-asidecar-1"}, {Name: "stack-vpn-1", ID: "old-vpn"}}}
 	u := r.units(&group{projects: projects, items: r.items})[0]
 	u.services = uniqueServices(u.items) // 创建项目时才有（见 createProject）；读不出配置时 configured 为空
 	if got := strings.Join(u.serviceOrder(), " "); got != "vpn asidecar" {
@@ -104,8 +109,11 @@ func TestCreateOrderFollowsExistence(t *testing.T) {
 	sidecar := oldContainer(t, `{"Name":"/sidecar","HostConfig":{"VolumesFrom":["data:ro"]}}`)
 	store := oldContainer(t, `{"Name":"/data"}`)
 	projects := []bundle.Project{{Name: "aapp"}, {Name: "bweb"}, {Name: "zproxy"}}
-	r := &run{items: []*citem{app, proxy, web, sidecar, store, vpn}, projects: projects, dataDir: data,
-		m: &bundle.Manifest{Networks: []string{"proxynet"}}}
+	r := testRun(t, Deps{}, Options{})
+	r.items = []*citem{app, proxy, web, sidecar, store, vpn}
+	r.projects = projects
+	r.dataDir = data
+	r.m = &bundle.Manifest{Networks: []string{"proxynet"}}
 	units := r.units(&group{projects: projects, items: r.items})
 	deps := depsOf(units)
 	want := map[string]string{
