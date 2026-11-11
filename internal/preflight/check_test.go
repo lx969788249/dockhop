@@ -371,6 +371,41 @@ func TestEvaluateBindHoldingProject(t *testing.T) {
 	}
 }
 
+// 要放 Compose 项目文件的地方（项目目录、项目目录外的文件）在新服务器上是软链接时，迁入会跟着它把文件
+// 放到它指向的地方；在 DockHop 自己的目录里面时放不进去：都在下载之前停下。项目目录在要整个替换的挂载
+// 目录里面的不看：它随挂载目录一起换掉。
+func TestEvaluateProjectPaths(t *testing.T) {
+	plan := func(dir string) *bundle.Plan {
+		return &bundle.Plan{
+			Containers: []bundle.PlanContainer{{Name: "site-web-1", Project: "site", NetworkMode: "bridge"}},
+			Projects:   []bundle.PlanProject{{Name: "site", Services: []string{"web"}, WorkingDir: dir, Outside: []string{"/etc/site.env"}}},
+			Binds:      []bundle.PlanBind{{Path: "/srv/apps"}},
+		}
+	}
+	links := map[string]string{"/opt/site": "/mnt/site", "/etc/site.env": "/mnt/site.env", "/srv/apps/site": "/mnt/other"}
+	tg := testTarget()
+	tg.Link = func(p string) string { return links[p] }
+	o := Options{Home: "/root/.dockhop"}
+	var got []string
+	for _, i := range Evaluate(plan("/opt/site"), tg, &Decisions{}, o).Issues {
+		if i.Kind == "project_link" && i.Level == Stop {
+			got = append(got, i.Title)
+		}
+	}
+	if len(got) != 2 || !strings.Contains(got[0], "/opt/site") || !strings.Contains(got[1], "/etc/site.env") {
+		t.Errorf("要放项目文件的地方是软链接：%q", got)
+	}
+	for _, i := range Evaluate(plan("/srv/apps/site"), tg, &Decisions{}, o).Issues {
+		if strings.Contains(i.Title, "/srv/apps/site") {
+			t.Errorf("项目目录在要整个替换的挂载目录里面，不用看：%+v", i)
+		}
+	}
+	tg.Link = func(string) string { return "" }
+	if i := find(Evaluate(plan("/data/dockhop/site"), tg, &Decisions{}, Options{Home: "/data/dockhop"}), "project_home"); i == nil || i.Level != Stop {
+		t.Errorf("项目目录在 DockHop 自己的目录里面：%+v", i)
+	}
+}
+
 // WritesOf 是迁入要写到新服务器上的东西：要迁入的容器挂载的目录和数据卷（检查时选了保留已有的数据卷
 // 不算）、它们的 Compose 项目，以及装着项目目录的挂载目录。跳过的容器独占的不算。
 func TestWritesOf(t *testing.T) {

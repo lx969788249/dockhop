@@ -247,6 +247,31 @@ func TestRestoreBindRefusesLink(t *testing.T) {
 
 // 新服务器上已经有指向迁移过来的目录的软链接：目录的路径经过软链接（例如 /srv 指向数据盘）时
 // 也算指对了。以前拿解析后的路径和原来的写法比，报“指向不对”，迁入停下。
+// 要放 Compose 项目文件的地方在新服务器上是软链接时不放：迁入前检查已经停下（见 preflight.LinkedProject），
+// 这里是动手之前最后再看一次，检查之后才被换成软链接的同样不放。
+func TestInstallProjectRefusesLink(t *testing.T) {
+	root := t.TempDir()
+	world := filepath.Join(root, "world")
+	disk := filepath.Join(world, "disk")
+	os.MkdirAll(disk, 0o755)
+	dst := filepath.Join(world, "site")
+	os.Symlink(disk, dst)
+	before := snapshotTree(t, world)
+	r := bindRun(t, root, filepath.Join(root, "data"))
+	r.workdir = filepath.Join(root, "work")
+	for _, p := range []bundle.Project{
+		{Name: "site", WorkingDir: dst, DirParts: 1},
+		{Name: "site", WorkingDir: filepath.Join(world, "plain"), Outside: []string{dst}, OutParts: 1},
+	} {
+		if err := r.installProject(p); err == nil || !strings.Contains(err.Error(), "软链接") || !strings.Contains(err.Error(), disk) {
+			t.Errorf("应拒绝，并说出软链接指向哪里：%+v %v", p, err)
+		}
+	}
+	if after := snapshotTree(t, world); after != before {
+		t.Fatalf("不应改动任何东西：\n原来：\n%s\n现在：\n%s", before, after)
+	}
+}
+
 func TestRestoreLinkTargetThroughLink(t *testing.T) {
 	root := t.TempDir()
 	world := filepath.Join(root, "world")

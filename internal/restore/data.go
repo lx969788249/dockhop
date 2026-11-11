@@ -242,6 +242,20 @@ func (r *run) restoreLink(link, target string) error {
 // installProject 把 Compose 项目目录和它引用的目录外文件放回原来的位置。逐个文件
 // 安装（合并），不删除新服务器上这个目录里原有的其他文件；DockHop 自己的目录不动。
 func (r *run) installProject(p bundle.Project) error {
+	// 迁入前检查已经在要放文件的地方是软链接时停下（见 preflight.LinkedProject），这里是动手之前最后再看
+	// 一次：检查之后才被换成软链接的，同样不放。
+	var paths []string
+	if p.DirParts > 0 {
+		paths = append(paths, p.WorkingDir)
+	}
+	if p.OutParts > 0 {
+		paths = append(paths, p.Outside...)
+	}
+	for _, path := range paths {
+		if dest, err := os.Readlink(path); err == nil {
+			return errors.New(preflight.LinkedProject(p.Name, path, dest))
+		}
+	}
 	skip := func(path string) bool { return spec.Within(path, r.Home) || spec.Within(path, r.workdir) }
 	if p.DirParts > 0 {
 		if err := r.extractAndInstall("compose/"+p.Name+"/dir", p.DirParts, p.WorkingDir, skip); err != nil {

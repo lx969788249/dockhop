@@ -394,6 +394,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 	keptDataIssues(plan, t, d, containers, match, addIssue)
 	existingVolumeIssues(plan, t, d, usedVolumes, addIssue)
 	existingBindIssues(plan, t, usedBinds, addIssue)
+	projectIssues(w, t, o.Home, addIssue)
 	networkIssues(plan, t, d, containers, match, addIssue)
 	portIssues(t, d, containers, match, addIssue)
 	digestIssues(t, d, containers, addIssue)
@@ -604,6 +605,37 @@ func existingBindIssues(plan *bundle.Plan, t *Target, usedBinds map[string]bool,
 				Hint:  "先把它们卸载（umount），或者挂到这个目录外面，再重新检查"})
 		}
 	}
+}
+
+// projectIssues 检查要放 Compose 项目文件的地方（见 projectPaths）：在新服务器上是软链接时停下（见
+// LinkedProject）；在 DockHop 自己的目录（home）里面时放不进去，也停下。
+func projectIssues(w Writes, t *Target, home string, addIssue func(Issue)) {
+	for _, p := range w.Projects {
+		for _, path := range projectPaths(p, w.Binds) {
+			if dest := t.Link(path); dest != "" {
+				addIssue(Issue{Level: Stop, Kind: "project_link", Project: p.Name, Title: LinkedProject(p.Name, path, dest),
+					Hint: "用不着这个软链接就删掉它；想让文件放在它指向的地方，在旧服务器上也把它放到那里再迁移。处理好之后重新运行迁入"})
+				continue
+			}
+			if home != "" && spec.Within(path, home) {
+				addIssue(Issue{Level: Stop, Kind: "project_home", Project: p.Name,
+					Title: fmt.Sprintf("Compose 项目 %s 的文件 %s 在 DockHop 存放迁移文件、回滚资料的目录 %s 里面，放不进去", p.Name, path, home),
+					Hint:  "设置 DOCKHOP_HOME=其他目录（例如 /var/tmp/dockhop）后重新运行"})
+			}
+		}
+	}
+}
+
+// projectPaths 是迁入要放 Compose 项目 p 的文件的地方：项目目录和项目目录外的文件。在要整个替换的挂载目录
+// （binds）里面的除外：它们随挂载目录一起换掉，挂载目录本身另外检查（见 existingBindIssues、homeIssues）。
+func projectPaths(p bundle.PlanProject, binds []string) []string {
+	var out []string
+	for _, path := range append([]string{p.WorkingDir}, p.Outside...) {
+		if !slices.ContainsFunc(binds, func(b string) bool { return spec.Within(path, b) }) {
+			out = append(out, path)
+		}
+	}
+	return out
 }
 
 // digestIssues 找出按摘要固定了版本、又没选用迁移包里的镜像，新服务器却连不上镜像仓库按摘要补齐的。
@@ -1070,6 +1102,13 @@ func shortRef(ref string) string {
 // 写入之前都按它停下。
 func LinkedBind(path, dest string) string {
 	return fmt.Sprintf("新服务器上的 %s 是软链接，指向 %s：迁入不会跟着它去替换它指向的地方，也不会把它换成普通目录", path, dest)
+}
+
+// LinkedProject 说明为什么要放 Compose 项目文件的地方在新服务器上是软链接时不放：跟着它放，文件会放到它
+// 指向的、没检查过的地方（可能是系统目录）；换成普通的目录或文件，又改掉了这台服务器原来的安排。迁入前
+// 检查和真正放之前都按它停下。
+func LinkedProject(project, path, dest string) string {
+	return fmt.Sprintf("新服务器上的 %s 是软链接，指向 %s：迁入不会跟着它把 Compose 项目 %s 的文件放到它指向的地方", path, dest, project)
 }
 
 // HomeClash 检查迁入的目录 p 会不会盖住 DockHop 存放迁移文件、回滚资料的目录 home。
