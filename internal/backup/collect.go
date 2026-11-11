@@ -182,7 +182,7 @@ func (c *collected) dataBytes() int64 {
 
 // collect 读取选中内容的全部配置和大小。只读，不改动任何东西。
 func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *inventory, sel *selection, screen *ui.Screen, ignore map[string]bool) (*collected, error) {
-	out := &collected{sel: sel, inv: inv, layerBytes: map[*item]int64{}}
+	out := &collected{sel: sel, inv: inv}
 	usage, err := dc.VolumeUsage(ctx)
 	if err != nil {
 		screen.Detail("读取数据卷大小失败：%v", err)
@@ -208,20 +208,9 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 				if vols[m.Name] != nil {
 					continue
 				}
-				raw, err := dc.InspectVolumeRaw(ctx, m.Name)
+				v, err := readVolume(ctx, dc, m.Name, it.c.Image, usage)
 				if err != nil {
-					return nil, fmt.Errorf("读取数据卷 %s 失败：%v", m.Name, err)
-				}
-				v := &volumeInfo{name: m.Name, anonymous: spec.IsAnonymousVolume(m.Name), raw: raw, imageID: it.c.Image, bytes: -1}
-				var meta struct {
-					Driver  string            `json:"Driver"`
-					Options map[string]string `json:"Options"`
-					Labels  map[string]string `json:"Labels"`
-				}
-				_ = json.Unmarshal(raw, &meta)
-				v.driver, v.opts, v.labels = meta.Driver, meta.Options, meta.Labels
-				if size, ok := usage[m.Name]; ok {
-					v.bytes = size
+					return nil, err
 				}
 				vols[m.Name] = v
 			case "bind":
@@ -244,27 +233,9 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 			if name == "bridge" || name == "host" || name == "none" || nets[name] != nil {
 				continue
 			}
-			raw, err := dc.InspectNetworkRaw(ctx, name)
+			n, err := readNetwork(ctx, dc, name)
 			if err != nil {
-				return nil, fmt.Errorf("读取网络 %s 失败：%v", name, err)
-			}
-			n := &networkInfo{name: name, raw: raw}
-			var meta struct {
-				Driver string            `json:"Driver"`
-				Labels map[string]string `json:"Labels"`
-				IPAM   struct {
-					Config []struct {
-						Subnet string `json:"Subnet"`
-					} `json:"Config"`
-				} `json:"IPAM"`
-			}
-			_ = json.Unmarshal(raw, &meta)
-			n.driver = meta.Driver
-			_, n.compose = meta.Labels["com.docker.compose.network"]
-			for _, c := range meta.IPAM.Config {
-				if c.Subnet != "" {
-					n.subnets = append(n.subnets, c.Subnet)
-				}
+				return nil, err
 			}
 			nets[name] = n
 		}
@@ -272,19 +243,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 	for _, size := range images {
 		out.imageBytes += size
 	}
-	// 容器里没挂载出来的改动要在停机期间打包：先量一下，太大的提前提醒（停机会更久）。
-	for i, it := range sel.items {
-		if it.c.HostConfig.ReadonlyRootfs {
-			continue
-		}
-		screen.Count("统计容器里的改动", i+1, len(sel.items), it.name())
-		size, err := dc.ContainerSize(ctx, it.c.ID)
-		if err != nil {
-			screen.Detail("读不到容器 %s 里改动的大小：%v", it.name(), err)
-			continue
-		}
-		out.layerBytes[it] = size
-	}
+	out.layerBytes = layerSizes(ctx, dc, sel.items, screen)
 	for _, v := range vols {
 		out.volumes = append(out.volumes, v)
 	}
@@ -293,13 +252,103 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		out.networks = append(out.networks, n)
 	}
 	sort.Slice(out.networks, func(i, j int) bool { return out.networks[i].name < out.networks[j].name })
+	if out.binds, err = mergeBinds(ctx, bindPaths, screen); err != nil {
+		return nil, err
+	}
+	for _, u := range sel.units {
+		if u.project == "" {
+			continue
+		}
+		p, err := collectProject(ctx, tool, u, out.binds, screen)
+		if err != nil {
+			return nil, err
+		}
+		out.projects = append(out.projects, p)
+	}
 
-	// 去掉重复和嵌套的挂载目录：外层目录迁移了，里面的就不用再迁一次。
-	sort.Slice(bindPaths, func(i, j int) bool { return len(bindPaths[i].path) < len(bindPaths[j].path) })
-	// 数据只迁一份，但每个软链接都要记下：容器挂载时用的可能是其中任何一个。
-	for _, b := range bindPaths {
+	shared, err := sharers(inv, sel.items, out.volumeNames(), out.hostPaths(), ignore, screen)
+	if err != nil {
+		return nil, err
+	}
+	out.shared = shared
+	return out, nil
+}
+
+// readVolume 读取数据卷 name 的配置，大小从 usage 里取（没有的记成 -1，表示不知道）。imageID 是用到它的
+// 容器的镜像，打包时用它创建读数据的临时容器。
+func readVolume(ctx context.Context, dc *docker.Client, name, imageID string, usage map[string]int64) (*volumeInfo, error) {
+	raw, err := dc.InspectVolumeRaw(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("读取数据卷 %s 失败：%v", name, err)
+	}
+	v := &volumeInfo{name: name, anonymous: spec.IsAnonymousVolume(name), raw: raw, imageID: imageID, bytes: -1}
+	var meta struct {
+		Driver  string            `json:"Driver"`
+		Options map[string]string `json:"Options"`
+		Labels  map[string]string `json:"Labels"`
+	}
+	_ = json.Unmarshal(raw, &meta)
+	v.driver, v.opts, v.labels = meta.Driver, meta.Options, meta.Labels
+	if size, ok := usage[name]; ok {
+		v.bytes = size
+	}
+	return v, nil
+}
+
+// readNetwork 读取网络 name 的配置：驱动、是不是 Compose 建的、子网。
+func readNetwork(ctx context.Context, dc *docker.Client, name string) (*networkInfo, error) {
+	raw, err := dc.InspectNetworkRaw(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("读取网络 %s 失败：%v", name, err)
+	}
+	n := &networkInfo{name: name, raw: raw}
+	var meta struct {
+		Driver string            `json:"Driver"`
+		Labels map[string]string `json:"Labels"`
+		IPAM   struct {
+			Config []struct {
+				Subnet string `json:"Subnet"`
+			} `json:"Config"`
+		} `json:"IPAM"`
+	}
+	_ = json.Unmarshal(raw, &meta)
+	n.driver = meta.Driver
+	_, n.compose = meta.Labels["com.docker.compose.network"]
+	for _, c := range meta.IPAM.Config {
+		if c.Subnet != "" {
+			n.subnets = append(n.subnets, c.Subnet)
+		}
+	}
+	return n, nil
+}
+
+// layerSizes 量一下容器里没挂载出来的改动有多大：它们要在停机期间打包，太大的提前提醒（停机会更久）。
+// 只读根文件系统的容器没有改动；量不出来的不记。
+func layerSizes(ctx context.Context, dc *docker.Client, items []*item, screen *ui.Screen) map[*item]int64 {
+	sizes := map[*item]int64{}
+	for i, it := range items {
+		if it.c.HostConfig.ReadonlyRootfs {
+			continue
+		}
+		screen.Count("统计容器里的改动", i+1, len(items), it.name())
+		size, err := dc.ContainerSize(ctx, it.c.ID)
+		if err != nil {
+			screen.Detail("读不到容器 %s 里改动的大小：%v", it.name(), err)
+			continue
+		}
+		sizes[it] = size
+	}
+	return sizes
+}
+
+// mergeBinds 去掉重复和嵌套的挂载目录：外层目录迁移了，里面的就不用再迁一次。数据只迁一份，但每个
+// 软链接都要记下：容器挂载时用的可能是其中任何一个。留下的编上号、统计大小。
+func mergeBinds(ctx context.Context, paths []*bindInfo, screen *ui.Screen) ([]*bindInfo, error) {
+	sort.Slice(paths, func(i, j int) bool { return len(paths[i].path) < len(paths[j].path) })
+	var binds []*bindInfo
+	for _, b := range paths {
 		covered := false
-		for _, kept := range out.binds {
+		for _, kept := range binds {
 			if b.path == kept.path || strings.HasPrefix(b.path, kept.path+"/") {
 				kept.addLinks(b.links)
 				covered = true
@@ -314,87 +363,80 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 			return nil, fmt.Errorf("挂载的目录 %s 读不到：%v", b.path, err)
 		}
 		b.dir = st.IsDir()
-		b.id = fmt.Sprintf("b%03d", len(out.binds)+1)
+		b.id = fmt.Sprintf("b%03d", len(binds)+1)
 		screen.Note("统计目录大小 · " + ui.ShortPath(b.path))
 		b.bytes, _ = treeSize(ctx, b.path, nil, 0)
-		out.binds = append(out.binds, b)
+		binds = append(binds, b)
 	}
+	return binds, nil
+}
 
-	for _, u := range sel.units {
-		if u.project == "" {
-			continue
+// collectProject 读取 Compose 项目 u 要打包的东西：项目目录（在挂载的目录 binds 里面的已经随它打包，
+// 只另外打包迁入前检查用的配置文件）、项目目录外的文件，以及配置和正在运行的容器对不上的地方。
+func collectProject(ctx context.Context, tool *compose.Tool, u *unit, binds []*bindInfo, screen *ui.Screen) (*projectInfo, error) {
+	p := &projectInfo{u: u}
+	stop := func(err error) error {
+		return screen.StepFailed("Compose 项目 "+u.project+" 没法迁移："+err.Error(), "",
+			"把它改成普通的目录或文件（或者让它指向一个单独的地方）后重新运行，或者不迁移这个项目")
+	}
+	// 挂载目录记的是真实路径，项目目录本身是软链接时也按它的真实路径比较。
+	dir, _, err := approveRoot(projectRoot, u.workingDir, "")
+	if err != nil {
+		return nil, stop(err)
+	}
+	for _, b := range binds {
+		if b.path == dir || strings.HasPrefix(dir, b.path+"/") {
+			p.inBind = true
+		} else if strings.HasPrefix(b.path, dir+"/") {
+			p.excludes = append(p.excludes, b.path)
 		}
-		p := &projectInfo{u: u}
-		stop := func(err error) error {
-			return screen.StepFailed("Compose 项目 "+u.project+" 没法迁移："+err.Error(), "",
-				"把它改成普通的目录或文件（或者让它指向一个单独的地方）后重新运行，或者不迁移这个项目")
-		}
-		// 挂载目录记的是真实路径，项目目录本身是软链接时也按它的真实路径比较。
-		dir, _, err := approveRoot(projectRoot, u.workingDir, "")
-		if err != nil {
-			return nil, stop(err)
-		}
-		for _, b := range out.binds {
-			if b.path == dir || strings.HasPrefix(dir, b.path+"/") {
-				p.inBind = true
-			} else if strings.HasPrefix(b.path, dir+"/") {
-				p.excludes = append(p.excludes, b.path)
-			}
-		}
-		if !p.inBind {
-			screen.Note("统计项目目录 · " + ui.ShortPath(u.workingDir))
-			p.dirBytes, p.skipped = treeSize(ctx, u.workingDir, p.excludes, bigFileLimit)
-		}
-		cp := compose.Project{Name: u.project, WorkingDir: u.workingDir, Files: u.files}
-		if p.inBind {
-			for _, f := range compose.CheckFiles(cp) {
-				_, system, err := approveRoot(checkRoot, f, dir)
-				if err != nil {
-					return nil, stop(err)
-				}
-				if !system {
-					p.check = append(p.check, f)
-				}
-			}
-		}
-		files, unknown := compose.DeclaredFiles(cp)
-		for _, r := range files {
-			_, system, err := approveRoot(outsideRoot, r, dir)
+	}
+	if !p.inBind {
+		screen.Note("统计项目目录 · " + ui.ShortPath(u.workingDir))
+		p.dirBytes, p.skipped = treeSize(ctx, u.workingDir, p.excludes, bigFileLimit)
+	}
+	cp := compose.Project{Name: u.project, WorkingDir: u.workingDir, Files: u.files}
+	if p.inBind {
+		for _, f := range compose.CheckFiles(cp) {
+			_, system, err := approveRoot(checkRoot, f, dir)
 			if err != nil {
 				return nil, stop(err)
 			}
-			if system {
-				continue
+			if !system {
+				p.check = append(p.check, f)
 			}
-			p.outside = append(p.outside, r)
-			size, _ := treeSize(ctx, r, nil, 0)
-			p.outBytes += size
 		}
-		if len(unknown) > 0 {
-			screen.Warn("Compose 项目 %s 的配置里有带变量的路径（%s），没法确定是哪个文件，不会一起迁移；迁入后请确认新服务器上有这些文件",
-				u.project, ui.Names(unknown))
+	}
+	files, unknown := compose.DeclaredFiles(cp)
+	for _, r := range files {
+		_, system, err := approveRoot(outsideRoot, r, dir)
+		if err != nil {
+			return nil, stop(err)
 		}
-		if tool != nil {
-			if services, err := tool.Services(ctx, cp); err != nil {
-				screen.Detail("Compose 项目 %s 的配置算不出来：%v", u.project, err)
-			} else if services != nil {
-				for _, it := range u.items {
-					svc := it.c.Config.Labels[labelService]
-					if why := driftReason(services[svc], it.c); why != "" {
-						p.drift = append(p.drift, svc+"（"+why+"）")
-					}
+		if system {
+			continue
+		}
+		p.outside = append(p.outside, r)
+		size, _ := treeSize(ctx, r, nil, 0)
+		p.outBytes += size
+	}
+	if len(unknown) > 0 {
+		screen.Warn("Compose 项目 %s 的配置里有带变量的路径（%s），没法确定是哪个文件，不会一起迁移；迁入后请确认新服务器上有这些文件",
+			u.project, ui.Names(unknown))
+	}
+	if tool != nil {
+		if services, err := tool.Services(ctx, cp); err != nil {
+			screen.Detail("Compose 项目 %s 的配置算不出来：%v", u.project, err)
+		} else if services != nil {
+			for _, it := range u.items {
+				svc := it.c.Config.Labels[labelService]
+				if why := driftReason(services[svc], it.c); why != "" {
+					p.drift = append(p.drift, svc+"（"+why+"）")
 				}
 			}
 		}
-		out.projects = append(out.projects, p)
 	}
-
-	shared, err := sharers(inv, sel.items, out.volumeNames(), out.hostPaths(), ignore, screen)
-	if err != nil {
-		return nil, err
-	}
-	out.shared = shared
-	return out, nil
+	return p, nil
 }
 
 // sharers 找出打包时要和选中的容器 sel 一起临时停止的容器，菜单里不能选的容器（docker compose run
