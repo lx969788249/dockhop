@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 
@@ -408,111 +407,6 @@ func (u *undo) removeComposeNetworks(ctx context.Context, e Entry, note func(str
 	}
 }
 
-func (u *undo) undoBind(e Entry, note func(string, ...any)) {
-	if e.Path == "" || e.Path == "/" {
-		return
-	}
-	// 下面的做法会整个删除 Path：它是挂载点（单独挂载的磁盘）时绝不能这样做，那样会把整块盘上的
-	// 东西删掉；挂载点只会原地换内容。判断不了时也不动。
-	if mounted, err := u.mountPoint(e.Path); err != nil || mounted {
-		note("%s 是单独挂载的目录（或者判断不了：%v），不能整个删除再放回，没有动它，请按回滚资料人工处理", e.Path, err)
-		return
-	}
-	_, curErr := os.Lstat(e.Path)
-	if !e.Existed {
-		if curErr == nil {
-			if err := os.RemoveAll(e.Path); err != nil {
-				note("本次新建的目录 %s 没能删除：%v", e.Path, err)
-			}
-		}
-		return
-	}
-	if _, err := os.Lstat(e.Backup); err != nil {
-		if curErr == nil {
-			return // 记下了但还没挪开原来的目录：现在的就是原来的
-		}
-		note("目录 %s 和它的备份都找不到了", e.Path)
-		return
-	}
-	if curErr == nil {
-		if err := os.RemoveAll(e.Path); err != nil {
-			note("没能删除迁入的目录 %s：%v", e.Path, err)
-			return
-		}
-	}
-	if err := os.Rename(e.Backup, e.Path); err != nil {
-		note("目录 %s 没能放回原来的：%v", e.Path, err)
-	}
-}
-
-// undoContents 撤销原地换内容（见 replaceContents）：Path 里迁移过来的东西删掉，备份目录里原来的
-// 挪回去，Path 本身改回日志里记的属主、权限、修改时间，最后删掉空了的备份目录。日志里记着 Path
-// 原来有哪些东西（Names）：名字不在里面的，或者原来的那个已经挪进了备份目录的，才是迁移过来的；
-// 原来的那个还没挪走（或者已经挪回来了）的留着。所以换到一半、回滚到一半被打断，从头再来一遍都
-// 是安全的。
-func (u *undo) undoContents(e Entry, note func(string, ...any)) {
-	backed, err := os.ReadDir(e.Backup)
-	if errors.Is(err, os.ErrNotExist) {
-		// 还没开始挪原来的东西，或者已经全部放回去了（可能刚删掉备份目录就被打断，属性还没改回，
-		// 再改一遍）；也可能是数据盘没挂上（备份在盘上，看不到）。只有 Path 还是挂载点，才能当成前两种。
-		switch mounted, err := u.mountPoint(e.Path); {
-		case err != nil:
-			note("没法确认 %s 还挂着：%v", e.Path, err)
-		case !mounted:
-			note("%s 现在不是单独挂载的目录（数据盘没挂上？），原来的内容在盘上的 %s 里，挂上之后重新运行就会放回去",
-				e.Path, filepath.Base(e.Backup))
-		case e.Meta != nil:
-			if err := applyMeta(e.Path, *e.Meta); err != nil {
-				note("目录 %s 没能改回原来的属主、权限和修改时间：%v", e.Path, err)
-			}
-		}
-		return
-	}
-	if err != nil {
-		note("目录 %s 的备份读不了：%v", e.Path, err)
-		return
-	}
-	inBackup := make(map[string]bool, len(backed))
-	for _, b := range backed {
-		inBackup[b.Name()] = true
-	}
-	original := make(map[string]bool, len(e.Names))
-	for _, n := range e.Names {
-		original[n] = true
-	}
-	cur, err := os.ReadDir(e.Path)
-	if err != nil {
-		note("目录 %s 读不了：%v", e.Path, err)
-		return
-	}
-	for _, c := range cur {
-		p := filepath.Join(e.Path, c.Name())
-		if p == e.Backup || original[c.Name()] && !inBackup[c.Name()] {
-			continue
-		}
-		if err := os.RemoveAll(p); err != nil {
-			note("没能删除迁入的 %s：%v", p, err)
-			return
-		}
-	}
-	for _, b := range backed {
-		if err := os.Rename(filepath.Join(e.Backup, b.Name()), filepath.Join(e.Path, b.Name())); err != nil {
-			note("目录 %s 里原来的 %s 没能放回去：%v", e.Path, b.Name(), err)
-			return
-		}
-	}
-	// 先删空了的备份目录再改属性：删它会改掉 Path 的修改时间。
-	if err := os.Remove(e.Backup); err != nil {
-		note("目录 %s 的备份目录没能删除：%v", e.Path, err)
-		return
-	}
-	if e.Meta != nil {
-		if err := applyMeta(e.Path, *e.Meta); err != nil {
-			note("目录 %s 没能改回原来的属主、权限和修改时间：%v", e.Path, err)
-		}
-	}
-}
-
 func (u *undo) undoVolume(ctx context.Context, e Entry, note func(string, ...any)) {
 	_, err := u.dc.InspectVolume(ctx, e.Name)
 	exists := err == nil
@@ -739,14 +633,12 @@ func (u *undo) cleanupCommitted(ctx context.Context, entries []Entry) []string {
 				}
 			}
 		case opBind:
-			if e.Existed {
-				if err := os.RemoveAll(e.Backup); err != nil {
-					left = append(left, fmt.Sprintf("旧目录 %s：%v", e.Backup, err))
-				}
+			if err := cleanupBind(e); err != nil {
+				left = append(left, err.Error())
 			}
 		case opContents:
-			if err := os.RemoveAll(e.Backup); err != nil {
-				left = append(left, fmt.Sprintf("目录 %s 里原来的内容 %s：%v", e.Path, e.Backup, err))
+			if err := cleanupContents(e); err != nil {
+				left = append(left, err.Error())
 			}
 		case opStage:
 			if err := os.RemoveAll(e.Path); err != nil {

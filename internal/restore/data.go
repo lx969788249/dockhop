@@ -167,42 +167,26 @@ func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
 	if dest, err := os.Readlink(b.Path); err == nil {
 		return errors.New(preflight.LinkedBind(b.Path, dest))
 	}
-	// 单独挂载的目录（例如一块数据盘）不能改名，只能在原地换里面的内容（见 replaceContents），
-	// 解压也解在它里面：和它在同一块盘上。判断不了时不动它：选错了办法，挂载点改名会失败，
-	// 普通目录也不该在里面换。
-	inPlace := false
-	if b.Dir {
-		mp, err := r.MountPoint(b.Path)
-		if err != nil {
-			return fmt.Errorf("没法判断 %s 是不是单独挂载的目录：%v", b.Path, err)
-		}
-		inPlace = mp
-	}
-	parent := filepath.Dir(b.Path)
-	if err := r.mkdirAll(parent, 0o755); err != nil {
+	// 整个替换，还是原地换内容（单独挂载的目录不能改名），见 dirs.go。
+	swap, err := r.newDirSwap(b.Path, b.Dir)
+	if err != nil {
 		return err
 	}
-	stage := siblingName(b.Path, "stage")
-	var contents Entry // 原地换内容时，日志里记着原来有哪些东西的那一条
-	if inPlace {
-		stage = innerName(b.Path, "stage")
-		var err error
-		if contents, err = r.recordContents(b.Path); err != nil {
-			return err
-		}
+	if err := r.mkdirAll(filepath.Dir(b.Path), 0o755); err != nil {
+		return err
 	}
 	// 解压用的临时目录先记进日志：程序被强制结束时它会留下来，回滚时删掉。
-	if err := r.j.add(Entry{Op: opStage, Path: stage}); err != nil {
+	if err := r.j.add(Entry{Op: opStage, Path: swap.stage}); err != nil {
 		return err
 	}
-	_ = os.RemoveAll(stage)
-	if err := os.Mkdir(stage, 0o700); err != nil {
+	_ = os.RemoveAll(swap.stage)
+	if err := os.Mkdir(swap.stage, 0o700); err != nil {
 		return err
 	}
-	defer os.RemoveAll(stage)
+	defer os.RemoveAll(swap.stage)
 	rc := bundle.OpenStream(r.dataDir, "binds/"+b.ID, b.Parts)
 	p := r.Screen.StartProgress("目录 "+ui.ShortPath(b.Path), b.Bytes, "")
-	err := bundle.ExtractTree(io.TeeReader(rc, p), stage)
+	err = bundle.ExtractTree(io.TeeReader(rc, p), swap.stage)
 	rc.Close()
 	p.Done(err)
 	if err == nil && r.testFail("bind:"+b.Path) {
@@ -211,7 +195,7 @@ func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
 	if err != nil {
 		return err
 	}
-	staged := filepath.Join(stage, strings.TrimPrefix(b.Path, "/"))
+	staged := filepath.Join(swap.stage, strings.TrimPrefix(b.Path, "/"))
 	st, err := os.Lstat(staged)
 	if err != nil {
 		return fmt.Errorf("迁移包里缺少 %s", b.Path)
@@ -219,12 +203,7 @@ func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
 	if st.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("迁移包里的 %s 是软链接，拒绝使用", b.Path)
 	}
-	if inPlace {
-		err = r.replaceContents(contents, stage, staged)
-	} else {
-		err = r.replaceDir(staged, b.Path)
-	}
-	if err != nil {
+	if err := r.swapIn(swap, staged); err != nil {
 		return err
 	}
 	_ = os.RemoveAll(filepath.Join(r.dataDir, "binds", b.ID))
