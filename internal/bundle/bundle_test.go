@@ -136,7 +136,7 @@ func TestReadManifestVersion(t *testing.T) {
 
 func TestPlanRoundTrip(t *testing.T) {
 	link, _ := crypto.NewLink("1.2.3.4", 8080)
-	p := &Plan{Version: 1, Containers: []PlanContainer{{Name: "web", Ports: []PlanPort{{HostPort: "8080", ContainerPort: "80", Proto: "tcp"}}}}}
+	p := &Plan{Version: PlanVersion, Containers: []PlanContainer{{Name: "web", Ports: []PlanPort{{HostPort: "8080", ContainerPort: "80", Proto: "tcp"}}}}}
 	var buf bytes.Buffer
 	if err := EncryptPlan(&buf, link, p); err != nil {
 		t.Fatal(err)
@@ -144,6 +144,21 @@ func TestPlanRoundTrip(t *testing.T) {
 	got, err := DecryptPlan(&buf, link)
 	if err != nil || got.Containers[0].Ports[0].HostPort != "8080" {
 		t.Fatalf("迁移计划：%+v %v", got, err)
+	}
+}
+
+// 迁入前检查和迁入都按迁移计划算要写到哪些地方（见 PlanVersion）：版本不一样的迁移计划不能用。旧的要在
+// 旧服务器上用新版本重新迁出，新的要用新版本迁入。
+func TestDecryptPlanVersion(t *testing.T) {
+	link, _ := crypto.NewLink("1.2.3.4", 8080)
+	for v, want := range map[int]error{PlanVersion - 1: ErrPlanOlder, PlanVersion: nil, PlanVersion + 1: ErrPlanNewer} {
+		var buf bytes.Buffer
+		if err := EncryptPlan(&buf, link, &Plan{Version: v}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := DecryptPlan(&buf, link); !errors.Is(err, want) {
+			t.Errorf("版本 %d：%v，应为 %v", v, err, want)
+		}
 	}
 }
 

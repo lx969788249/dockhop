@@ -49,6 +49,36 @@ func TestRefusesWithoutPlan(t *testing.T) {
 	}
 }
 
+// 版本不一样的迁移计划不能用（见 bundle.PlanVersion），在下载和改动之前停下：旧版本迁出的，说明要在旧服务器
+// 上用新版本重新迁出；更新版本迁出的，说明要用新版本迁入。
+func TestRefusesOtherPlanVersions(t *testing.T) {
+	for v, want := range map[int]string{bundle.PlanVersion - 1: "重新迁出", bundle.PlanVersion + 1: "更新版本的 DockHop"} {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		link, _ := crypto.NewLink("127.0.0.1", ln.Addr().(*net.TCPAddr).Port)
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "bundle"), []byte("bundle"), 0o600)
+		pf, _ := os.Create(filepath.Join(dir, "plan"))
+		if err := bundle.EncryptPlan(pf, link, &bundle.Plan{Version: v}); err != nil {
+			t.Fatal(err)
+		}
+		pf.Close()
+		srv, err := transfer.NewServer(ln, link, filepath.Join(dir, "bundle"), filepath.Join(dir, "plan"), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go srv.Serve()
+		var out bytes.Buffer
+		r := &run{Deps: Deps{Screen: ui.New(&out, false, nil), Log: &logging.Logger{}, Getenv: func(string) string { return "" }}, opts: Options{Link: link}}
+		if err := r.fetchPlan(context.Background()); err == nil || r.plan != nil || !strings.Contains(out.String(), want) {
+			t.Errorf("迁移计划的版本是 %d 时应拒绝，说明%s：%v\n%s", v, want, err, out.String())
+		}
+		srv.Shutdown(context.Background())
+	}
+}
+
 // 迁入前检查读新服务器的情况时按 Ctrl+C：马上停下，当作取消（以前这一段不响应 Ctrl+C，要等 Docker
 // 回话；被取消了也报成“读取新服务器的情况失败”）。
 func TestCheckStopsOnCancel(t *testing.T) {

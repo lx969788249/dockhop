@@ -2,16 +2,18 @@ package backup
 
 import (
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/docker"
 )
 
 // buildPlan 生成迁移计划：新服务器下载之前据此检查自己能不能迁入。
 func buildPlan(m *bundle.Manifest, col *collected, bundleSize int64, bundleSum string) *bundle.Plan {
-	p := &bundle.Plan{Version: 2, Source: m.Source, Images: m.ImageFiles, BundleSHA256: bundleSum}
+	p := &bundle.Plan{Version: bundle.PlanVersion, Source: m.Source, Images: m.ImageFiles, BundleSHA256: bundleSum}
 	p.Sizes.Bundle = bundleSize
 	p.Sizes.ImageFiles = imageFileBytes(m.ImageFiles)
 	p.Sizes.Images = m.Images.Bytes
@@ -28,13 +30,6 @@ func buildPlan(m *bundle.Manifest, col *collected, bundleSize int64, bundleSum s
 	}
 	for _, b := range m.Binds {
 		p.Sizes.Binds += b.Bytes
-	}
-	bindOf := map[string]string{} // 挂载用的路径 → 迁移的真实路径
-	for _, b := range col.binds {
-		bindOf[b.path] = b.path
-		for _, l := range b.links {
-			bindOf[l.Link] = b.path
-		}
 	}
 	for _, it := range col.sel.items {
 		c := it.c
@@ -95,19 +90,15 @@ func buildPlan(m *bundle.Manifest, col *collected, bundleSize int64, bundleSum s
 			pc.Networks = append(pc.Networks, addr)
 		}
 		for _, mt := range c.Mounts {
-			switch mt.Type {
-			case "volume":
+			if mt.Type == "volume" {
 				pc.Volumes = append(pc.Volumes, mt.Name)
-			case "bind":
-				if real, ok := bindOf[mt.Source]; ok {
-					pc.Binds = append(pc.Binds, real)
-				}
 			}
 		}
+		pc.Binds = bindsOf(c, col.binds)
 		p.Containers = append(p.Containers, pc)
 	}
 	for _, pr := range m.Projects {
-		p.Projects = append(p.Projects, bundle.PlanProject{Name: pr.Name, Services: pr.Services})
+		p.Projects = append(p.Projects, bundle.PlanProject{Name: pr.Name, Services: pr.Services, WorkingDir: pr.WorkingDir, Outside: pr.Outside})
 	}
 	for _, v := range col.volumes {
 		p.Volumes = append(p.Volumes, bundle.PlanVolume{Name: v.name, Driver: v.driver, Opts: v.opts, Labels: v.labels, Bytes: max(v.bytes, 0)})
@@ -119,6 +110,23 @@ func buildPlan(m *bundle.Manifest, col *collected, bundleSize int64, bundleSum s
 		p.Networks = append(p.Networks, bundle.PlanNetwork{Name: n.name, Driver: n.driver, Subnets: n.subnets, Compose: n.compose})
 	}
 	return p
+}
+
+// bindsOf 是容器 c 挂载的目录在迁移包里是哪几个（binds 里的真实路径）：挂载的路径就是它、在它里面，
+// 或者是指向它的软链接（或者在软链接里面）。迁入前检查和迁入都按迁移计划里记的这一份算要写哪些目录。
+func bindsOf(c *docker.Container, binds []*bindInfo) []string {
+	var out []string
+	for _, b := range binds {
+		for _, mt := range c.Mounts {
+			if mt.Type == "bind" && slices.ContainsFunc(append([]string{b.path}, linkPaths(b.links)...), func(p string) bool {
+				return mt.Source == p || strings.HasPrefix(mt.Source, p+"/")
+			}) {
+				out = append(out, b.path)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func projectOf(col *collected, it *item) string {

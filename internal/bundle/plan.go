@@ -3,10 +3,22 @@ package bundle
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 
 	"github.com/lx969788249/dockhop/internal/crypto"
 )
+
+// PlanVersion 是迁移计划的格式版本。3：加上 Compose 项目的目录和项目目录外的文件，容器挂载的目录按它在
+// 迁移包里是哪一个记（挂载的路径在它里面、或者是指向它的软链接时也算上）。迁入前检查和迁入都按迁移计划
+// 算要写到新服务器上的哪些地方，版本不一样的不能用（见 DecryptPlan）。
+const PlanVersion = 3
+
+// ErrPlanOlder 表示迁移计划是旧版本的 DockHop 生成的，缺迁入要用的内容：要在旧服务器上用新版本重新迁出。
+var ErrPlanOlder = errors.New("迁移计划是旧版本的 DockHop 生成的")
+
+// ErrPlanNewer 表示迁移计划是更新版本的 DockHop 生成的：要用新版本迁入。
+var ErrPlanNewer = errors.New("迁移计划是更新版本的 DockHop 生成的")
 
 // Plan 是迁移计划：新服务器在下载迁移包之前，先拿它检查自己能不能迁入。
 // 内容只有“迁移需要什么”，没有任何业务数据；同样用链接里的密钥加密。
@@ -69,8 +81,10 @@ type PlanNetAddr struct {
 
 // PlanProject 是一个 Compose 项目。
 type PlanProject struct {
-	Name     string   `json:"name"`
-	Services []string `json:"services"`
+	Name       string   `json:"name"`
+	Services   []string `json:"services"`
+	WorkingDir string   `json:"working_dir"`       // 项目目录，迁入时把项目文件放回这里
+	Outside    []string `json:"outside,omitempty"` // 项目目录以外被引用的文件，迁入时放回原来的路径
 }
 
 // PlanVolume 是一个数据卷。
@@ -125,7 +139,7 @@ func EncryptPlan(w io.Writer, link crypto.Link, p *Plan) error {
 	return ew.Close()
 }
 
-// DecryptPlan 解密并读出迁移计划。
+// DecryptPlan 解密并读出迁移计划。版本和这个程序的不一样时返回 ErrPlanOlder 或 ErrPlanNewer。
 func DecryptPlan(r io.Reader, link crypto.Link) (*Plan, error) {
 	dr, err := link.Decrypt(r)
 	if err != nil {
@@ -138,6 +152,12 @@ func DecryptPlan(r io.Reader, link crypto.Link) (*Plan, error) {
 	var p Plan
 	if err := json.Unmarshal(buf.Bytes(), &p); err != nil {
 		return nil, err
+	}
+	switch {
+	case p.Version < PlanVersion:
+		return nil, ErrPlanOlder
+	case p.Version > PlanVersion:
+		return nil, ErrPlanNewer
 	}
 	return &p, nil
 }

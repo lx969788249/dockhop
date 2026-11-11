@@ -43,7 +43,14 @@ func (r *run) fetchPlan(ctx context.Context) error {
 		return s.StepFailed("连接旧服务器失败", err.Error(), "")
 	}
 	p, err := bundle.DecryptPlan(bytes.NewReader(raw), r.opts.Link)
-	if err != nil {
+	switch {
+	case errors.Is(err, bundle.ErrPlanOlder):
+		return s.StepFailed("这个迁移链接是旧版本的 DockHop 生成的，要在旧服务器上用最新版本重新迁出（还没有下载或改动任何东西）", "",
+			"在旧服务器上按 Ctrl+C 结束现在的迁出，运行 bash <(curl -fsSL https://dockhop.run) 选迁出，再用新的链接迁入")
+	case errors.Is(err, bundle.ErrPlanNewer):
+		return s.StepFailed("这个迁移链接是更新版本的 DockHop 生成的，要用最新版本迁入（还没有下载或改动任何东西）", "",
+			"运行 bash <(curl -fsSL https://dockhop.run)，选迁入")
+	case err != nil:
 		return s.StepFailed("迁移计划解不开："+err.Error(), "", "确认用的是旧服务器这次显示的完整链接")
 	}
 	r.plan = p

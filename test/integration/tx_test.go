@@ -414,7 +414,7 @@ func TestInRejectsUnsafeBundle(t *testing.T) {
 	sum := sha256.Sum256(b)
 	planPath := filepath.Join(t.TempDir(), "plan")
 	pf, _ := os.Create(planPath)
-	bundle.EncryptPlan(pf, link, &bundle.Plan{Version: 2, Source: src, BundleSHA256: hex.EncodeToString(sum[:]),
+	bundle.EncryptPlan(pf, link, &bundle.Plan{Version: bundle.PlanVersion, Source: src, BundleSHA256: hex.EncodeToString(sum[:]),
 		Sizes:      bundle.PlanSizes{Bundle: int64(len(b)), Images: in, Volumes: n},
 		Containers: []bundle.PlanContainer{{Name: p + "_web", State: "created", Image: "alpine:3.20", NetworkMode: "bridge", Volumes: []string{p + "_vol"}}},
 		Volumes:    []bundle.PlanVolume{{Name: p + "_vol", Driver: "local", Bytes: n}}})
