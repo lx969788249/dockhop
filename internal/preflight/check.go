@@ -330,7 +330,6 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 	res.Containers = len(containers)
 	usedVolumes := map[string]bool{}
 	usedBinds := map[string]bool{}
-	hasProject := false
 	for _, c := range containers {
 		for _, v := range c.Volumes {
 			usedVolumes[v] = true
@@ -338,12 +337,32 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		for _, b := range c.Binds {
 			usedBinds[b] = true
 		}
-		if c.Project != "" {
-			hasProject = true
-		}
 	}
 
-	// ---------- Docker 环境 ----------
+	dockerIssues(plan, t, containers, addIssue)
+	if !t.Local && o.LocalWork != nil {
+		if what := o.LocalWork(planWrites(plan, d, containers, usedVolumes, usedBinds), t); len(what) > 0 {
+			addIssue(Issue{Level: Stop, Kind: "remote_docker",
+				Title: "Docker 不在这台服务器上（DOCKER_HOST 指向了别的机器），没法在 Docker 所在的服务器上" + strings.Join(what, "、"),
+				Hint:  "请在 Docker 所在的服务器上直接运行 DockHop"})
+		}
+	}
+	hardwareIssues(plan, t, containers, usedVolumes, addIssue)
+	homeIssues(plan, o.Home, addIssue)
+	res.NeedBytes = diskIssues(plan, t, d, o, usedVolumes, usedBinds, addIssue)
+	held := existingContainerIssues(plan, t, d, o, match, addIssue)
+	existingProjectIssues(plan, d, o, match, held, addIssue)
+	keptDataIssues(plan, t, d, containers, match, addIssue)
+	existingVolumeIssues(plan, t, d, usedVolumes, addIssue)
+	existingBindIssues(plan, t, usedBinds, addIssue)
+	networkIssues(plan, t, d, containers, match, addIssue)
+	portIssues(t, d, containers, match, addIssue)
+	digestIssues(t, d, containers, addIssue)
+	return res
+}
+
+// dockerIssues 检查新服务器的 Docker 环境：CPU 类型、Docker 版本，要迁移 Compose 项目时的 Docker Compose。
+func dockerIssues(plan *bundle.Plan, t *Target, containers []bundle.PlanContainer, addIssue func(Issue)) {
 	src, dst := plan.Source.Arch, t.Arch
 	if src != "" && dst != "" && alias(src) != alias(dst) {
 		addIssue(Issue{Level: Stop, Kind: "arch",
@@ -354,6 +373,7 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		addIssue(Issue{Level: Note, Kind: "docker_version",
 			Title: fmt.Sprintf("新服务器的 Docker（%s）比旧服务器（%s）旧，一般不影响迁移", t.DockerVersion, plan.Source.Docker)})
 	}
+	hasProject := slices.ContainsFunc(containers, func(c bundle.PlanContainer) bool { return c.Project != "" })
 	if hasProject && !t.HasCompose {
 		addIssue(Issue{Level: Stop, Kind: "compose", Title: "要迁移 Compose 项目，但新服务器没有安装 Docker Compose",
 			Hint: "先安装 Docker Compose（例如 apt install docker-compose-plugin）再重试"})
@@ -363,29 +383,32 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 			Title: fmt.Sprintf("新服务器的 docker-compose 是老版本 %s，旧服务器用的是 Compose %s；有些写法老版本读不懂，迁入时可能失败（失败会自动删除迁入的内容）。"+
 				"建议先在新服务器安装新版 Docker Compose", t.Compose, plan.Source.Compose)})
 	}
-	if !t.Local && o.LocalWork != nil {
-		var w Writes
-		for _, b := range plan.Binds {
-			if usedBinds[b.Path] {
-				w.Binds = append(w.Binds, b.Path)
-			}
-		}
-		for _, c := range containers {
-			if c.Project != "" && !slices.Contains(w.Projects, c.Project) {
-				w.Projects = append(w.Projects, c.Project)
-			}
-		}
-		for _, v := range plan.Volumes {
-			if usedVolumes[v.Name] && !d.KeepVolume(v.Name) {
-				w.Volumes = append(w.Volumes, v.Name)
-			}
-		}
-		if what := o.LocalWork(w, t); len(what) > 0 {
-			addIssue(Issue{Level: Stop, Kind: "remote_docker",
-				Title: "Docker 不在这台服务器上（DOCKER_HOST 指向了别的机器），没法在 Docker 所在的服务器上" + strings.Join(what, "、"),
-				Hint:  "请在 Docker 所在的服务器上直接运行 DockHop"})
+}
+
+// planWrites 按迁移计划和眼下的选择，算出这次迁入要写到新服务器上的东西（见 Writes）：要迁入的容器
+// （containers）用到的目录、Compose 项目和数据卷，保留已有的数据卷不算。
+func planWrites(plan *bundle.Plan, d *Decisions, containers []bundle.PlanContainer, usedVolumes, usedBinds map[string]bool) Writes {
+	var w Writes
+	for _, b := range plan.Binds {
+		if usedBinds[b.Path] {
+			w.Binds = append(w.Binds, b.Path)
 		}
 	}
+	for _, c := range containers {
+		if c.Project != "" && !slices.Contains(w.Projects, c.Project) {
+			w.Projects = append(w.Projects, c.Project)
+		}
+	}
+	for _, v := range plan.Volumes {
+		if usedVolumes[v.Name] && !d.KeepVolume(v.Name) {
+			w.Volumes = append(w.Volumes, v.Name)
+		}
+	}
+	return w
+}
+
+// hardwareIssues 检查要迁入的容器要用的运行环境、显卡、设备和卷插件新服务器上有没有，内存够不够。
+func hardwareIssues(plan *bundle.Plan, t *Target, containers []bundle.PlanContainer, usedVolumes map[string]bool, addIssue func(Issue)) {
 	for _, c := range containers {
 		if c.Runtime != "" && len(t.Runtimes) > 0 && !t.Runtimes[c.Runtime] {
 			addIssue(Issue{Level: Stop, Kind: "runtime", Container: c.Name,
@@ -423,22 +446,24 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		addIssue(Issue{Level: Info, Kind: "memory", Title: fmt.Sprintf("容器设置的内存上限合计 %s，超过新服务器的内存 %s，内存紧张时容器可能被系统结束",
 			ui.HumanBytes(memNeed), ui.HumanBytes(t.MemTotal))})
 	}
+}
 
-	// ---------- 挂载目录不能盖住 DockHop 自己的文件 ----------
+// homeIssues：挂载目录（连同指向它的软链接）不能盖住 DockHop 自己的文件（见 HomeClash）。
+func homeIssues(plan *bundle.Plan, home string, addIssue func(Issue)) {
 	for _, b := range plan.Binds {
 		for _, p := range append([]string{b.Path}, b.AllLinks()...) {
-			if is := HomeClash(p, o.Home); is != nil {
+			if is := HomeClash(p, home); is != nil {
 				addIssue(*is)
 			}
 		}
 	}
+}
 
-	// ---------- 磁盘空间 ----------
-	res.NeedBytes = diskIssues(plan, t, d, o, usedVolumes, usedBinds, addIssue)
-
-	// ---------- 已有的同名容器、Compose 项目、数据卷 ----------
-	// 按 --existing skip 保留、不迁入的也要说一声，所以看的是选择跳过的之外的全部。
-	held := map[string]bool{} // 里面的容器要用的名字被保留下来的已有容器占着、不迁入的 Compose 项目
+// existingContainerIssues 找出新服务器上已有的同名容器，按 --existing（o.Existing）和检查时的选择说明
+// 怎么处理，还没选的问一下。按 --existing skip 保留、不迁入的也要说一声，所以看的是选择跳过的之外的
+// 全部。返回里面的容器要用的名字被保留下来的已有容器占着、不迁入的 Compose 项目。
+func existingContainerIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, match Counterparts, addIssue func(Issue)) map[string]bool {
+	held := map[string]bool{}
 	for _, c := range plan.Containers {
 		if d.SkippedContainer(c) {
 			continue
@@ -484,6 +509,12 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 			}
 		}
 	}
+	return held
+}
+
+// existingProjectIssues 找出新服务器上已有的同名 Compose 项目（或者它要用的容器名），和
+// existingContainerIssues 一样说明怎么处理、还没选的问一下。held 里的项目已经说过不迁入了。
+func existingProjectIssues(plan *bundle.Plan, d *Decisions, o Options, match Counterparts, held map[string]bool, addIssue func(Issue)) {
 	for _, p := range projectNames(plan.Containers) {
 		what := match.ExistingFor(p)
 		if what == "" || held[p] || slices.Contains(d.SkipProjects, p) || slices.Contains(d.ReplaceProjects, p) {
@@ -505,7 +536,11 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 				Title: "新服务器上已经有" + what})
 		}
 	}
-	keptDataIssues(plan, t, d, containers, match, addIssue)
+}
+
+// existingVolumeIssues 找出新服务器上已有的同名数据卷：迁移过来的数据会替换它；存储方式和旧服务器不同的
+// 问一下。
+func existingVolumeIssues(plan *bundle.Plan, t *Target, d *Decisions, usedVolumes map[string]bool, addIssue func(Issue)) {
 	for _, v := range plan.Volumes {
 		if !usedVolumes[v.Name] || d.KeepVolume(v.Name) || spec.IsAnonymousVolume(v.Name) {
 			continue
@@ -522,8 +557,12 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 				Title: "数据卷 " + v.Name + " 已存在，迁移过来的数据会替换它（失败时放回原来的）"})
 		}
 	}
-	// 目录和数据卷一样整个替换，迁入成功后原来的内容就删了，所以里面有东西时也要说一声。
-	// 里面还挂着别的磁盘时不能替换：挂在里面的会跟着挪进备份，提交后删备份会连那块盘上的东西一起删掉。
+}
+
+// existingBindIssues 检查新服务器上要替换的目录。目录和数据卷一样整个替换，迁入成功后原来的内容就删了，
+// 所以里面有东西时也要说一声。目录是软链接的停下（见 LinkedBind）。里面还挂着别的磁盘时不能替换：挂在
+// 里面的会跟着挪进备份，提交后删备份会连那块盘上的东西一起删掉。
+func existingBindIssues(plan *bundle.Plan, t *Target, usedBinds map[string]bool, addIssue func(Issue)) {
 	for _, b := range plan.Binds {
 		if !usedBinds[b.Path] {
 			continue
@@ -548,11 +587,10 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 				Hint:  "先把它们卸载（umount），或者挂到这个目录外面，再重新检查"})
 		}
 	}
+}
 
-	networkIssues(plan, t, d, containers, match, addIssue)
-	portIssues(t, d, containers, match, addIssue)
-
-	// ---------- digest 固定的镜像 ----------
+// digestIssues 找出按摘要固定了版本、又没选用迁移包里的镜像，新服务器却连不上镜像仓库按摘要补齐的。
+func digestIssues(t *Target, d *Decisions, containers []bundle.PlanContainer, addIssue func(Issue)) {
 	seen := map[string]bool{}
 	for _, c := range containers {
 		if !c.DigestPinned || seen[c.Image] || d.UseBundleImage(c.Image) {
@@ -564,7 +602,6 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 				Title: fmt.Sprintf("容器 %s 的镜像按摘要固定了版本（%s），新服务器连不上镜像仓库，没法按摘要补齐", c.Name, shortRef(c.Image))})
 		}
 	}
-	return res
 }
 
 // keptDataIssues 找出要迁入的容器（containers）里和保留下来的已有服务共用数据的。保留的服务（检查时
