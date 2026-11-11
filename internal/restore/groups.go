@@ -93,22 +93,34 @@ func (r *run) buildGroups(writers []writer) {
 			binds = append(binds, b)
 		}
 	}
-	// 路径按新服务器上解析软链接之后的实际位置比较：父目录是软链接时，写法不同的两个路径
-	// 可能是同一处。
-	overlap := func(a, b string) bool { return spec.PathsOverlap(host.RealPath(a), host.RealPath(b)) }
-	bindKeys := func(source string) []string {
-		var keys []string
-		for _, b := range binds {
-			match := overlap(source, b.Path)
-			for _, l := range b.AllLinks() {
-				match = match || overlap(source, l.Link)
-			}
-			if match {
-				keys = append(keys, "b:"+b.Path)
-			}
+	r.linkItems(uf, binds)
+	r.linkPlaces(uf, binds)
+	r.linkWriters(uf, writers)
+	r.groupsFrom(uf)
+}
+
+// overlap 表示两个路径是不是同一处或者互相包含。按新服务器上解析软链接之后的实际位置比较：父目录是
+// 软链接时，写法不同的两个路径可能是同一处。
+func overlap(a, b string) bool { return spec.PathsOverlap(host.RealPath(a), host.RealPath(b)) }
+
+// bindKeys 是挂载 source 会用到的迁入的目录（binds 里的，连同指向它的软链接）。
+func bindKeys(binds []bundle.Bind, source string) []string {
+	var keys []string
+	for _, b := range binds {
+		match := overlap(source, b.Path)
+		for _, l := range b.AllLinks() {
+			match = match || overlap(source, l.Link)
 		}
-		return keys
+		if match {
+			keys = append(keys, "b:"+b.Path)
+		}
 	}
+	return keys
+}
+
+// linkItems 把迁入的容器和它所在的 Compose 项目、用到的数据卷、目录、网络、依赖的其他迁入的容器
+// 合到一组。
+func (r *run) linkItems(uf unionFind, binds []bundle.Bind) {
 	names := map[string]bool{}
 	for _, it := range r.items {
 		names[it.m.Name] = true
@@ -124,7 +136,7 @@ func (r *run) buildGroups(writers []writer) {
 			case "volume":
 				uf.union(c, "v:"+m.Name)
 			case "bind":
-				for _, k := range bindKeys(m.Source) {
+				for _, k := range bindKeys(binds, m.Source) {
 					uf.union(c, k)
 				}
 			}
@@ -153,8 +165,11 @@ func (r *run) buildGroups(writers []writer) {
 			}
 		}
 	}
-	// 写到同一处的必须在同一组：路径相同或者互相包含都算（项目目录、项目目录以外的文件、
-	// 挂载目录和指向它的软链接）。不然只删除其中一组时，会删掉或换回另一组还在用的文件。
+}
+
+// linkPlaces 把写到同一处的合到一组：路径相同或者互相包含都算（项目目录、项目目录以外的文件、
+// 挂载目录和指向它的软链接）。不然只删除其中一组时，会删掉或换回另一组还在用的文件。
+func (r *run) linkPlaces(uf unionFind, binds []bundle.Bind) {
 	type place struct{ key, path string }
 	var places []place
 	at := func(key, path string) { places = append(places, place{key, host.RealPath(path)}) }
@@ -179,11 +194,15 @@ func (r *run) buildGroups(writers []writer) {
 			}
 		}
 	}
+}
+
+// linkWriters 把迁入时要临时停下的已有容器（writers）和它共用的数据卷、目录合到一组。借用别的要停下的
+// 容器的网络、进程空间的，和它在同一组：放回它之前，借用的不能先启动。
+func (r *run) linkWriters(uf unionFind, writers []writer) {
 	vols, targets := r.writeSet()
 	for _, w := range writers {
 		k := "w:" + w.summary.Name()
 		uf.find(k)
-		// 借用别的要停下的容器的网络、进程空间的，和它在同一组：放回它之前，借用的不能先启动。
 		for _, ref := range spec.Dependencies(w.full) {
 			for _, o := range writers {
 				if refersTo(ref, o) {
@@ -204,7 +223,10 @@ func (r *run) buildGroups(writers []writer) {
 			}
 		}
 	}
+}
 
+// groupsFrom 按 uf 合出来的组建出 r.groups（按迁入的容器、项目的先后编号）和 r.groupOf（每个键在哪一组）。
+func (r *run) groupsFrom(uf unionFind) {
 	byRoot := map[string]*group{}
 	r.groups = nil
 	get := func(key string) *group {
