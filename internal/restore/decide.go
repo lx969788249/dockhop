@@ -23,12 +23,12 @@ import (
 // decide 是改动新服务器之前的最后一道检查，只读不改：按新服务器现在的样子决定替换、保留哪些
 // 已有服务，找出要临时停下的、和迁入的数据共用的容器，并确认要停下的容器都能停下、之后再
 // 原样恢复。之后的改动（加载镜像、备份已有服务、写入数据……）都在事务里，失败时全部撤销。
-func (r *run) decide(ctx context.Context) error {
+func (r *run) decide(ctx context.Context, chk *checked, pkg *bundleFiles) (*scope, error) {
 	s := r.Screen
 	dc := r.Docker
 	existing, err := dc.Containers(ctx, true)
 	if err != nil {
-		return s.StepFailed("读取容器列表失败", err.Error(), "")
+		return nil, s.StepFailed("读取容器列表失败", err.Error(), "")
 	}
 	byName := map[string]docker.ContainerSummary{}
 	projects := map[string][]docker.ContainerSummary{}
@@ -45,54 +45,54 @@ func (r *run) decide(ctx context.Context) error {
 
 	// 要迁入的内容：去掉检查时选择跳过的，--existing skip 时新服务器上已经有对应的，以及要用的名字被
 	// 保留下来的已有容器占着的（见 preflight.Counterparts）。
-	match := r.counterparts(existing)
+	match := r.counterparts(chk, existing)
 	// held 说明 Compose 项目 project 为什么不迁入：它里面的容器要用的名字被保留下来的已有容器占着；
 	// 不是这样时为空。
 	held := func(project string) string {
-		for _, mc := range r.m.Containers {
+		for _, mc := range pkg.m.Containers {
 			if h := match.Holder(mc.Name); mc.Project == project && h != "" && match.Kept(mc.Name) {
 				return "新服务器上的同名容器 " + mc.Name + " 属于保留的 " + h
 			}
 		}
 		return ""
 	}
-	r.targets = map[string]bool{}
+	sc := &scope{targets: map[string]bool{}, anonVolumes: map[string]bundle.Volume{}}
 	var replaceProjects []string
-	for _, p := range r.m.Projects {
-		if slices.Contains(r.d.SkipProjects, p.Name) {
+	for _, p := range pkg.m.Projects {
+		if slices.Contains(chk.d.SkipProjects, p.Name) {
 			continue
 		}
 		if why := held(p.Name); why != "" {
-			r.d.SkipProjects = append(r.d.SkipProjects, p.Name)
-			r.d.Skipped = append(r.d.Skipped, preflight.Skip{Project: p.Name, Reason: why})
+			chk.d.SkipProjects = append(chk.d.SkipProjects, p.Name)
+			chk.d.Skipped = append(chk.d.Skipped, preflight.Skip{Project: p.Name, Reason: why})
 			continue
 		}
 		if what := match.ExistingFor(p.Name); what != "" {
 			switch policy {
 			case "skip":
-				r.d.SkipProjects = append(r.d.SkipProjects, p.Name)
-				r.d.Skipped = append(r.d.Skipped, preflight.Skip{Project: p.Name, Reason: "新服务器上已有" + what + "，按 --existing skip 保留"})
+				chk.d.SkipProjects = append(chk.d.SkipProjects, p.Name)
+				chk.d.Skipped = append(chk.d.Skipped, preflight.Skip{Project: p.Name, Reason: "新服务器上已有" + what + "，按 --existing skip 保留"})
 				continue
 			case "fail":
-				return s.StepFailed("新服务器上已经有"+what+"（--existing fail 不允许替换），没有改动任何东西", "", "删除或改名新服务器上的这些容器，或者去掉 --existing fail")
+				return nil, s.StepFailed("新服务器上已经有"+what+"（--existing fail 不允许替换），没有改动任何东西", "", "删除或改名新服务器上的这些容器，或者去掉 --existing fail")
 			}
 		}
 		if len(projects[p.Name]) > 0 {
 			replaceProjects = append(replaceProjects, p.Name)
 		}
-		r.projects = append(r.projects, p)
+		sc.projects = append(sc.projects, p)
 	}
-	for _, mc := range r.m.Containers {
-		if mc.Project != "" && slices.Contains(r.d.SkipProjects, mc.Project) || slices.Contains(r.d.SkipContainers, mc.Name) {
+	for _, mc := range pkg.m.Containers {
+		if mc.Project != "" && slices.Contains(chk.d.SkipProjects, mc.Project) || slices.Contains(chk.d.SkipContainers, mc.Name) {
 			continue
 		}
-		raw, err := os.ReadFile(filepath.Join(r.dataDir, "containers", mc.Name+".json"))
+		raw, err := os.ReadFile(filepath.Join(pkg.dataDir, "containers", mc.Name+".json"))
 		if err != nil {
-			return s.StepFailed("迁移包里缺少容器 "+mc.Name+" 的配置", err.Error(), "在旧服务器重新运行迁出")
+			return nil, s.StepFailed("迁移包里缺少容器 "+mc.Name+" 的配置", err.Error(), "在旧服务器重新运行迁出")
 		}
 		var c docker.Container
 		if err := json.Unmarshal(raw, &c); err != nil {
-			return s.StepFailed("容器 "+mc.Name+" 的配置读不懂", err.Error(), "")
+			return nil, s.StepFailed("容器 "+mc.Name+" 的配置读不懂", err.Error(), "")
 		}
 		// 容器启动失败时的输出可能带着这些值（例如连接串），日志和报错里都要隐藏。
 		for _, v := range logging.EnvSecrets(c.Config.Env) {
@@ -102,52 +102,52 @@ func (r *run) decide(ctx context.Context) error {
 			switch h := match.Holder(mc.Name); {
 			case h != "" && match.Kept(mc.Name):
 				// 名字被跟着 h 保留下来的已有容器占着。Compose 项目里的容器不会到这里：整个项目上面已经跳过。
-				r.d.SkipContainers = append(r.d.SkipContainers, mc.Name)
-				r.d.Skipped = append(r.d.Skipped, preflight.Skip{Container: mc.Name, Reason: "新服务器上的同名容器属于保留的 " + h})
+				chk.d.SkipContainers = append(chk.d.SkipContainers, mc.Name)
+				chk.d.Skipped = append(chk.d.Skipped, preflight.Skip{Container: mc.Name, Reason: "新服务器上的同名容器属于保留的 " + h})
 				continue
 			case h != "":
 				// 同名的已有容器随 h 一起替换（见 backupProject），名字空出来，不用另外备份。
 			case mc.Project != "" && x.Labels["com.docker.compose.project"] == mc.Project:
 				// 它属于要替换的同名 Compose 项目，随项目一起备份。
 			case policy == "skip":
-				r.d.SkipContainers = append(r.d.SkipContainers, mc.Name)
-				r.d.Skipped = append(r.d.Skipped, preflight.Skip{Container: mc.Name, Reason: "新服务器上已有同名容器，按 --existing skip 保留"})
+				chk.d.SkipContainers = append(chk.d.SkipContainers, mc.Name)
+				chk.d.Skipped = append(chk.d.Skipped, preflight.Skip{Container: mc.Name, Reason: "新服务器上已有同名容器，按 --existing skip 保留"})
 				continue
 			case policy == "fail":
-				return s.StepFailed("新服务器上已经有同名容器 "+mc.Name+"（--existing fail 不允许替换），没有改动任何东西", "", "删除这个容器，或者去掉 --existing fail")
+				return nil, s.StepFailed("新服务器上已经有同名容器 "+mc.Name+"（--existing fail 不允许替换），没有改动任何东西", "", "删除这个容器，或者去掉 --existing fail")
 			default:
 				// 它跟着这个容器（单独迁入的），或者这个容器所在的 Compose 项目：停下、改名备份，名字空出来。
-				r.targets[mc.Name] = true
+				sc.targets[mc.Name] = true
 			}
 		}
-		r.items = append(r.items, &citem{m: mc, raw: raw, c: &c})
+		sc.items = append(sc.items, &citem{m: mc, raw: raw, c: &c})
 	}
-	for _, v := range r.m.Volumes {
+	for _, v := range pkg.m.Volumes {
 		if v.Anonymous {
-			r.anonVolumes[v.Name] = v
+			sc.anonVolumes[v.Name] = v
 		}
 	}
-	if len(r.items) == 0 {
-		return s.StepFailed("按检查时的选择，没有要迁入的容器了", "", "")
+	if len(sc.items) == 0 {
+		return nil, s.StepFailed("按检查时的选择，没有要迁入的容器了", "", "")
 	}
-	writers, err := r.findWriters(ctx, existing)
+	writers, err := r.findWriters(ctx, chk, sc, existing)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	r.writers, r.replaceProjects, r.existingProjects = writers, replaceProjects, projects
-	r.buildGroups(writers)
-	r.seen = r.scene(existing, writers)
-	return r.checkStoppable(ctx)
+	sc.writers, sc.replaceProjects, sc.existingProjects = writers, replaceProjects, projects
+	sc.buildGroups(chk, pkg, r.Log.Printf)
+	sc.seen = r.scene(chk, existing, writers)
+	return sc, r.checkStoppable(ctx, sc)
 }
 
 // counterparts 说明新服务器上的已有容器迁入时会怎样：和迁入前检查是同一条规则（见
 // preflight.Counterparts），检查时说会替换的，迁入时才会替换。
-func (r *run) counterparts(existing []docker.ContainerSummary) preflight.Counterparts {
+func (r *run) counterparts(chk *checked, existing []docker.ContainerSummary) preflight.Counterparts {
 	projects := map[string]string{}
 	for _, c := range existing {
 		projects[c.Name()] = c.Labels["com.docker.compose.project"]
 	}
-	return preflight.CounterpartsOf(r.plan.Containers, projects, &r.d, r.opts.Existing)
+	return preflight.CounterpartsOf(chk.plan.Containers, projects, &chk.d, r.opts.Existing)
 }
 
 // findWriters 找出新服务器上和要写入的数据（数据卷、挂载目录、Compose 项目的文件）共用的已有容器：
@@ -156,10 +156,10 @@ func (r *run) counterparts(existing []docker.ContainerSummary) preflight.Counter
 //   - 其他正在运行的：要先临时停止，否则数据不一致。
 //
 // 读不到某个容器的配置时，没法确认它有没有在用这些数据，不能当作没有。
-func (r *run) findWriters(ctx context.Context, existing []docker.ContainerSummary) ([]writer, error) {
+func (r *run) findWriters(ctx context.Context, chk *checked, sc *scope, existing []docker.ContainerSummary) ([]writer, error) {
 	s := r.Screen
-	match := r.counterparts(existing)
-	volumes, dirs := writeSet(r.writes())
+	match := r.counterparts(chk, existing)
+	volumes, dirs := writeSet(sc.writes(chk))
 	paths := realPaths(dirs)
 	self, _ := os.Hostname()
 	ignore := map[string]bool{}
@@ -229,8 +229,8 @@ func refersTo(ref string, w writer) bool {
 
 // scene 是新服务器上和这次迁入有关的已有容器：要替换的（名字、ID），要临时停下的、和迁入的
 // 数据共用的（名字、ID、状态）。decide 时记下，改动之前再核对一次（见 recheck）。
-func (r *run) scene(existing []docker.ContainerSummary, writers []writer) []string {
-	match := r.counterparts(existing)
+func (r *run) scene(chk *checked, existing []docker.ContainerSummary, writers []writer) []string {
+	match := r.counterparts(chk, existing)
 	var out []string
 	for _, c := range existing {
 		if match.Replaced(c.Name()) {
@@ -252,20 +252,20 @@ func (r *run) scene(existing []docker.ContainerSummary, writers []writer) []stri
 // 可能花了好一会儿，这期间有容器新建、启动、停下，或者被重建（例如被 Watchtower 更新了），再按
 // decide 时的样子停容器、备份就不对了：新启动的共用数据的容器没停下，数据写进去时它还在用。
 // 有变化就停下，重新运行会按新服务器现在的样子重新检查。
-func (r *run) recheck(ctx context.Context) error {
+func (r *migrate) recheck(ctx context.Context) error {
 	s := r.Screen
 	existing, err := r.Docker.Containers(ctx, true)
 	if err != nil {
 		return s.StepFailed("读取容器列表失败", err.Error(), "")
 	}
-	writers, err := r.findWriters(ctx, existing)
+	writers, err := r.findWriters(ctx, r.chk, r.sc, existing)
 	if err != nil {
 		return err
 	}
-	now := r.scene(existing, writers)
+	now := r.scene(r.chk, existing, writers)
 	var changed []string
-	for _, e := range append(slices.Clone(r.seen), now...) {
-		if slices.Contains(r.seen, e) != slices.Contains(now, e) {
+	for _, e := range append(slices.Clone(r.sc.seen), now...) {
+		if slices.Contains(r.sc.seen, e) != slices.Contains(now, e) {
 			changed = append(changed, strings.Fields(e)[0])
 		}
 	}
@@ -279,23 +279,23 @@ func (r *run) recheck(ctx context.Context) error {
 
 // checkStoppable 确认迁入时要停下的已有容器都能停下、之后再原样恢复（规则见
 // spec.StopRiskOf）：共用数据的容器，以及要被替换的同名容器和同名 Compose 项目的容器。
-func (r *run) checkStoppable(ctx context.Context) error {
+func (r *run) checkStoppable(ctx context.Context, sc *scope) error {
 	type stopping struct {
 		c   *docker.Container
 		why string
 	}
 	var list []stopping
-	for _, w := range r.writers {
+	for _, w := range sc.writers {
 		list = append(list, stopping{w.full, "它和迁入的服务共用数据"})
 	}
 	var ids []string
-	for _, it := range r.items {
-		if r.targets[it.m.Name] {
+	for _, it := range sc.items {
+		if sc.targets[it.m.Name] {
 			ids = append(ids, it.m.Name)
 		}
 	}
-	for _, p := range r.replaceProjects {
-		for _, c := range r.existingProjects[p] {
+	for _, p := range sc.replaceProjects {
+		for _, c := range sc.existingProjects[p] {
 			ids = append(ids, c.ID)
 		}
 	}
@@ -324,18 +324,18 @@ func (r *run) checkStoppable(ctx context.Context) error {
 }
 
 // writes 是这次迁入要写到新服务器上的东西，和迁入前检查按同一份迁移计划算（见 preflight.WritesOf）。
-func (r *run) writes() preflight.Writes {
+func (sc *scope) writes(chk *checked) preflight.Writes {
 	names := map[string]bool{}
-	for _, it := range r.items {
+	for _, it := range sc.items {
 		names[it.m.Name] = true
 	}
 	var migrating []bundle.PlanContainer
-	for _, c := range r.plan.Containers {
+	for _, c := range chk.plan.Containers {
 		if names[c.Name] {
 			migrating = append(migrating, c)
 		}
 	}
-	return preflight.WritesOf(r.plan, &r.d, migrating)
+	return preflight.WritesOf(chk.plan, &chk.d, migrating)
 }
 
 // dataTargets 是 w 里要写入数据的有名字的数据卷（匿名卷随容器新建）和目录（系统路径只重建挂载、

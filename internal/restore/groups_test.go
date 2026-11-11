@@ -31,15 +31,15 @@ func TestBuildGroups(t *testing.T) {
 		c.Name = "/" + name
 		return &citem{m: bundle.Container{Name: name, Project: project}, c: &c}
 	}
-	r := testRun(t, Deps{}, Options{})
-	r.m = &bundle.Manifest{
+	r := testMigrate(t, Deps{}, Options{})
+	r.pkg.m = &bundle.Manifest{
 		Binds:    []bundle.Bind{{Path: "/srv/shared"}, {Path: "/srv/blog"}, {Path: "/var/run/docker.sock"}},
 		Volumes:  []bundle.Volume{{Name: "dbdata"}, {Name: "cache"}},
 		Projects: []bundle.Project{{Name: "blog", WorkingDir: "/srv/blog/app"}},
 	}
-	r.projects = r.m.Projects
+	r.sc.projects = r.pkg.m.Projects
 	// 迁移计划里记的和迁移包里的一致（见 preflight.WritesOf）。
-	r.plan = &bundle.Plan{
+	r.chk.plan = &bundle.Plan{
 		Containers: []bundle.PlanContainer{
 			{Name: "web", Binds: []string{"/srv/shared"}}, {Name: "nginx", Binds: []string{"/srv/shared", "/var/run/docker.sock"}},
 			{Name: "blog-app-1", Project: "blog"}, {Name: "blog-db-1", Project: "blog", Volumes: []string{"dbdata"}},
@@ -50,7 +50,7 @@ func TestBuildGroups(t *testing.T) {
 		Volumes:  []bundle.PlanVolume{{Name: "dbdata"}, {Name: "cache"}},
 		Binds:    []bundle.PlanBind{{Path: "/srv/shared"}, {Path: "/srv/blog"}, {Path: "/var/run/docker.sock"}},
 	}
-	r.items = []*citem{
+	r.sc.items = []*citem{
 		mk("web", "", `{"Mounts":[{"Type":"bind","Source":"/srv/shared/html"}],"NetworkSettings":{"Networks":{"bridge":{}}}}`),
 		mk("nginx", "", `{"Mounts":[{"Type":"bind","Source":"/srv/shared"},{"Type":"bind","Source":"/var/run/docker.sock"}]}`),
 		mk("blog-app-1", "blog", `{"NetworkSettings":{"Networks":{"blog_default":{}}}}`),
@@ -62,23 +62,24 @@ func TestBuildGroups(t *testing.T) {
 	}
 	var w docker.Container
 	json.Unmarshal([]byte(`{"Mounts":[{"Type":"volume","Name":"cache"}]}`), &w)
-	r.buildGroups([]writer{{summary: docker.ContainerSummary{Names: []string{"/backup"}}, full: &w}})
+	r.sc.writers = []writer{{summary: docker.ContainerSummary{Names: []string{"/backup"}}, full: &w}}
+	r.sc.buildGroups(r.chk, r.pkg, t.Logf)
 
 	var got []string
-	for _, g := range r.groups {
+	for _, g := range r.sc.groups {
 		got = append(got, g.label())
 	}
 	want := []string{"web、nginx", "Compose 项目 blog、files", "redis、exporter", "alone"}
 	if strings.Join(got, " | ") != strings.Join(want, " | ") {
 		t.Fatalf("分组不对：\n现在：%v\n应该：%v", got, want)
 	}
-	if r.groupOf["v:dbdata"] != r.groupOf["p:blog"] || r.groupOf["b:/srv/blog"] != r.groupOf["p:blog"] {
+	if r.sc.groupOf["v:dbdata"] != r.sc.groupOf["p:blog"] || r.sc.groupOf["b:/srv/blog"] != r.sc.groupOf["p:blog"] {
 		t.Error("项目用到的卷、项目目录所在的挂载目录应和项目同组")
 	}
-	if r.groupOf["w:backup"] != r.groupOf["c:redis"] {
+	if r.sc.groupOf["w:backup"] != r.sc.groupOf["c:redis"] {
 		t.Error("临时停止的容器应和用同一个卷的服务同组")
 	}
-	if _, ok := r.groupOf["b:/var/run/docker.sock"]; ok {
+	if _, ok := r.sc.groupOf["b:/var/run/docker.sock"]; ok {
 		t.Error("宿主机系统路径不应把服务连到一起")
 	}
 }
@@ -98,15 +99,15 @@ func TestBuildGroupsSharedPaths(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			r := testRun(t, Deps{}, Options{})
-			r.m = &bundle.Manifest{Projects: c.projects}
-			r.projects = c.projects
+			r := testMigrate(t, Deps{}, Options{})
+			r.pkg.m = &bundle.Manifest{Projects: c.projects}
+			r.sc.projects = c.projects
 			for _, p := range c.projects {
-				r.items = append(r.items, &citem{m: bundle.Container{Name: p.Name + "-web-1", Project: p.Name}, c: &docker.Container{}})
+				r.sc.items = append(r.sc.items, &citem{m: bundle.Container{Name: p.Name + "-web-1", Project: p.Name}, c: &docker.Container{}})
 			}
-			r.buildGroups(nil)
-			if together := r.groupOf["p:a"] == r.groupOf["p:b"]; together != c.together {
-				t.Errorf("同组：%v，应该：%v（%d 组）", together, c.together, len(r.groups))
+			r.sc.buildGroups(r.chk, r.pkg, t.Logf)
+			if together := r.sc.groupOf["p:a"] == r.sc.groupOf["p:b"]; together != c.together {
+				t.Errorf("同组：%v，应该：%v（%d 组）", together, c.together, len(r.sc.groups))
 			}
 		})
 	}
@@ -123,14 +124,14 @@ func TestBuildGroupsSymlinkParent(t *testing.T) {
 		"目录外的文件": {{Name: "a", WorkingDir: filepath.Join(root, "a"), Outside: []string{filepath.Join(root, "alias", "shared.env")}},
 			{Name: "b", WorkingDir: filepath.Join(root, "b"), Outside: []string{filepath.Join(root, "real", "shared.env")}}},
 	} {
-		r := testRun(t, Deps{}, Options{})
-		r.m = &bundle.Manifest{Projects: projects}
-		r.projects = projects
+		r := testMigrate(t, Deps{}, Options{})
+		r.pkg.m = &bundle.Manifest{Projects: projects}
+		r.sc.projects = projects
 		for _, p := range projects {
-			r.items = append(r.items, &citem{m: bundle.Container{Name: p.Name + "-web-1", Project: p.Name}, c: &docker.Container{}})
+			r.sc.items = append(r.sc.items, &citem{m: bundle.Container{Name: p.Name + "-web-1", Project: p.Name}, c: &docker.Container{}})
 		}
-		r.buildGroups(nil)
-		if r.groupOf["p:a"] != r.groupOf["p:b"] {
+		r.sc.buildGroups(r.chk, r.pkg, t.Logf)
+		if r.sc.groupOf["p:a"] != r.sc.groupOf["p:b"] {
 			t.Errorf("%s：经过软链接写到同一处，应在同一组", name)
 		}
 	}
@@ -144,13 +145,13 @@ func TestPartialRollbackKeepsOtherGroup(t *testing.T) {
 	os.WriteFile(filepath.Join(stage, "compose.yml"), []byte("services: {}"), 0o600)
 	projects := []bundle.Project{{Name: "a", WorkingDir: filepath.Join(root, "a")}, {Name: "b", WorkingDir: filepath.Join(root, "b")}}
 	var out bytes.Buffer
-	r := testRun(t, Deps{Screen: ui.New(&out, false, nil)}, Options{})
-	r.m = &bundle.Manifest{Projects: projects}
-	r.projects = projects
+	r := testMigrate(t, Deps{Screen: ui.New(&out, false, nil)}, Options{})
+	r.pkg.m = &bundle.Manifest{Projects: projects}
+	r.sc.projects = projects
 	for _, p := range projects {
-		r.items = append(r.items, &citem{m: bundle.Container{Name: p.Name + "-web-1", Project: p.Name}, c: &docker.Container{}})
+		r.sc.items = append(r.sc.items, &citem{m: bundle.Container{Name: p.Name + "-web-1", Project: p.Name}, c: &docker.Container{}})
 	}
-	r.buildGroups(nil)
+	r.sc.buildGroups(r.chk, r.pkg, t.Logf)
 	j, err := openJournal(filepath.Join(root, "rb"))
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +170,7 @@ func TestPartialRollbackKeepsOtherGroup(t *testing.T) {
 	}
 	var drop []Entry
 	for _, e := range entries {
-		if e.Group == r.groupOf["p:a"] {
+		if e.Group == r.sc.groupOf["p:a"] {
 			drop = append(drop, e)
 		}
 	}
@@ -189,13 +190,13 @@ func TestPartialRollbackKeepsOtherGroup(t *testing.T) {
 // 几组都用的镜像名留着。
 func TestPartialRollbackRestoresImageNames(t *testing.T) {
 	var out bytes.Buffer
-	r := testRun(t, Deps{Screen: ui.New(&out, false, nil)}, Options{})
-	r.m = &bundle.Manifest{}
+	r := testMigrate(t, Deps{Screen: ui.New(&out, false, nil)}, Options{})
+	r.pkg.m = &bundle.Manifest{}
 	for _, name := range []string{"good", "bad"} {
-		r.items = append(r.items, &citem{m: bundle.Container{Name: name, ImageID: "sha256:src-" + name}, c: &docker.Container{}})
+		r.sc.items = append(r.sc.items, &citem{m: bundle.Container{Name: name, ImageID: "sha256:src-" + name}, c: &docker.Container{}})
 	}
-	r.items[0].c.Config.Image, r.items[1].c.Config.Image = "base:1", "base:1" // 两组都用 base:1
-	r.buildGroups(nil)
+	r.sc.items[0].c.Config.Image, r.sc.items[1].c.Config.Image = "base:1", "base:1" // 两组都用 base:1
+	r.sc.buildGroups(r.chk, r.pkg, t.Logf)
 	if r.imageKey("sha256:src-bad", "bad:1") != "c:bad" || r.imageKey("sha256:src-base", "base:1") != "" {
 		t.Fatal("只有一组用的镜像跟着那一组，两组都用的算共用")
 	}
@@ -214,7 +215,7 @@ func TestPartialRollbackRestoresImageNames(t *testing.T) {
 		r.in(r.imageKey(x.id, x.ref))
 		j.add(Entry{Op: opTag, Name: x.ref, ID: x.was})
 	}
-	ok, bad := r.groupByID(r.groupOf["c:good"]), r.groupByID(r.groupOf["c:bad"])
+	ok, bad := r.sc.groupByID(r.sc.groupOf["c:good"]), r.sc.groupByID(r.sc.groupOf["c:bad"])
 	bad.reason = "没能启动"
 	r.Home = t.TempDir()
 	if err := r.commitPartial(context.Background(), []*group{ok}, []*group{bad}); err != errPartial {
@@ -254,20 +255,20 @@ func TestPartialRollbackImageNameUsers(t *testing.T) {
 			d := &images{tags: map[string]string{dockerName(c.bad.Image): "sha256:target"},
 				ids: map[string]bool{"sha256:target": true, "sha256:src": true, "sha256:src-old": true}}
 			var out bytes.Buffer
-			r := testRun(t, Deps{Docker: d.docker(t), Screen: ui.New(&out, false, nil), Home: t.TempDir()}, Options{})
-			r.m = &bundle.Manifest{ImageFiles: c.files, Images: bundle.Images{Refs: map[string]string{}}}
-			r.images = map[string]imageSource{}
+			r := testMigrate(t, Deps{Docker: d.docker(t), Screen: ui.New(&out, false, nil), Home: t.TempDir()}, Options{})
+			r.pkg.m = &bundle.Manifest{ImageFiles: c.files, Images: bundle.Images{Refs: map[string]string{}}}
+			r.chk.images = map[string]imageSource{}
 			for _, x := range []bundle.Container{c.good, c.bad} {
 				it := &citem{m: x, c: &docker.Container{}}
 				it.c.Config.Image = x.Image
-				r.items = append(r.items, it)
+				r.sc.items = append(r.sc.items, it)
 			}
-			r.buildGroups(nil)
+			r.sc.buildGroups(r.chk, r.pkg, t.Logf)
 			for _, f := range c.files {
 				for _, ref := range f.Refs {
-					r.m.Images.Refs[ref] = f.ID
+					r.pkg.m.Images.Refs[ref] = f.ID
 				}
-				r.images[f.File] = imageSource{local: f.ID} // 本机已经有，只加名字
+				r.chk.images[f.File] = imageSource{local: f.ID} // 本机已经有，只加名字
 			}
 			r.undo = testUndo(t, r.Docker, r.Screen)
 			j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
@@ -278,7 +279,7 @@ func TestPartialRollbackImageNameUsers(t *testing.T) {
 			if err := r.loadImages(context.Background()); err != nil {
 				t.Fatalf("%v\n%s", err, out.String())
 			}
-			ok, bad := r.groupByID(r.groupOf["c:good"]), r.groupByID(r.groupOf["c:bad"])
+			ok, bad := r.sc.groupByID(r.sc.groupOf["c:good"]), r.sc.groupByID(r.sc.groupOf["c:bad"])
 			bad.reason = "没能启动"
 			if err := r.commitPartial(context.Background(), []*group{ok}, []*group{bad}); err != errPartial {
 				t.Fatal(err)
@@ -320,7 +321,7 @@ func checkPartialDone(t *testing.T, root string) {
 }
 
 // partialRun 是只有空的 Docker 的迁入（没有容器和镜像），回滚资料在 dir。
-func partialRun(t *testing.T, dir string) *run {
+func partialRun(t *testing.T, dir string) *migrate {
 	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
 		if strings.HasSuffix(req.URL.Path, "/containers/json") || strings.HasSuffix(req.URL.Path, "/images/json") {
 			io.WriteString(w, "[]")
@@ -334,7 +335,7 @@ func partialRun(t *testing.T, dir string) *run {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { log.Finish(logging.Failed, true) })
-	r := testRun(t, Deps{Docker: dc, Prompt: ui.NewPrompter(nil, io.Discard), Log: log,
+	r := testMigrate(t, Deps{Docker: dc, Prompt: ui.NewPrompter(nil, io.Discard), Log: log,
 		Home: t.TempDir(), Getenv: func(string) string { return "" }}, Options{})
 	r.rbDir = dir
 	r.undo = testUndo(t, dc, r.Screen)
@@ -357,7 +358,7 @@ func TestPartialCommitKeepsJournal(t *testing.T) {
 	r.j = j
 	g1 := &group{id: "g1", items: []*citem{{m: bundle.Container{Name: "a"}, c: &docker.Container{}}}}
 	g2 := &group{id: "g2", reason: "没能启动", items: []*citem{{m: bundle.Container{Name: "b"}, c: &docker.Container{}}}}
-	r.groups = []*group{g1, g2}
+	r.sc.groups = []*group{g1, g2}
 	var during []Entry // 删除没启动的组时日志里的内容
 	r.undo.fail = func(point string) bool {
 		if point == "rollback-data" {

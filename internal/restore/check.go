@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
+	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/transfer"
 	"github.com/lx969788249/dockhop/internal/ui"
@@ -26,50 +27,49 @@ func (r *run) client() *transfer.Client {
 	return transfer.NewClient(r.opts.Link, timeout, r.Log.Printf)
 }
 
-func (r *run) fetchPlan(ctx context.Context) error {
+func (r *run) fetchPlan(ctx context.Context) (*bundle.Plan, error) {
 	s := r.Screen
 	s.Note("连接旧服务器 " + r.opts.Link.Host)
 	raw, err := r.client().FetchPlan(ctx)
 	if errors.Is(err, transfer.ErrNoPlan) {
 		// 迁移计划是迁入前检查和核对下载文件的依据，没有它不能迁入。
-		return s.StepFailed("旧服务器没有提供迁移计划，没法做迁入前检查（还没有下载或改动任何东西）", "",
+		return nil, s.StepFailed("旧服务器没有提供迁移计划，没法做迁入前检查（还没有下载或改动任何东西）", "",
 			"在旧服务器上重新运行迁出")
 	}
 	if err != nil {
 		var ce *transfer.ConnError
 		if errors.As(err, &ce) {
-			return s.StepFailed(ce.Reason, "", ce.Hint)
+			return nil, s.StepFailed(ce.Reason, "", ce.Hint)
 		}
-		return s.StepFailed("连接旧服务器失败", err.Error(), "")
+		return nil, s.StepFailed("连接旧服务器失败", err.Error(), "")
 	}
 	p, err := bundle.DecryptPlan(bytes.NewReader(raw), r.opts.Link)
 	switch {
 	case errors.Is(err, bundle.ErrPlanOlder):
-		return s.StepFailed("这个迁移链接是旧版本的 DockHop 生成的，要在旧服务器上用最新版本重新迁出（还没有下载或改动任何东西）", "",
+		return nil, s.StepFailed("这个迁移链接是旧版本的 DockHop 生成的，要在旧服务器上用最新版本重新迁出（还没有下载或改动任何东西）", "",
 			"在旧服务器上按 Ctrl+C 结束现在的迁出，运行 bash <(curl -fsSL https://dockhop.run) 选迁出，再用新的链接迁入")
 	case errors.Is(err, bundle.ErrPlanNewer):
-		return s.StepFailed("这个迁移链接是更新版本的 DockHop 生成的，要用最新版本迁入（还没有下载或改动任何东西）", "",
+		return nil, s.StepFailed("这个迁移链接是更新版本的 DockHop 生成的，要用最新版本迁入（还没有下载或改动任何东西）", "",
 			"运行 bash <(curl -fsSL https://dockhop.run)，选迁入")
 	case err != nil:
-		return s.StepFailed("迁移计划解不开："+err.Error(), "", "确认用的是旧服务器这次显示的完整链接")
+		return nil, s.StepFailed("迁移计划解不开："+err.Error(), "", "确认用的是旧服务器这次显示的完整链接")
 	}
-	r.plan = p
-	return nil
+	return p, nil
 }
 
 // check 是迁入前检查，返回这一步的摘要。
-func (r *run) check(ctx context.Context) (string, error) {
+func (r *run) check(ctx context.Context, chk *checked, tool *compose.Tool) (string, error) {
 	s := r.Screen
-	r.skipDone(ctx)
+	r.skipDone(ctx, chk)
 	runner := &preflight.Runner{Screen: s, Prompt: r.Prompt, Auto: r.opts.Yes,
 		Collect: func() (*preflight.Target, error) {
 			v := ""
-			if r.tool != nil {
-				v = r.tool.Version
+			if tool != nil {
+				v = tool.Version
 			}
 			return preflight.Collect(ctx, r.Docker, v)
 		}}
-	res, err := runner.Run(r.plan, &r.d, preflight.Options{Existing: r.opts.Existing, BaseDir: r.workBase(), Home: r.Home, LocalWork: localWork})
+	res, err := runner.Run(chk.plan, &chk.d, preflight.Options{Existing: r.opts.Existing, BaseDir: r.workBase(chk), Home: r.Home, LocalWork: localWork})
 	if ui.Canceled(err) {
 		return "", err
 	}
@@ -80,7 +80,7 @@ func (r *run) check(ctx context.Context) (string, error) {
 		}
 		return "", s.StepFailed(err.Error(), "", "")
 	}
-	b, _ := json.Marshal(r.d)
+	b, _ := json.Marshal(chk.d)
 	r.Log.Printf("检查时的选择：%s", b)
 	summary := "没有发现问题"
 	if runner.Raised() {

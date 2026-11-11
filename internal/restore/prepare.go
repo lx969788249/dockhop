@@ -13,26 +13,17 @@ import (
 // Compose 项目改名备份，失败时都能放回去。
 
 // prepare 备份要替换的已有服务，临时停下和迁入的数据共用的容器（都是 decide 找出来的）。
-func (r *run) prepare(ctx context.Context) error {
+func (r *migrate) prepare(ctx context.Context) error {
 	s, dc := r.Screen, r.Docker
 	if err := r.recheck(ctx); err != nil {
 		return err
 	}
-	helperBin := ""
-	if dc.Local() {
-		var err error
-		if helperBin, err = prepareHelper(r.Home); err != nil {
-			s.Warn("准备清空数据卷用的程序失败：%v", err)
-			helperBin = ""
-		}
-	}
-	r.vio = &volumeIO{dc: dc, image: r.helperImage(ctx), helperBin: helperBin, lock: lockPath(r.Home)}
-	r.undo.vio = r.vio
+	r.volumes(ctx) // 先准备好读写数据卷要用的（这时镜像都已加载）
 
 	stopped := 0
-	for _, w := range r.writers {
+	for _, w := range r.sc.writers {
 		name := w.summary.Name()
-		e := Entry{Op: opStop, Name: name, ID: w.summary.ID, State: stateOf(w.full), Group: r.groupOf["w:"+name]}
+		e := Entry{Op: opStop, Name: name, ID: w.summary.ID, State: stateOf(w.full), Group: r.sc.groupOf["w:"+name]}
 		if err := r.stopContainer(ctx, e); err != nil {
 			return err
 		}
@@ -44,8 +35,8 @@ func (r *run) prepare(ctx context.Context) error {
 	// 和迁入的容器同名、不随 Compose 项目一起备份的已有容器（见 decide）：停止、改名备份、断开网络
 	// （释放固定 IP），失败时改回来。
 	backedUp := 0
-	for _, it := range r.items {
-		if !r.targets[it.m.Name] {
+	for _, it := range r.sc.items {
+		if !r.sc.targets[it.m.Name] {
 			continue
 		}
 		r.in("c:" + it.m.Name)
@@ -82,12 +73,12 @@ func (r *run) prepare(ctx context.Context) error {
 	}
 
 	// 已有的同名 Compose 项目：记下每个容器的完整配置，停止，把有改动的存成回滚镜像，再删除。
-	for _, p := range r.replaceProjects {
+	for _, p := range r.sc.replaceProjects {
 		r.in("p:" + p)
-		if err := r.backupProject(ctx, p, r.existingProjects[p]); err != nil {
+		if err := r.backupProject(ctx, p, r.sc.existingProjects[p]); err != nil {
 			return err
 		}
-		backedUp += len(r.existingProjects[p])
+		backedUp += len(r.sc.existingProjects[p])
 	}
 	r.in("")
 	if r.testFail("prepare") {
@@ -110,7 +101,7 @@ func stateOf(c *docker.Container) string {
 }
 
 // stopContainer 记下并停止一个容器（暂停的先恢复再停）。
-func (r *run) stopContainer(ctx context.Context, e Entry) error {
+func (r *migrate) stopContainer(ctx context.Context, e Entry) error {
 	if err := r.j.add(e); err != nil {
 		return r.Screen.StepFailed(err.Error(), "", "")
 	}
@@ -125,7 +116,7 @@ func (r *run) stopContainer(ctx context.Context, e Entry) error {
 	return nil
 }
 
-func (r *run) backupProject(ctx context.Context, project string, list []docker.ContainerSummary) error {
+func (r *migrate) backupProject(ctx context.Context, project string, list []docker.ContainerSummary) error {
 	s, dc := r.Screen, r.Docker
 	var old []OldContainer
 	for _, c := range list {

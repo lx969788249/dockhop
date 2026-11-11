@@ -63,7 +63,7 @@ func TestFileChangesRollBack(t *testing.T) {
 	before := snapshotTree(t, world)
 
 	var out bytes.Buffer
-	r := testRun(t, Deps{Screen: ui.New(&out, false, nil), Home: filepath.Join(root, "home")}, Options{})
+	r := testMigrate(t, Deps{Screen: ui.New(&out, false, nil), Home: filepath.Join(root, "home")}, Options{})
 	j, err := openJournal(filepath.Join(root, "rb"))
 	if err != nil {
 		t.Fatal(err)
@@ -160,11 +160,11 @@ func dirNames(dir string) []string {
 	return names
 }
 
-func bindRun(t *testing.T, root, dataDir string) *run {
+func bindRun(t *testing.T, root, dataDir string) *migrate {
 	t.Helper()
-	r := testRun(t, Deps{Home: filepath.Join(root, "home"),
+	r := testMigrate(t, Deps{Home: filepath.Join(root, "home"),
 		MountPoint: noMounts}, Options{})
-	r.dataDir = dataDir
+	r.pkg.dataDir = dataDir
 	j, err := openJournal(filepath.Join(root, "rb"))
 	if err != nil {
 		t.Fatal(err)
@@ -260,7 +260,7 @@ func TestInstallProjectRefusesLink(t *testing.T) {
 	os.Symlink(disk, dst)
 	before := snapshotTree(t, world)
 	r := bindRun(t, root, filepath.Join(root, "data"))
-	r.workdir = filepath.Join(root, "work")
+	r.pkg.workdir = filepath.Join(root, "work")
 	for _, p := range []bundle.Project{
 		{Name: "site", WorkingDir: dst, DirParts: 1},
 		{Name: "site", WorkingDir: filepath.Join(world, "plain"), Outside: []string{dst}, OutParts: 1},
@@ -463,7 +463,7 @@ func TestRollbackStopsWhenDockerErrors(t *testing.T) {
 
 // sharedWriters 模拟提交时恢复临时停下的、共用数据的容器：b 恢复成功（又在运行了），
 // a 恢复失败，于是整体回滚。stopOK 决定回滚时能不能把 b 停下。
-func sharedWriters(t *testing.T, stopOK bool) (r *run, dataReplacedWhileRunning func() bool, dst string) {
+func sharedWriters(t *testing.T, stopOK bool) (r *migrate, dataReplacedWhileRunning func() bool, dst string) {
 	root := t.TempDir()
 	dst, backup := filepath.Join(root, "data"), filepath.Join(root, "backup")
 	os.Mkdir(dst, 0o700)
@@ -510,7 +510,7 @@ func sharedWriters(t *testing.T, stopOK bool) (r *run, dataReplacedWhileRunning 
 			t.Fatal(err)
 		}
 	}
-	r = testRun(t, Deps{Docker: dc, Screen: screen}, Options{})
+	r = testMigrate(t, Deps{Docker: dc, Screen: screen}, Options{})
 	r.j = j
 	r.rbDir = rb
 	r.shared = shared
@@ -1297,7 +1297,7 @@ func TestRollbackRemovesOnlyCreatedContainers(t *testing.T) {
 func TestCreateContainerRecordsID(t *testing.T) {
 	for _, journalFails := range []bool{false, true} {
 		t.Run(fmt.Sprintf("记不下来=%v", journalFails), func(t *testing.T) {
-			var r *run
+			var r *migrate
 			fake := dockertest.New(t, func(w http.ResponseWriter, q *http.Request) bool {
 				p := q.URL.Path
 				switch {
@@ -1317,8 +1317,8 @@ func TestCreateContainerRecordsID(t *testing.T) {
 				return true
 			})
 			dc, calls := fake.Client(), fake.Calls
-			r = testRun(t, Deps{Docker: dc}, Options{})
-			r.m = &bundle.Manifest{}
+			r = testMigrate(t, Deps{Docker: dc}, Options{})
+			r.pkg.m = &bundle.Manifest{}
 			r.j = testJournal(t)
 			raw := json.RawMessage(`{"Name":"/web","Config":{"Image":"alpine"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`)
 			it := &citem{m: bundle.Container{Name: "web"}, raw: raw, c: &docker.Container{}, img: "alpine"}

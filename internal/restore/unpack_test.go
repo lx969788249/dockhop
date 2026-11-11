@@ -69,11 +69,8 @@ func TestBadBundleDropsDownload(t *testing.T) {
 		}
 		var out bytes.Buffer
 		r := testRun(t, Deps{Screen: ui.New(&out, false, nil), Home: dir}, Options{Link: link})
-		r.plan = plan
-		r.downloaded = true
-		r.bundlePath = path
-		r.dataDir = filepath.Join(dir, "data")
-		_, err := r.unpack(context.Background())
+		pkg := &bundleFiles{downloaded: true, bundlePath: path, dataDir: filepath.Join(dir, "data")}
+		_, err := r.unpack(context.Background(), &checked{plan: plan}, pkg)
 		got := r.Screen.Failure()
 		if err == nil || got == nil || !strings.Contains(got.Hint, "在旧服务器重新运行迁出") || strings.Contains(got.Hint, "重新下载") != c.redownload {
 			t.Errorf("%s：%v %+v", c.name, err, got)
@@ -91,12 +88,12 @@ func TestHomeClash(t *testing.T) {
 	home := filepath.Join(root, "dockhop")
 	app := filepath.Join(root, "app")
 	r := testRun(t, Deps{Home: home}, Options{})
-	r.m = &bundle.Manifest{Binds: []bundle.Bind{{Path: app}}}
-	if is := r.homeClash(); is != nil {
+	pkg := &bundleFiles{m: &bundle.Manifest{Binds: []bundle.Bind{{Path: app}}}}
+	if is := r.homeClash(pkg); is != nil {
 		t.Fatalf("不重叠时不应拦下：%s", is.Title)
 	}
-	r.m.Binds[0].Links = []bundle.BindLink{{Link: filepath.Join(home, "cfg"), Target: app}}
-	if is := r.homeClash(); is == nil || !strings.Contains(is.Title, filepath.Join(home, "cfg")) || !strings.Contains(is.Hint, "DOCKHOP_HOME") {
+	pkg.m.Binds[0].Links = []bundle.BindLink{{Link: filepath.Join(home, "cfg"), Target: app}}
+	if is := r.homeClash(pkg); is == nil || !strings.Contains(is.Title, filepath.Join(home, "cfg")) || !strings.Contains(is.Hint, "DOCKHOP_HOME") {
 		t.Fatalf("软链接在 DockHop 的目录里时应拦下：%+v", is)
 	}
 }

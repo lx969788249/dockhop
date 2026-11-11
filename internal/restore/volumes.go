@@ -29,6 +29,30 @@ func (r *run) helperImage(ctx context.Context) string {
 	return anyImage(list)
 }
 
+// newVolumeIO 准备读写数据卷：挑一个本机的镜像建临时容器；Docker 在本机时，再复制好清空数据卷用的
+// DockHop 程序。复制失败时返回错误，程序路径为空，照样能读写（见 volumeIO）。
+func (r *run) newVolumeIO(ctx context.Context) (*volumeIO, error) {
+	v := &volumeIO{dc: r.Docker, lock: lockPath(r.Home)}
+	var err error
+	if r.Docker.Local() {
+		v.helperBin, err = prepareHelper(r.Home)
+	}
+	v.image = r.helperImage(ctx)
+	return v, err
+}
+
+// volumes 是这次迁入读写数据卷用的 volumeIO：第一次用到时准备（见 prepare），撤销时也用它。
+func (r *migrate) volumes(ctx context.Context) *volumeIO {
+	if r.vio == nil {
+		vio, err := r.newVolumeIO(ctx)
+		if err != nil {
+			r.Screen.Warn("准备清空数据卷用的程序失败：%v", err)
+		}
+		r.vio, r.undo.vio = vio, vio
+	}
+	return r.vio
+}
+
 // anyImage 从本机的镜像里挑一个：临时容器只用来挂上数据卷、放进 DockHop 程序，哪个镜像都行。
 // 优先用名字，其次用“名字@摘要”（按 ID 创建时 containerd 存储会给多平台镜像选错平台），
 // 都没有时用 ID；一个镜像都没有时为空。

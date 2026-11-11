@@ -16,9 +16,9 @@ import (
 
 // countText 是迁入的容器和它们的状态。停止、暂停的容器是照旧服务器上的样子保留的，
 // 单独说明，免得以为没启动成功。
-func (r *run) countText() string {
+func (sc *scope) countText() string {
 	running, paused, stopped := 0, 0, 0
-	for _, it := range r.items {
+	for _, it := range sc.items {
 		switch it.want() {
 		case wantPaused:
 			paused++
@@ -29,12 +29,12 @@ func (r *run) countText() string {
 		}
 	}
 	if paused+stopped == 0 {
-		if len(r.items) == 1 {
+		if len(sc.items) == 1 {
 			return "容器正常运行"
 		}
-		return fmt.Sprintf("%d 个容器都在正常运行", len(r.items))
+		return fmt.Sprintf("%d 个容器都在正常运行", len(sc.items))
 	}
-	t := fmt.Sprintf("%d 个容器，%d 个正常运行", len(r.items), running)
+	t := fmt.Sprintf("%d 个容器，%d 个正常运行", len(sc.items), running)
 	var kept []string
 	if stopped > 0 {
 		kept = append(kept, fmt.Sprintf("%d 个停止", stopped))
@@ -46,10 +46,10 @@ func (r *run) countText() string {
 }
 
 // servicesText 是迁入了哪些服务：独立容器写容器名、Compose 项目写项目名。
-func (r *run) servicesText() string {
+func (sc *scope) servicesText() string {
 	var names []string
 	seen := map[string]bool{}
-	for _, it := range r.items {
+	for _, it := range sc.items {
 		n := it.m.Name
 		if it.m.Project != "" {
 			n = it.m.Project
@@ -64,7 +64,7 @@ func (r *run) servicesText() string {
 
 // changed 表示这次运行改动过这台服务器：开始了这次迁入的事务，或者撤销过迁入的内容（这次的，
 // 或者上次被强制结束时留下的）。
-func (r *run) changed() bool { return r.j != nil || r.out.rollbackDone }
+func (r *run) changed() bool { return r.at.mg != nil || r.out.rollbackDone }
 
 // ending 是一次迁入的结局：结果摘要按它写，迁移次数按它统计（见 Deps 的 Succeeded、Failed）。
 type ending int
@@ -102,10 +102,12 @@ func (r *run) ending(ctx context.Context, err error) ending {
 }
 
 func (r *run) report(ctx context.Context, end ending) error {
+	chk, pkg, sc := r.at.chk, r.at.pkg, r.at.sc
+	downloaded := pkg != nil && pkg.downloaded
 	// 还没改动这台服务器就取消了：不用摆出一整块失败结果。
 	if end == endCancelled {
 		msg := "\n已取消，这台服务器上什么都没有改动。"
-		if r.downloaded {
+		if downloaded {
 			msg += "已经下载的部分留着，用同一个链接重新迁入会接着下载。"
 		}
 		r.Screen.Println(msg)
@@ -120,23 +122,23 @@ func (r *run) report(ctx context.Context, end ending) error {
 	status := transfer.Status{Result: "failed"}
 	rep := ui.Report{Title: "迁入结果", Elapsed: time.Since(r.started)}
 	untouched := "（还没有改动新服务器）"
-	if !r.downloaded {
+	if !downloaded {
 		untouched = "（还没有下载或改动任何东西）"
 	}
 	switch {
 	case success:
 		rep.Result = "✅ 迁入完成"
-		lines = append(lines, "迁入的服务："+r.servicesText()+" · "+r.countText())
-		if len(r.done) > 0 {
-			lines = append(lines, "上次已经迁入："+strings.Join(r.done, "、"))
+		lines = append(lines, "迁入的服务："+sc.servicesText()+" · "+sc.countText())
+		if len(chk.done) > 0 {
+			lines = append(lines, "上次已经迁入："+strings.Join(chk.done, "、"))
 		}
 		status.Result = "success"
 	case end == endPartial:
-		ok, failed := r.splitGroups()
+		ok, failed := sc.splitGroups()
 		rep.Result = "⚠️ 只迁入了一部分"
 		lines = append(lines, "已经迁入、正常运行："+labels(ok))
-		if len(r.done) > 0 {
-			lines = append(lines, "上次已经迁入："+strings.Join(r.done, "、"))
+		if len(chk.done) > 0 {
+			lines = append(lines, "上次已经迁入："+strings.Join(chk.done, "、"))
 		}
 		if len(r.out.rollbackIssues) == 0 {
 			lines = append(lines, "没有迁入（已删除）："+labels(failed))
@@ -188,10 +190,12 @@ func (r *run) report(ctx context.Context, end ending) error {
 	if f := r.Screen.Failure(); f != nil && status.Message == "" {
 		status.Message = f.Reason
 	}
-	lines = append(lines, r.d.Summary()...)
-	if !success && r.downloaded {
-		if _, err := os.Stat(r.bundlePath); err == nil {
-			lines = append(lines, "下载的迁移包（加密）保留在 "+r.workdir+"：用同一个链接重新迁入时不用重新下载，不迁了可以删掉这个目录")
+	if chk != nil {
+		lines = append(lines, chk.d.Summary()...)
+	}
+	if !success && downloaded {
+		if _, err := os.Stat(pkg.bundlePath); err == nil {
+			lines = append(lines, "下载的迁移包（加密）保留在 "+pkg.workdir+"：用同一个链接重新迁入时不用重新下载，不迁了可以删掉这个目录")
 		}
 	}
 	rep.Lines = lines
@@ -200,7 +204,7 @@ func (r *run) report(ctx context.Context, end ending) error {
 		rep.LogPath = r.Log.Path()
 	}
 	// 通知旧服务器：成功时它会自动结束；失败时它继续提供下载，方便重试。
-	if r.m != nil || r.plan != nil {
+	if chk != nil {
 		if err := transfer.SendStatusQuiet(ctx, r.opts.Link, status); err != nil {
 			r.Log.Printf("没能通知旧服务器（可能已经关闭）：%v", err)
 		}

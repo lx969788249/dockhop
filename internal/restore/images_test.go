@@ -134,15 +134,15 @@ func TestImageSources(t *testing.T) {
 	dc := fake.Client()
 
 	var out bytes.Buffer
-	r := testRun(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, Options{Link: link})
-	r.workdir = t.TempDir()
-	r.m = &bundle.Manifest{ImageFiles: files}
+	r := testMigrate(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, Options{Link: link})
+	r.pkg.workdir = t.TempDir()
+	r.pkg.m = &bundle.Manifest{ImageFiles: files}
 	r.j = testJournal(t)
-	r.decideImages(context.Background(), files)
+	r.chk.images = r.decideImages(context.Background(), files)
 	want := map[string]imageSource{"image-1": {local: "sha256:here"}, "image-2": {pull: true}, "image-3": {pull: true}, "image-5": {pull: true}}
 	for _, f := range files {
-		if r.images[f.File] != want[f.File] {
-			t.Errorf("%s 应 %+v，实际 %+v", f.File, want[f.File], r.images[f.File])
+		if r.chk.images[f.File] != want[f.File] {
+			t.Errorf("%s 应 %+v，实际 %+v", f.File, want[f.File], r.chk.images[f.File])
 		}
 	}
 	if err := r.loadImageFiles(context.Background()); err != nil {
@@ -157,7 +157,7 @@ func TestImageSources(t *testing.T) {
 	if strings.Join(tags, "；") != "sha256:here → local:1；sha256:pulled-here → web:1.25；sha256:pulled-here → web:latest" {
 		t.Errorf("加的名字不对：%v", tags)
 	}
-	if left, _ := filepath.Glob(filepath.Join(r.workdir, "images", "*")); len(left) > 0 {
+	if left, _ := filepath.Glob(filepath.Join(r.pkg.workdir, "images", "*")); len(left) > 0 {
 		t.Errorf("加载完应删掉下载的镜像文件：%v", left)
 	}
 	// 每个名字改动之前都记进了事务日志（原来指向哪个镜像；没有的为空），失败时改回去。
@@ -216,9 +216,9 @@ func TestLoadImagesNamesPinned(t *testing.T) {
 			dc := fake.Client()
 			id := "sha256:" + strings.Repeat("b", 64)
 			var out bytes.Buffer
-			r := testRun(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, Options{})
-			r.dataDir = t.TempDir()
-			r.m = &bundle.Manifest{Images: bundle.Images{Refs: map[string]string{digest: id, "nginx:1.27": id}}}
+			r := testMigrate(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, Options{})
+			r.pkg.dataDir = t.TempDir()
+			r.pkg.m = &bundle.Manifest{Images: bundle.Images{Refs: map[string]string{digest: id, "nginx:1.27": id}}}
 			r.j = testJournal(t)
 			if err := r.loadImages(context.Background()); err != nil {
 				t.Fatalf("%v\n%s", err, out.String())
@@ -275,29 +275,29 @@ func TestImageNamesFollowGroups(t *testing.T) {
 	d := &images{tags: map[string]string{"bad:1": "sha256:old-bad"}, ids: map[string]bool{"sha256:old-bad": true,
 		"sha256:good": true, "sha256:bad": true, "sha256:base": true, "sha256:pair": true}}
 	var out bytes.Buffer
-	r := testRun(t, Deps{Docker: d.docker(t), Screen: ui.New(&out, false, nil)}, Options{})
-	r.m = &bundle.Manifest{Images: bundle.Images{Refs: map[string]string{}}}
-	r.images = map[string]imageSource{}
+	r := testMigrate(t, Deps{Docker: d.docker(t), Screen: ui.New(&out, false, nil)}, Options{})
+	r.pkg.m = &bundle.Manifest{Images: bundle.Images{Refs: map[string]string{}}}
+	r.chk.images = map[string]imageSource{}
 	// good、bad 各用自己的镜像；base:1 两个互不相干（分在不同组）的容器都用；left、right 用
 	// 同一个镜像的两个名字，这个镜像还有一个谁都没用的名字 pair:latest。
 	for _, x := range [][3]string{{"good", "good:1"}, {"bad", "bad:1"}, {"tool-a", "base:1"}, {"tool-b", "base:1"},
 		{"left", "left:1", "sha256:pair"}, {"right", "right:1", "sha256:pair"}} {
 		it := &citem{m: bundle.Container{Name: x[0], ImageID: x[2]}, c: &docker.Container{}}
 		it.c.Config.Image = x[1]
-		r.items = append(r.items, it)
+		r.sc.items = append(r.sc.items, it)
 	}
-	r.buildGroups(nil)
+	r.sc.buildGroups(r.chk, r.pkg, t.Logf)
 	for i, refs := range [][]string{{"good:1"}, {"bad:1"}, {"base:1"}, {"left:1", "right:1", "pair:latest"}} {
 		id := "sha256:" + strings.TrimSuffix(refs[0], ":1")
 		if len(refs) > 1 {
 			id = "sha256:pair"
 		}
 		f := bundle.ImageFile{File: fmt.Sprint(i), ID: id, Refs: refs}
-		r.m.ImageFiles = append(r.m.ImageFiles, f)
+		r.pkg.m.ImageFiles = append(r.pkg.m.ImageFiles, f)
 		for _, ref := range refs {
-			r.m.Images.Refs[ref] = id
+			r.pkg.m.Images.Refs[ref] = id
 		}
-		r.images[f.File] = imageSource{local: id} // 本机已经有，只加名字
+		r.chk.images[f.File] = imageSource{local: id} // 本机已经有，只加名字
 	}
 	j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
 	if err != nil {
@@ -318,8 +318,8 @@ func TestImageNamesFollowGroups(t *testing.T) {
 			got["已有"] = strings.Join(slices.Sorted(slices.Values(e.Names)), ",")
 		}
 	}
-	want := map[string]string{"good:1": r.groupOf["c:good"], "bad:1": r.groupOf["c:bad"], "base:1": "",
-		"left:1": r.groupOf["c:left"], "right:1": r.groupOf["c:right"], "pair:latest": "",
+	want := map[string]string{"good:1": r.sc.groupOf["c:good"], "bad:1": r.sc.groupOf["c:bad"], "base:1": "",
+		"left:1": r.sc.groupOf["c:left"], "right:1": r.sc.groupOf["c:right"], "pair:latest": "",
 		"已有": "sha256:bad,sha256:base,sha256:good,sha256:old-bad,sha256:pair"}
 	if !maps.Equal(got, want) || want["good:1"] == want["bad:1"] || want["left:1"] == want["right:1"] {
 		t.Fatalf("实际 %v，应为 %v", got, want)

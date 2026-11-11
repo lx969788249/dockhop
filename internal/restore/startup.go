@@ -20,17 +20,17 @@ import (
 
 // startServices 建好网络，一组一组地启动服务。有的组没能启动时，由 decidePartial 决定只保留
 // 正常运行的、还是全部删除。
-func (r *run) startServices(ctx context.Context) error {
+func (r *migrate) startServices(ctx context.Context) error {
 	// 先建好所有独立网络，再启动 Compose 项目：Compose 自动分配网段时会占用第一个空闲网段，
 	// 可能正是独立网络在旧服务器上用的网段。
 	byCompose := r.networkOwners()
-	for _, n := range r.m.Networks {
-		g := r.groupByID(r.groupOf["n:"+n])
+	for _, n := range r.pkg.m.Networks {
+		g := r.sc.groupByID(r.sc.groupOf["n:"+n])
 		if g == nil || g.reason != "" || n == "bridge" || n == "host" || n == "none" {
 			continue // 没有要迁入的容器用它
 		}
 		r.in("n:" + n)
-		raw, err := os.ReadFile(filepath.Join(r.dataDir, "networks", n+".json"))
+		raw, err := os.ReadFile(filepath.Join(r.pkg.dataDir, "networks", n+".json"))
 		if err != nil {
 			r.groupFailed(g, "迁移包里缺少网络 "+n+" 的配置："+err.Error(), "")
 			continue
@@ -48,12 +48,12 @@ func (r *run) startServices(ctx context.Context) error {
 
 	// 一组没能启动时，接着启动其他组，最后再决定怎么处理。
 	total, n := 0, 0
-	for _, it := range r.items {
-		if it.m.Project == "" || !r.projectRestored(it.m.Project) {
+	for _, it := range r.sc.items {
+		if it.m.Project == "" || !r.sc.projectRestored(it.m.Project) {
 			total++
 		}
 	}
-	for _, g := range r.groups {
+	for _, g := range r.sc.groups {
 		if g.reason != "" {
 			continue
 		}
@@ -68,7 +68,7 @@ func (r *run) startServices(ctx context.Context) error {
 	if err := r.confirmReady(ctx); err != nil {
 		return err
 	}
-	ok, failed := r.splitGroups()
+	ok, failed := r.sc.splitGroups()
 	switch {
 	case len(failed) == 0:
 		return nil
@@ -83,7 +83,7 @@ func (r *run) startServices(ctx context.Context) error {
 }
 
 // startGroup 启动一组服务（见本文件开头）。
-func (r *run) startGroup(ctx context.Context, g *group, n *int, total int) error {
+func (r *migrate) startGroup(ctx context.Context, g *group, n *int, total int) error {
 	units := r.units(g)
 	r.logDeps(units)
 	for _, u := range dependencyOrder(units, unitKey, (*unit).createAfter) {
@@ -120,7 +120,7 @@ func (r *run) startGroup(ctx context.Context, g *group, n *int, total int) error
 // waitBefore 在启动 u 之前，等它用到的单位就绪：Docker 要求的必须等到；从配置里认出来的
 // 等不到也接着启动（见 order.go），那个单位最后再等一次。还没启动的不等：互相用到、排不出
 // 先后时会这样。
-func (r *run) waitBefore(ctx context.Context, u *unit) error {
+func (r *migrate) waitBefore(ctx context.Context, u *unit) error {
 	for _, d := range u.deps {
 		if !d.on.started || !d.ready && (!d.prefer || d.on.waited) {
 			continue
@@ -151,7 +151,7 @@ func (u *unit) again() {
 }
 
 // createUnit 创建一个单位的容器（不启动）。
-func (r *run) createUnit(ctx context.Context, u *unit) error {
+func (r *migrate) createUnit(ctx context.Context, u *unit) error {
 	if u.project != nil {
 		r.Screen.Note("创建 Compose 项目 " + u.project.Name + " 的容器")
 		return r.createProject(ctx, u)
@@ -168,19 +168,19 @@ func (r *run) createUnit(ctx context.Context, u *unit) error {
 }
 
 // unitError 写明是哪个 Compose 项目没能启动，带上建议。
-func (r *run) unitError(u *unit, err error) error {
+func (r *migrate) unitError(u *unit, err error) error {
 	reason, hint := err.Error(), groupHint(err)
 	if u.project == nil {
 		return &startError{reason, hint}
 	}
 	if hint == "" && r.tool != nil && r.tool.Legacy() {
-		hint = r.legacyHint()
+		hint = legacyHint(r.tool)
 	}
 	return &startError{"Compose 项目 " + u.project.Name + " 启动失败：" + reason, hint}
 }
 
 // startUnit 启动一个单位里原来在运行的容器，不等它们就绪。
-func (r *run) startUnit(ctx context.Context, u *unit, n *int, total int) error {
+func (r *migrate) startUnit(ctx context.Context, u *unit, n *int, total int) error {
 	u.started = true
 	if u.project != nil {
 		return r.startProject(ctx, u)
@@ -199,7 +199,7 @@ func (r *run) startUnit(ctx context.Context, u *unit, n *int, total int) error {
 }
 
 // waitUnit 等一个单位里原来在运行的容器都就绪（Compose 项目按服务的依赖顺序）。
-func (r *run) waitUnit(ctx context.Context, u *unit) error {
+func (r *migrate) waitUnit(ctx context.Context, u *unit) error {
 	if u.ready {
 		return nil
 	}
@@ -226,7 +226,7 @@ func (r *run) waitUnit(ctx context.Context, u *unit) error {
 }
 
 // readyItem 等一个原来在运行的容器就绪；原来暂停着的，就绪后再暂停。
-func (r *run) readyItem(ctx context.Context, it *citem) error {
+func (r *migrate) readyItem(ctx context.Context, it *citem) error {
 	if !it.starts() || it.ready {
 		return nil
 	}
@@ -246,7 +246,7 @@ func (r *run) readyItem(ctx context.Context, it *citem) error {
 // 全部容器、连同它依赖的服务一起启动，所以只有原来全部在运行时才交给它；有停着的容器（例如
 // 同一个服务一个副本在运行、一个停着）时，按依赖顺序逐个服务启动原来在运行的容器，等它们
 // 就绪再启动依赖它们的服务。
-func (r *run) startProject(ctx context.Context, u *unit) error {
+func (r *migrate) startProject(ctx context.Context, u *unit) error {
 	allRunning := true
 	for _, it := range u.items {
 		allRunning = allRunning && it.starts()
@@ -300,9 +300,9 @@ func groupHint(err error) string {
 }
 
 // groupFailed 记下一组没能启动，并显示原因。
-func (r *run) groupFailed(g *group, reason, hint string) {
+func (r *migrate) groupFailed(g *group, reason, hint string) {
 	g.reason = reason
-	if len(r.groups) > 1 {
+	if len(r.sc.groups) > 1 {
 		r.Log.Printf("这一组没能启动：%s", g.label())
 	}
 	_ = r.Screen.StepFailed(reason, "", hint)

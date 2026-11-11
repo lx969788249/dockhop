@@ -238,8 +238,8 @@ func exitInfo(c *docker.Container) string {
 // confirmReady 在决定提交之前把就绪了的容器再查一遍：没有健康检查的稳定运行几秒就算就绪，
 // 之后还可能停掉；一组服务启动、等待的时候，先就绪的组也可能已经出了问题。停了、在重启、
 // 不健康了的，它所在的组和没能启动的一样处理。
-func (r *run) confirmReady(ctx context.Context) error {
-	for _, g := range r.groups {
+func (r *migrate) confirmReady(ctx context.Context) error {
+	for _, g := range r.sc.groups {
 		for _, it := range g.items {
 			if g.reason != "" {
 				break

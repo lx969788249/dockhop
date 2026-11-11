@@ -43,11 +43,11 @@ func TestStartOrderFollowsReferences(t *testing.T) {
 		"NetworkSettings":{"Networks":{"1panel-network":{"Aliases":null}}}}`)
 
 	projects := []bundle.Project{{Name: "halo"}, {Name: "nginx-proxy-manager"}, {Name: "postgresql"}}
-	r := testRun(t, Deps{}, Options{})
-	r.items = []*citem{halo, npm, pg, probe, backup}
-	r.projects = projects
-	r.m = &bundle.Manifest{}
-	units := r.units(&group{projects: projects, items: r.items})
+	r := testMigrate(t, Deps{}, Options{})
+	r.sc.items = []*citem{halo, npm, pg, probe, backup}
+	r.sc.projects = projects
+	r.pkg.m = &bundle.Manifest{}
+	units := r.units(&group{projects: projects, items: r.sc.items})
 	deps := depsOf(units)
 	want := map[string]string{
 		"p:halo":                "p:postgresql 最好先就绪（halo 的启动命令里写着 postgresql）",
@@ -80,11 +80,11 @@ func TestServiceOrderFollowsContainerReferences(t *testing.T) {
 	side := oldContainer(t, `{"Name":"/stack-asidecar-1","Config":{"Labels":{"com.docker.compose.project":"stack","com.docker.compose.service":"asidecar"}},
 		"HostConfig":{"NetworkMode":"container:old-vpn"}}`)
 	projects := []bundle.Project{{Name: "stack"}}
-	r := testRun(t, Deps{}, Options{})
-	r.items = []*citem{side, vpn}
-	r.projects = projects
-	r.m = &bundle.Manifest{Containers: []bundle.Container{{Name: "stack-asidecar-1"}, {Name: "stack-vpn-1", ID: "old-vpn"}}}
-	u := r.units(&group{projects: projects, items: r.items})[0]
+	r := testMigrate(t, Deps{}, Options{})
+	r.sc.items = []*citem{side, vpn}
+	r.sc.projects = projects
+	r.pkg.m = &bundle.Manifest{Containers: []bundle.Container{{Name: "stack-asidecar-1"}, {Name: "stack-vpn-1", ID: "old-vpn"}}}
+	u := r.units(&group{projects: projects, items: r.sc.items})[0]
 	u.services = uniqueServices(u.items) // 创建项目时才有（见 createProject）；读不出配置时 configured 为空
 	if got := strings.Join(u.serviceOrder(), " "); got != "vpn asidecar" {
 		t.Fatalf("启动顺序：%s", got)
@@ -109,12 +109,12 @@ func TestCreateOrderFollowsExistence(t *testing.T) {
 	sidecar := oldContainer(t, `{"Name":"/sidecar","HostConfig":{"VolumesFrom":["data:ro"]}}`)
 	store := oldContainer(t, `{"Name":"/data"}`)
 	projects := []bundle.Project{{Name: "aapp"}, {Name: "bweb"}, {Name: "zproxy"}}
-	r := testRun(t, Deps{}, Options{})
-	r.items = []*citem{app, proxy, web, sidecar, store, vpn}
-	r.projects = projects
-	r.dataDir = data
-	r.m = &bundle.Manifest{Networks: []string{"proxynet"}}
-	units := r.units(&group{projects: projects, items: r.items})
+	r := testMigrate(t, Deps{}, Options{})
+	r.sc.items = []*citem{app, proxy, web, sidecar, store, vpn}
+	r.sc.projects = projects
+	r.pkg.dataDir = data
+	r.pkg.m = &bundle.Manifest{Networks: []string{"proxynet"}}
+	units := r.units(&group{projects: projects, items: r.sc.items})
 	deps := depsOf(units)
 	want := map[string]string{
 		"p:aapp":    "p:zproxy 要先存在（aapp-app-1 接在 Compose 项目 zproxy 建的网络 proxynet 上）",

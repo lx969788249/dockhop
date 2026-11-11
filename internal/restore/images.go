@@ -44,17 +44,17 @@ var (
 	pullMinBytes = int64(3 << 20)
 )
 
-// decideImages 决定每个镜像文件从哪里来。查询镜像仓库同时进行：连不上镜像仓库时也只多等
-// 一次超时。
-func (r *run) decideImages(ctx context.Context, files []bundle.ImageFile) {
-	r.images = map[string]imageSource{}
+// decideImages 决定迁移计划里每个镜像文件从哪里来（镜像文件 → 来处，从旧服务器下载的不在里面）。查询镜像
+// 仓库同时进行：连不上镜像仓库时也只多等一次超时。
+func (r *run) decideImages(ctx context.Context, files []bundle.ImageFile) map[string]imageSource {
+	images := map[string]imageSource{}
 	// 向镜像仓库的查询同时进行，各自只写自己那一格，全部查完再填表。
 	pullable := make([]bool, len(files))
 	var wg sync.WaitGroup
 	for i, f := range files {
 		names := strings.Join(f.Refs, "、")
 		if id := r.localImage(ctx, f); id != "" {
-			r.images[f.File] = imageSource{local: id}
+			images[f.File] = imageSource{local: id}
 			r.Log.Printf("镜像 %s：本机已经有一模一样的，直接用", names)
 			continue
 		}
@@ -79,9 +79,10 @@ func (r *run) decideImages(ctx context.Context, files []bundle.ImageFile) {
 	wg.Wait()
 	for i, f := range files {
 		if pullable[i] {
-			r.images[f.File] = imageSource{pull: true}
+			images[f.File] = imageSource{pull: true}
 		}
 	}
+	return images
 }
 
 // localImage 返回本机上和 f 一模一样的镜像的 ID：镜像 ID 相同，或者有同一个仓库摘要。
@@ -98,13 +99,14 @@ func (r *run) localImage(ctx context.Context, f bundle.ImageFile) string {
 }
 
 // fromOldServer 表示这个镜像文件要从旧服务器下载。
-func (r *run) fromOldServer(f bundle.ImageFile) bool {
-	src := r.images[f.File]
+func (chk *checked) fromOldServer(f bundle.ImageFile) bool {
+	src := chk.images[f.File]
 	return src.local == "" && !src.pull
 }
 
-func (r *run) imagePath(f bundle.ImageFile) string {
-	return filepath.Join(r.workdir, "images", f.File)
+// imagePath 是镜像文件 f 下载到的地方：这次迁入的工作目录里。
+func (pkg *bundleFiles) imagePath(f bundle.ImageFile) string {
+	return filepath.Join(pkg.workdir, "images", f.File)
 }
 
 // fetchPart 是一轮下载里的一个文件。
@@ -156,11 +158,11 @@ func (r *run) fetch(ctx context.Context, label string, parts []fetchPart) error 
 
 // loadImageFiles 让每个镜像都在这台服务器上就位：本机已有的加上原来的名字；能拉到的从镜像
 // 仓库拉；其余的用从旧服务器下载的文件加载。
-func (r *run) loadImageFiles(ctx context.Context) error {
-	files := r.m.ImageFiles
+func (r *migrate) loadImageFiles(ctx context.Context) error {
+	files := r.pkg.m.ImageFiles
 	for i, f := range files {
 		label := fmt.Sprintf("加载镜像 %d/%d", i+1, len(files))
-		src := r.images[f.File]
+		src := r.chk.images[f.File]
 		// 不管从哪里来，最后都会给它加上原来的名字（加载的文件里也带着这些名字）。
 		for _, ref := range f.Refs {
 			r.in(r.imageKey(f.ID, ref))
@@ -186,7 +188,7 @@ func (r *run) loadImageFiles(ctx context.Context) error {
 
 // pullImage 从镜像仓库按摘要拉取 f，再加上原来的名字。拉取失败、卡住或太慢时改从旧服务器
 // 下载：旧服务器的下载服务一直开到迁入成功。
-func (r *run) pullImage(ctx context.Context, label string, f bundle.ImageFile) error {
+func (r *migrate) pullImage(ctx context.Context, label string, f bundle.ImageFile) error {
 	p := r.Screen.StartProgress(label, 0, "")
 	pctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -238,9 +240,9 @@ func (r *run) pullImage(ctx context.Context, label string, f bundle.ImageFile) e
 
 // loadImageFile 从旧服务器下载 f（还没下载完整的话），解密后加载进 Docker，用完就删。
 // 文件里带着镜像原来的名字，加载后就有。
-func (r *run) loadImageFile(ctx context.Context, label string, f bundle.ImageFile) error {
+func (r *migrate) loadImageFile(ctx context.Context, label string, f bundle.ImageFile) error {
 	s := r.Screen
-	path := r.imagePath(f)
+	path := r.pkg.imagePath(f)
 	if st, err := os.Stat(path); err != nil || st.Size() != f.Bytes {
 		if err := r.fetch(ctx, "下载镜像", []fetchPart{{url: r.opts.Link.ImageURL(f.File), path: path, size: f.Bytes}}); err != nil {
 			return err
@@ -279,7 +281,7 @@ func (r *run) loadImageFile(ctx context.Context, label string, f bundle.ImageFil
 // 镜像的别的名字），跟着用这个镜像（ID 是 id）的容器。这些容器不止一组时为空，算整次迁入共用的。
 // 两组用同一个镜像的不同名字时各归各的，按镜像算的话，没保留的那组的名字也会被当成共用的留下来。
 // 名字按 Docker 的认法比较（见 fullTag）：app 和 app:latest 是同一个名字。
-func (r *run) imageKey(id, ref string) string {
+func (r *migrate) imageKey(id, ref string) string {
 	if key, used := r.usersKey(func(it *citem) bool { return fullTag(r.baseImage(it)) == fullTag(ref) }); used {
 		return key
 	}
@@ -289,13 +291,13 @@ func (r *run) imageKey(id, ref string) string {
 
 // usersKey 返回符合 match 的容器所在的组（其中一个容器的键），它们不止一组时为空；used 表示有
 // 这样的容器。
-func (r *run) usersKey(match func(*citem) bool) (key string, used bool) {
-	for _, it := range r.items {
+func (r *migrate) usersKey(match func(*citem) bool) (key string, used bool) {
+	for _, it := range r.sc.items {
 		if !match(it) {
 			continue
 		}
 		k := "c:" + it.m.Name
-		if used && r.groupOf[k] != r.groupOf[key] {
+		if used && r.sc.groupOf[k] != r.sc.groupOf[key] {
 			return "", true
 		}
 		key, used = k, true
@@ -306,7 +308,7 @@ func (r *run) usersKey(match func(*citem) bool) (key string, used bool) {
 // noteTag 在镜像名 name 被改动之前（加名字，或者 docker load 按文件里记的名字加名字），把它
 // 原来指向哪个镜像记进事务日志：迁入失败时改回去，原来没有的名字删掉（见 undoTags）。同一个名字
 // 的不同写法（见 fullTag）只记一次。按摘要的引用（名字@sha256:…）不是名字，不会被改动。
-func (r *run) noteTag(ctx context.Context, name string) error {
+func (r *migrate) noteTag(ctx context.Context, name string) error {
 	if strings.Contains(name, "@sha256:") || r.noted[fullTag(name)] {
 		return nil
 	}
@@ -320,9 +322,6 @@ func (r *run) noteTag(ctx context.Context, name string) error {
 	}
 	if err := r.j.add(Entry{Op: opTag, Name: name, ID: id}); err != nil {
 		return r.Screen.StepFailed(err.Error(), "", "")
-	}
-	if r.noted == nil {
-		r.noted = map[string]bool{}
 	}
 	r.noted[fullTag(name)] = true
 	return nil
@@ -343,7 +342,7 @@ func (r *run) tagRefs(ctx context.Context, id string, f bundle.ImageFile) error 
 	return nil
 }
 
-func (r *run) loadImages(ctx context.Context) error {
+func (r *migrate) loadImages(ctx context.Context) error {
 	s := r.Screen
 	// 先记下这台服务器上已有哪些镜像：回滚时只删这次迁入带来的，原有的一个不删（见 removeImages）。
 	have, err := r.Docker.Images(ctx)
@@ -358,33 +357,33 @@ func (r *run) loadImages(ctx context.Context) error {
 		return s.StepFailed(err.Error(), "", "")
 	}
 	defer r.in("")
-	if r.m.Images.Parts > 0 {
+	if r.pkg.m.Images.Parts > 0 {
 		// 格式版本 1 的迁移包：所有镜像都在包里，docker load 按里面记的名字加名字。
 		var names []string
-		for ref := range r.m.Images.Refs {
+		for ref := range r.pkg.m.Images.Refs {
 			names = append(names, ref)
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			r.in(r.imageKey(r.m.Images.Refs[name], name))
+			r.in(r.imageKey(r.pkg.m.Images.Refs[name], name))
 			if err := r.noteTag(ctx, name); err != nil {
 				return err
 			}
 		}
-		rc := bundle.OpenStream(r.dataDir, "images", r.m.Images.Parts)
-		p := s.StartProgress("加载镜像", r.m.Images.Bytes, "镜像较大时需要几分钟")
+		rc := bundle.OpenStream(r.pkg.dataDir, "images", r.pkg.m.Images.Parts)
+		p := s.StartProgress("加载镜像", r.pkg.m.Images.Bytes, "镜像较大时需要几分钟")
 		err := r.Docker.LoadImages(ctx, io.TeeReader(rc, p))
 		rc.Close()
 		p.Done(err)
 		if err != nil {
 			return s.StepFailed("加载镜像失败："+err.Error(), "", "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
 		}
-		_ = os.RemoveAll(filepath.Join(r.dataDir, "images")) // 用完就删，省磁盘
+		_ = os.RemoveAll(filepath.Join(r.pkg.dataDir, "images")) // 用完就删，省磁盘
 	} else if err := r.loadImageFiles(ctx); err != nil {
 		return err
 	}
-	refs := make([]string, 0, len(r.m.Images.Refs))
-	for ref := range r.m.Images.Refs {
+	refs := make([]string, 0, len(r.pkg.m.Images.Refs))
+	for ref := range r.pkg.m.Images.Refs {
 		refs = append(refs, ref)
 	}
 	sort.Strings(refs)
@@ -393,13 +392,13 @@ func (r *run) loadImages(ctx context.Context) error {
 			return err
 		}
 	}
-	s.End(fmt.Sprintf("%d 个镜像 · %s", len(refs), ui.HumanBytes(r.m.Images.Bytes)))
+	s.End(fmt.Sprintf("%d 个镜像 · %s", len(refs), ui.HumanBytes(r.pkg.m.Images.Bytes)))
 	return nil
 }
 
 // resolveImage 确认迁移包里的一个镜像在这台服务器上能用。按摘要固定、只能用迁移包里那份的镜像
 // 加上名字，用它的容器改用这个名字创建（记在 imageAs 里）。
-func (r *run) resolveImage(ctx context.Context, ref string) error {
+func (r *migrate) resolveImage(ctx context.Context, ref string) error {
 	s := r.Screen
 	if !strings.Contains(ref, "@sha256:") {
 		if _, err := r.Docker.InspectImage(ctx, ref); err != nil {
@@ -412,7 +411,7 @@ func (r *run) resolveImage(ctx context.Context, ref string) error {
 		return nil
 	}
 	// 导出文件里没有仓库清单，加载后按摘要找不到（实验 3、6）。
-	if !r.d.UseBundleImage(ref) {
+	if !r.chk.d.UseBundleImage(ref) {
 		s.Note("按摘要补齐镜像清单 · " + ref)
 		pctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		err := r.Docker.PullImage(pctx, ref, nil)
@@ -425,7 +424,7 @@ func (r *run) resolveImage(ctx context.Context, ref string) error {
 	// 加载后的镜像只能按 ID 找到：旧版 Docker 的 ID 是配置的摘要，新版（containerd 存储）
 	// 的 ID 就是引用里的摘要。
 	id := ""
-	for _, cand := range []string{r.m.Images.Refs[ref], "sha256:" + ref[strings.LastIndex(ref, "@sha256:")+8:]} {
+	for _, cand := range []string{r.pkg.m.Images.Refs[ref], "sha256:" + ref[strings.LastIndex(ref, "@sha256:")+8:]} {
 		if img, err := r.Docker.InspectImage(ctx, cand); err == nil {
 			id = img.ID
 			break
@@ -436,7 +435,7 @@ func (r *run) resolveImage(ctx context.Context, ref string) error {
 	}
 	// 用 ref 的容器会改用名字 as 创建，名字跟着它们走。
 	as := preflight.StripDigest(ref)
-	r.in(r.imageKey(r.m.Images.Refs[ref], ref))
+	r.in(r.imageKey(r.pkg.m.Images.Refs[ref], ref))
 	if err := r.noteTag(ctx, as); err != nil {
 		return err
 	}

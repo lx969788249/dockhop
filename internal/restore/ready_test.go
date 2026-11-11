@@ -21,7 +21,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
-func logText(t *testing.T, r *run) string {
+func logText(t *testing.T, r *migrate) string {
 	t.Helper()
 	b, err := os.ReadFile(r.Log.Path())
 	if err != nil {
@@ -159,7 +159,7 @@ func TestConfirmReady(t *testing.T) {
 		src := &docker.Container{}
 		src.State.Running = true
 		g := &group{id: "g", items: []*citem{{m: bundle.Container{Name: "app"}, c: src, newID: "new-app", ready: true}}}
-		r.groups = []*group{g}
+		r.sc.groups = []*group{g}
 		if err := r.confirmReady(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -218,7 +218,7 @@ func TestConfirmReadyRetriesInspect(t *testing.T) {
 	src := &docker.Container{}
 	src.State.Running = true
 	g := &group{id: "g", items: []*citem{{m: bundle.Container{Name: "app"}, c: src, newID: "new-app", ready: true}}}
-	r.groups = []*group{g}
+	r.sc.groups = []*group{g}
 	if err := r.confirmReady(context.Background()); err != nil || g.reason != "" {
 		t.Fatalf("偶尔查不到不应算失败：%v %q", err, g.reason)
 	}
@@ -353,12 +353,9 @@ func TestStartupFailureHidesEnvSecrets(t *testing.T) {
 	defer log.Finish(logging.Failed, true)
 	var out bytes.Buffer
 	r := testRun(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: rd, Home: root}, Options{})
-	r.dataDir = data
-	r.rbDir = filepath.Join(root, "rollback")
-	r.undo = testUndo(t, nil, nil)
-	r.plan = &bundle.Plan{Containers: []bundle.PlanContainer{{Name: "web"}}}
-	r.m = &bundle.Manifest{Containers: []bundle.Container{{Name: "web", Image: "alpine", State: "running"}}}
-	if err := r.decide(context.Background()); err != nil {
+	chk := &checked{plan: &bundle.Plan{Containers: []bundle.PlanContainer{{Name: "web"}}}}
+	pkg := &bundleFiles{dataDir: data, m: &bundle.Manifest{Containers: []bundle.Container{{Name: "web", Image: "alpine", State: "running"}}}}
+	if _, err := r.decide(context.Background(), chk, pkg); err != nil {
 		t.Fatal(err)
 	}
 	readyErr := r.waitReady(context.Background(), &citem{m: bundle.Container{Name: "web"}, newID: "new-web"})

@@ -58,9 +58,7 @@ func TestCheckSums(t *testing.T) {
 			}
 			var out bytes.Buffer
 			r := testRun(t, Deps{Screen: ui.New(&out, false, nil)}, Options{})
-			r.plan = plan
-			r.images = c.images
-			if err := r.checkSums(); (err == nil) != c.ok || !c.ok && !strings.Contains(out.String(), "1.1.6 之前的版本") {
+			if err := r.checkSums(&checked{plan: plan, images: c.images}); (err == nil) != c.ok || !c.ok && !strings.Contains(out.String(), "1.1.6 之前的版本") {
 				t.Fatalf("结果：%v\n%s", err, out.String())
 			}
 		})

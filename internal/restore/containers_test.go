@@ -21,7 +21,7 @@ func TestServiceImageKeepsReplicasApart(t *testing.T) {
 	}
 	a, b := rep("stack-web-1", "/etc/a", "/etc/common"), rep("stack-web-2", "/etc/common", "/etc/b")
 	var out bytes.Buffer
-	r := testRun(t, Deps{Screen: ui.New(&out, false, nil)}, Options{})
+	r := testMigrate(t, Deps{Screen: ui.New(&out, false, nil)}, Options{})
 	r.vio = &volumeIO{}
 	img, err := r.serviceImage(context.Background(), "stack", "web", []*citem{a, b})
 	if err != nil {

@@ -27,62 +27,62 @@ func (r *run) dropStale() {
 	}
 }
 
-func (r *run) workBase() string {
-	if r.d.Workdir != "" {
-		return r.d.Workdir
+func (r *run) workBase(chk *checked) string {
+	if chk.d.Workdir != "" {
+		return chk.d.Workdir
 	}
 	return filepath.Join(r.Home, "work")
 }
 
-func (r *run) prepareWorkdir(token string) error {
-	if token == "" {
-		token = r.opts.Link.Token
-	}
-	r.workdir = filepath.Join(r.workBase(), "in-"+token)
-	r.dataDir = filepath.Join(r.workdir, "data")
-	if err := os.MkdirAll(r.workdir, 0o700); err != nil {
-		return r.Screen.StepFailed("无法创建工作目录 "+r.workdir, err.Error(), "")
+// prepareWorkdir 建这次迁入的工作目录（按链接里的下载口令起名：同一个链接重新迁入时接着用上次下载的），
+// 记进 pkg。
+func (r *run) prepareWorkdir(chk *checked, pkg *bundleFiles) error {
+	pkg.workdir = filepath.Join(r.workBase(chk), "in-"+r.opts.Link.Token)
+	pkg.dataDir = filepath.Join(pkg.workdir, "data")
+	if err := os.MkdirAll(pkg.workdir, 0o700); err != nil {
+		return r.Screen.StepFailed("无法创建工作目录 "+pkg.workdir, err.Error(), "")
 	}
 	// 上次失败留下的解密数据先删掉，重新解开（加密的下载文件保留，不用重新下载）。
-	if err := os.RemoveAll(r.dataDir); err != nil {
-		return r.Screen.StepFailed("无法清理上次留下的文件 "+r.dataDir, err.Error(), "")
+	if err := os.RemoveAll(pkg.dataDir); err != nil {
+		return r.Screen.StepFailed("无法清理上次留下的文件 "+pkg.dataDir, err.Error(), "")
 	}
 	return nil
 }
 
-func (r *run) download(ctx context.Context) error {
-	if err := r.checkSums(); err != nil {
+// download 按检查的结果（chk）下载迁移包和要从旧服务器拿的镜像文件，下到哪里记进 pkg。
+func (r *run) download(ctx context.Context, chk *checked, pkg *bundleFiles) error {
+	if err := r.checkSums(chk); err != nil {
 		return err
 	}
-	if err := r.prepareWorkdir(""); err != nil {
+	if err := r.prepareWorkdir(chk, pkg); err != nil {
 		return err
 	}
-	r.bundlePath = filepath.Join(r.workdir, "bundle")
-	r.downloaded = true
+	pkg.bundlePath = filepath.Join(pkg.workdir, "bundle")
+	pkg.downloaded = true
 	// 先下载要从旧服务器拿的镜像，最后下载迁移包：迁移包一下完，旧服务器就显示“正在迁入”。
 	var parts []fetchPart
-	for _, f := range r.plan.Images {
-		if r.fromOldServer(f) {
-			parts = append(parts, fetchPart{url: r.opts.Link.ImageURL(f.File), path: r.imagePath(f), size: f.Bytes})
+	for _, f := range chk.plan.Images {
+		if chk.fromOldServer(f) {
+			parts = append(parts, fetchPart{url: r.opts.Link.ImageURL(f.File), path: pkg.imagePath(f), size: f.Bytes})
 		}
 	}
-	parts = append(parts, fetchPart{url: r.opts.Link.BundleURL(), path: r.bundlePath, size: r.plan.Sizes.Bundle})
+	parts = append(parts, fetchPart{url: r.opts.Link.BundleURL(), path: pkg.bundlePath, size: chk.plan.Sizes.Bundle})
 	return r.fetch(ctx, "下载迁移包", parts)
 }
 
 // dropDownload 删掉下载的迁移包：解开后发现重新运行也用不上它。
-func (r *run) dropDownload() {
-	if r.downloaded {
-		_ = os.Remove(r.bundlePath)
+func (pkg *bundleFiles) dropDownload() {
+	if pkg.downloaded {
+		_ = os.Remove(pkg.bundlePath)
 	}
 }
 
 // checkSums 确认可能要从旧服务器下载的镜像文件（从镜像仓库拉不下来时也会改从旧服务器下载），
 // 迁移计划里都记着 SHA-256（见 verifyDownload）。1.1.6 之前的旧服务器没有记：同一次迁移的
 // 镜像文件有好几个，被对调了也发现不了，不能用。迁移包只有一个，没有可以对调的，没记时照常用。
-func (r *run) checkSums() error {
-	for _, f := range r.plan.Images {
-		if r.images[f.File].local == "" && f.SHA256 == "" {
+func (r *run) checkSums(chk *checked) error {
+	for _, f := range chk.plan.Images {
+		if chk.images[f.File].local == "" && f.SHA256 == "" {
 			return r.Screen.StepFailed("旧服务器上的 DockHop 是 1.1.6 之前的版本，迁移计划里没有镜像文件的校验值，"+
 				"没法确认下载的镜像没有被调换（还没有下载或改动任何东西）", "",
 				"在旧服务器上结束这次迁出，重新运行一行命令迁出（会用最新版），再用新的链接迁入")
@@ -125,14 +125,14 @@ func fileSHA256(path string) (string, error) {
 
 // cleanFiles 删除工作文件：成功时全部删除；失败时只删解密后的数据，保留加密的
 // 下载文件，重试时不用重新下载。
-func (r *run) cleanFiles(success bool) {
-	if r.workdir == "" {
+func (r *run) cleanFiles(pkg *bundleFiles, success bool) {
+	if pkg.workdir == "" {
 		return
 	}
-	_ = os.RemoveAll(r.dataDir)
+	_ = os.RemoveAll(pkg.dataDir)
 	if success {
-		if err := os.RemoveAll(r.workdir); err != nil {
-			r.Screen.Warn("临时文件没能删除，请手动删除：%s", r.workdir)
+		if err := os.RemoveAll(pkg.workdir); err != nil {
+			r.Screen.Warn("临时文件没能删除，请手动删除：%s", pkg.workdir)
 		}
 	}
 }

@@ -43,6 +43,15 @@ func testRun(t *testing.T, d Deps, o Options) *run {
 	return newRun(d, o)
 }
 
+// testMigrate 是测试用的、开始改动之后的 migrate：run 和 testRun 一样；前几步的结果（检查、迁移包、迁入范围）
+// 都是空的，由测试自己填；没有事务日志，要的话测试自己开。
+func testMigrate(t *testing.T, d Deps, o Options) *migrate {
+	t.Helper()
+	return &migrate{run: testRun(t, d, o), chk: &checked{}, pkg: &bundleFiles{},
+		sc:      &scope{targets: map[string]bool{}, anonVolumes: map[string]bundle.Volume{}},
+		imageAs: map[string]string{}, noted: map[string]bool{}}
+}
+
 // testUndo 是测试用的 undo：日志写到 t.Logf，不模拟失败，没有单独挂载的目录；screen 为空时丢掉输出。
 // 别的按需要再填。
 func testUndo(t *testing.T, dc *docker.Client, screen *ui.Screen) *undo {
@@ -54,7 +63,7 @@ func testUndo(t *testing.T, dc *docker.Client, screen *ui.Screen) *undo {
 }
 
 // prepareWith 用要写入目录 shared 的容器 new-app（和一个不用数据的 kept）按迁入的顺序调用
-// decide、begin、prepare。新服务器上的已有容器由 handle 回答（shared 是那个目录的完整路径）。
+// decide、begin、prepare（见 decideThenPrepare）。新服务器上的已有容器由 handle 回答（shared 是那个目录的完整路径）。
 // 返回屏幕上的输出（失败时有原因）和停过的容器。
 func prepareWith(t *testing.T, d preflight.Decisions, handle func(w http.ResponseWriter, p, shared string) bool) (string, []string) {
 	t.Helper()
@@ -79,31 +88,34 @@ func prepareWith(t *testing.T, d preflight.Decisions, handle func(w http.Respons
 	var out bytes.Buffer
 	screen := ui.New(&out, false, nil)
 	r := testRun(t, Deps{Docker: dc, Home: home, Screen: screen}, Options{})
-	r.d = d
-	r.plan = &bundle.Plan{Containers: []bundle.PlanContainer{{Name: "kept"}, {Name: "new-app", Binds: []string{shared}}},
-		Binds: []bundle.PlanBind{{Path: shared}}}
-	r.m = &bundle.Manifest{Containers: []bundle.Container{{Name: "kept"}, {Name: "new-app"}}, Binds: []bundle.Bind{{Path: shared}}}
-	r.dataDir = data
-	r.rbDir = filepath.Join(home, "rollback", "current")
-	r.undo = testUndo(t, dc, screen)
-	err := r.decide(context.Background())
-	if err == nil {
-		err = r.begin()
+	chk := &checked{d: d, plan: &bundle.Plan{Containers: []bundle.PlanContainer{{Name: "kept"}, {Name: "new-app", Binds: []string{shared}}},
+		Binds: []bundle.PlanBind{{Path: shared}}}}
+	pkg := &bundleFiles{dataDir: data,
+		m: &bundle.Manifest{Containers: []bundle.Container{{Name: "kept"}, {Name: "new-app"}}, Binds: []bundle.Bind{{Path: shared}}}}
+	if _, err := decideThenPrepare(r, chk, pkg); err != nil {
+		return out.String(), stopped
 	}
-	if err == nil {
-		err = r.prepare(context.Background())
+	return "", stopped
+}
+
+// decideThenPrepare 按迁入的顺序调用 decide、begin、prepare，最后关掉事务日志。返回开始改动之后的 migrate
+// （begin 之前就出错时为空）和出的错。
+func decideThenPrepare(r *run, chk *checked, pkg *bundleFiles) (*migrate, error) {
+	ctx := context.Background()
+	sc, err := r.decide(ctx, chk, pkg)
+	if err != nil {
+		return nil, err
 	}
-	if r.j != nil {
-		r.j.close()
+	mg, err := r.begin(nil, chk, pkg, sc)
+	if err != nil {
+		return nil, err
 	}
-	if err == nil {
-		return "", stopped
-	}
-	return out.String(), stopped
+	defer mg.j.close()
+	return mg, mg.prepare(ctx)
 }
 
 // 假 Docker 上的一个容器：每次查询按顺序给出下一个样子，最后一个样子一直保持。
-func fakeContainer(t *testing.T, logs string, states ...string) (*docker.Client, *bytes.Buffer, *run) {
+func fakeContainer(t *testing.T, logs string, states ...string) (*docker.Client, *bytes.Buffer, *migrate) {
 	t.Helper()
 	var mu sync.Mutex
 	n := 0
@@ -130,7 +142,7 @@ func fakeContainer(t *testing.T, logs string, states ...string) (*docker.Client,
 	}
 	t.Cleanup(func() { log.Finish(logging.Failed, true) })
 	var out bytes.Buffer
-	r := testRun(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: &logging.Redactor{},
+	r := testMigrate(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: &logging.Redactor{},
 		Getenv: func(k string) string {
 			if k == "DOCKHOP_TEST_STARTUP_GRACE" {
 				return "1s"

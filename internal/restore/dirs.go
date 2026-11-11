@@ -21,7 +21,7 @@ type dirSwap struct {
 
 // newDirSwap 按 path 是不是单独挂载的目录选办法。判断不了时不动它：选错了办法，挂载点改名会失败，普通
 // 目录也不该在里面换。原地换内容的，先把原来有哪些东西记进日志（要在建解压目录之前，见 recordContents）。
-func (r *run) newDirSwap(path string, isDir bool) (*dirSwap, error) {
+func (r *migrate) newDirSwap(path string, isDir bool) (*dirSwap, error) {
 	d := &dirSwap{path: path, stage: siblingName(path, "stage")}
 	if !isDir {
 		return d, nil
@@ -42,7 +42,7 @@ func (r *run) newDirSwap(path string, isDir bool) (*dirSwap, error) {
 }
 
 // swapIn 把解好的 staged 换到 d.path 上。
-func (r *run) swapIn(d *dirSwap, staged string) error {
+func (r *migrate) swapIn(d *dirSwap, staged string) error {
 	if d.contents != nil {
 		return r.replaceContents(*d.contents, d.stage, staged)
 	}
@@ -53,7 +53,7 @@ func (r *run) swapIn(d *dirSwap, staged string) error {
 
 // replaceDir 把解好的 staged 换到 dst：先在日志里记下，再把原来的 dst 改名成 old，
 // 最后把 staged 改名成 dst。三个路径在同一个目录下，改名是原子的。
-func (r *run) replaceDir(staged, dst string) error {
+func (r *migrate) replaceDir(staged, dst string) error {
 	old := siblingName(dst, "old")
 	_, err := os.Lstat(dst)
 	existed := err == nil
@@ -128,7 +128,7 @@ func cleanupBind(e Entry) error {
 // recordContents 在原地换 dst 的内容之前（dst 是单独挂载的目录，不能改名，见 restoreBind），把 dst
 // 原来有哪些东西和 dst 本身原来的属主、权限、修改时间记进日志，返回这一条。要在动 dst 之前记：
 // 解压目录也建在 dst 里，建了它，dst 的修改时间就变了。回滚见 undoContents。
-func (r *run) recordContents(dst string) (Entry, error) {
+func (r *migrate) recordContents(dst string) (Entry, error) {
 	orig, err := readMeta(dst)
 	if err != nil {
 		return Entry{}, err
@@ -149,7 +149,7 @@ func (r *run) recordContents(dst string) (Entry, error) {
 // 东西挪进 e.Path 里的备份目录 e.Backup，再把 staged 里的东西挪进来，最后 e.Path 本身改成迁移过来的
 // 属主、权限、修改时间（挪动之前就读好：挪走里面的东西会改掉目录的修改时间）。都在同一块盘上，
 // 每一步都只是改名。
-func (r *run) replaceContents(e Entry, stage, staged string) error {
+func (r *migrate) replaceContents(e Entry, stage, staged string) error {
 	migratedMeta, err := readMeta(staged)
 	if err != nil {
 		return err

@@ -67,7 +67,7 @@ func innerName(path, kind string) string {
 var runID = fmt.Sprintf("%d", os.Getpid())
 
 // mkdirAll 逐级创建目录，新建的每一级都记进日志（回滚时删掉空的）。
-func (r *run) mkdirAll(dir string, mode os.FileMode) error {
+func (r *migrate) mkdirAll(dir string, mode os.FileMode) error {
 	if st, err := os.Lstat(dir); err == nil {
 		if st.IsDir() {
 			return nil
@@ -90,7 +90,7 @@ func (r *run) mkdirAll(dir string, mode os.FileMode) error {
 
 // installTree 把 staging 里的文件逐个放到 dest 下（合并，不删除 dest 里原有的其他文件）。
 // 覆盖的文件先备份到回滚资料目录；skip 返回 true 的路径不动。
-func (r *run) installTree(staging, dest string, skip func(string) bool) error {
+func (r *migrate) installTree(staging, dest string, skip func(string) bool) error {
 	return filepath.WalkDir(staging, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -146,7 +146,7 @@ func (r *run) installTree(staging, dest string, skip func(string) bool) error {
 }
 
 // preserve 把将被覆盖的文件挪到回滚资料目录，并记进日志。
-func (r *run) preserve(target string) error {
+func (r *migrate) preserve(target string) error {
 	backup := r.j.file("file")
 	if err := r.j.add(Entry{Op: opFile, Path: target, Existed: true, Backup: backup}); err != nil {
 		return err

@@ -101,7 +101,7 @@ esac
 	}
 	defer j.close()
 	var out bytes.Buffer
-	r := testRun(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: home, Getenv: func(k string) string {
+	r := testMigrate(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: home, Getenv: func(k string) string {
 		if k == "DOCKHOP_TEST_STARTUP_GRACE" {
 			return "0s"
 		}
@@ -109,10 +109,10 @@ esac
 	}}, Options{})
 	r.tool = tool
 	r.j = j
-	r.workdir = home
-	r.items = []*citem{
+	r.pkg.workdir = home
+	r.sc.items = []*citem{
 		member("stack-web-1", "web", "1", true), member("stack-web-2", "web", "2", false), member("stack-db-1", "db", "1", true)}
-	u := &unit{key: "p:stack", project: &bundle.Project{Name: "stack", WorkingDir: home}, items: r.items}
+	u := &unit{key: "p:stack", project: &bundle.Project{Name: "stack", WorkingDir: home}, items: r.sc.items}
 	if err := r.createProject(context.Background(), u); err != nil {
 		t.Fatal(err)
 	}

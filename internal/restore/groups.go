@@ -85,18 +85,18 @@ type writer struct {
 }
 
 // buildGroups 给要迁入的容器和项目分组，并记下每个卷、目录、网络、临时停止的容器属于哪一组。
-func (r *run) buildGroups(writers []writer) {
+func (sc *scope) buildGroups(chk *checked, pkg *bundleFiles, logf func(string, ...any)) {
 	uf := unionFind{}
 	binds := []bundle.Bind{}
-	for _, b := range r.m.Binds {
+	for _, b := range pkg.m.Binds {
 		if !spec.IsSystemPath(b.Path) {
 			binds = append(binds, b)
 		}
 	}
-	r.linkItems(uf, binds)
-	r.linkPlaces(uf, binds)
-	r.linkWriters(uf, writers)
-	r.groupsFrom(uf)
+	sc.linkItems(uf, binds, pkg)
+	sc.linkPlaces(uf, binds)
+	sc.linkWriters(uf, chk)
+	sc.groupsFrom(uf, logf)
 }
 
 // overlap 表示两个路径是不是同一处或者互相包含。按新服务器上解析软链接之后的实际位置比较：父目录是
@@ -120,15 +120,15 @@ func bindKeys(binds []bundle.Bind, source string) []string {
 
 // linkItems 把迁入的容器和它所在的 Compose 项目、用到的数据卷、目录、网络、依赖的其他迁入的容器
 // 合到一组。
-func (r *run) linkItems(uf unionFind, binds []bundle.Bind) {
+func (sc *scope) linkItems(uf unionFind, binds []bundle.Bind, pkg *bundleFiles) {
 	names := map[string]bool{}
-	for _, it := range r.items {
+	for _, it := range sc.items {
 		names[it.m.Name] = true
 	}
-	for _, it := range r.items {
+	for _, it := range sc.items {
 		c := "c:" + it.m.Name
 		uf.find(c)
-		if it.m.Project != "" && r.projectRestored(it.m.Project) {
+		if it.m.Project != "" && sc.projectRestored(it.m.Project) {
 			uf.union(c, "p:"+it.m.Project)
 		}
 		for _, m := range it.c.Mounts {
@@ -148,7 +148,7 @@ func (r *run) linkItems(uf unionFind, binds []bundle.Bind) {
 		}
 		for _, ref := range spec.Dependencies(it.c) {
 			dep := ref
-			if n := r.nameOfOld(ref); n != "" {
+			if n := pkg.nameOfOld(ref); n != "" {
 				dep = n
 			}
 			if names[dep] {
@@ -158,8 +158,8 @@ func (r *run) linkItems(uf unionFind, binds []bundle.Bind) {
 	}
 	// 替换的 Compose 项目里有和迁入的容器同名的已有容器时（见 preflight.Counterparts），迁入的
 	// 容器用的是它空出来的名字：只撤销项目时要把它放回去，名字得先空出来，所以在同一组。
-	for _, p := range r.replaceProjects {
-		for _, c := range r.existingProjects[p] {
+	for _, p := range sc.replaceProjects {
+		for _, c := range sc.existingProjects[p] {
 			if names[c.Name()] {
 				uf.union("c:"+c.Name(), "p:"+p)
 			}
@@ -169,7 +169,7 @@ func (r *run) linkItems(uf unionFind, binds []bundle.Bind) {
 
 // linkPlaces 把写到同一处的合到一组：路径相同或者互相包含都算（项目目录、项目目录以外的文件、
 // 挂载目录和指向它的软链接）。不然只删除其中一组时，会删掉或换回另一组还在用的文件。
-func (r *run) linkPlaces(uf unionFind, binds []bundle.Bind) {
+func (sc *scope) linkPlaces(uf unionFind, binds []bundle.Bind) {
 	type place struct{ key, path string }
 	var places []place
 	at := func(key, path string) { places = append(places, place{key, host.RealPath(path)}) }
@@ -179,7 +179,7 @@ func (r *run) linkPlaces(uf unionFind, binds []bundle.Bind) {
 			at("b:"+b.Path, l.Link)
 		}
 	}
-	for _, p := range r.projects {
+	for _, p := range sc.projects {
 		k := "p:" + p.Name
 		uf.find(k)
 		at(k, p.WorkingDir)
@@ -198,11 +198,12 @@ func (r *run) linkPlaces(uf unionFind, binds []bundle.Bind) {
 
 // linkWriters 把迁入时要临时停下的已有容器（writers）和它共用的数据卷、目录合到一组。借用别的要停下的
 // 容器的网络、进程空间的，和它在同一组：放回它之前，借用的不能先启动。
-func (r *run) linkWriters(uf unionFind, writers []writer) {
+func (sc *scope) linkWriters(uf unionFind, chk *checked) {
+	writers := sc.writers
 	if len(writers) == 0 {
 		return
 	}
-	vols, targets := writeSet(r.writes())
+	vols, targets := writeSet(sc.writes(chk))
 	for _, w := range writers {
 		k := "w:" + w.summary.Name()
 		uf.find(k)
@@ -228,52 +229,52 @@ func (r *run) linkWriters(uf unionFind, writers []writer) {
 	}
 }
 
-// groupsFrom 按 uf 合出来的组建出 r.groups（按迁入的容器、项目的先后编号）和 r.groupOf（每个键在哪一组）。
-func (r *run) groupsFrom(uf unionFind) {
+// groupsFrom 按 uf 合出来的组建出 sc.groups（按迁入的容器、项目的先后编号）和 sc.groupOf（每个键在哪一组）。
+func (sc *scope) groupsFrom(uf unionFind, logf func(string, ...any)) {
 	byRoot := map[string]*group{}
-	r.groups = nil
+	sc.groups = nil
 	get := func(key string) *group {
 		root := uf.find(key)
 		g := byRoot[root]
 		if g == nil {
-			g = &group{id: fmt.Sprint(len(r.groups) + 1)}
+			g = &group{id: fmt.Sprint(len(sc.groups) + 1)}
 			byRoot[root] = g
-			r.groups = append(r.groups, g)
+			sc.groups = append(sc.groups, g)
 		}
 		return g
 	}
-	for _, it := range r.items {
+	for _, it := range sc.items {
 		g := get("c:" + it.m.Name)
 		g.items = append(g.items, it)
 	}
-	for _, p := range r.projects {
+	for _, p := range sc.projects {
 		g := get("p:" + p.Name)
 		g.projects = append(g.projects, p)
 	}
-	r.groupOf = map[string]string{}
+	sc.groupOf = map[string]string{}
 	for k := range uf {
 		if g := byRoot[uf.find(k)]; g != nil {
-			r.groupOf[k] = g.id
+			sc.groupOf[k] = g.id
 		}
 	}
-	if len(r.groups) > 1 {
+	if len(sc.groups) > 1 {
 		var parts []string
-		for _, g := range r.groups {
+		for _, g := range sc.groups {
 			parts = append(parts, g.label())
 		}
-		r.Log.Printf("分成 %d 组（每组单独启动）：%s", len(r.groups), strings.Join(parts, " | "))
+		logf("分成 %d 组（每组单独启动）：%s", len(sc.groups), strings.Join(parts, " | "))
 	}
 }
 
 // in 表示接下来的改动属于 key（例如 "c:web"）所在的组。
-func (r *run) in(key string) {
+func (r *migrate) in(key string) {
 	if r.j != nil {
-		r.j.group = r.groupOf[key]
+		r.j.group = r.sc.groupOf[key]
 	}
 }
 
-func (r *run) groupByID(id string) *group {
-	for _, g := range r.groups {
+func (sc *scope) groupByID(id string) *group {
+	for _, g := range sc.groups {
 		if g.id == id {
 			return g
 		}
@@ -282,8 +283,8 @@ func (r *run) groupByID(id string) *group {
 }
 
 // splitGroups 分出正常运行的和没能启动的组。
-func (r *run) splitGroups() (ok, failed []*group) {
-	for _, g := range r.groups {
+func (sc *scope) splitGroups() (ok, failed []*group) {
+	for _, g := range sc.groups {
 		if g.reason == "" {
 			ok = append(ok, g)
 		} else {
@@ -319,13 +320,13 @@ func (r *run) readDone() doneState {
 }
 
 // saveDone 把这次保留下来的服务加进记录。
-func (r *run) saveDone(items []*citem) error {
+func (r *migrate) saveDone(items []*citem) error {
 	st := r.readDone()
 	seen := map[string]bool{}
 	var list []doneContainer
 	for _, it := range items {
 		proj := ""
-		if it.m.Project != "" && r.projectRestored(it.m.Project) {
+		if it.m.Project != "" && r.sc.projectRestored(it.m.Project) {
 			proj = it.m.Project
 		}
 		list = append(list, doneContainer{Name: it.m.Name, ID: it.newID, Project: proj})
@@ -355,7 +356,7 @@ func (r *run) clearDone() { _ = os.Remove(r.donePath()) }
 
 // skipDone 读出上次已经迁入的服务，这次跳过它们。容器被删掉或换成了别的容器时，
 // 照常重新迁入；Compose 项目的容器少了任何一个，整个项目重新迁入。
-func (r *run) skipDone(ctx context.Context) {
+func (r *run) skipDone(ctx context.Context, chk *checked) {
 	st := r.readDone()
 	if len(st.Containers) == 0 {
 		return
@@ -379,24 +380,24 @@ func (r *run) skipDone(ctx context.Context) {
 	for _, c := range st.Containers {
 		switch {
 		case c.Project != "":
-			if projectOK[c.Project] && !slices.Contains(r.d.SkipProjects, c.Project) {
-				r.d.SkipProjects = append(r.d.SkipProjects, c.Project)
-				r.done = append(r.done, "Compose 项目 "+c.Project)
+			if projectOK[c.Project] && !slices.Contains(chk.d.SkipProjects, c.Project) {
+				chk.d.SkipProjects = append(chk.d.SkipProjects, c.Project)
+				chk.done = append(chk.done, "Compose 项目 "+c.Project)
 			}
 		case alive[c.Name]:
-			if !slices.Contains(r.d.SkipContainers, c.Name) {
-				r.d.SkipContainers = append(r.d.SkipContainers, c.Name)
-				r.done = append(r.done, c.Name)
+			if !slices.Contains(chk.d.SkipContainers, c.Name) {
+				chk.d.SkipContainers = append(chk.d.SkipContainers, c.Name)
+				chk.done = append(chk.done, c.Name)
 			}
 		}
 	}
-	if len(r.done) > 0 {
-		r.Screen.Info("上次已经迁入、这次跳过：%s", strings.Join(r.done, "、"))
+	if len(chk.done) > 0 {
+		r.Screen.Info("上次已经迁入、这次跳过：%s", strings.Join(chk.done, "、"))
 	}
 }
 
-func (r *run) projectRestored(name string) bool {
-	for _, p := range r.projects {
+func (sc *scope) projectRestored(name string) bool {
+	for _, p := range sc.projects {
 		if p.Name == name {
 			return true
 		}

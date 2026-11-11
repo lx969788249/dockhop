@@ -128,23 +128,10 @@ func TestReplaceFollowsProject(t *testing.T) {
 			var out bytes.Buffer
 			screen := ui.New(&out, false, nil)
 			r := testRun(t, Deps{Docker: dc, Home: home, Screen: screen}, Options{})
-			r.d = d
-			r.plan = &bundle.Plan{Containers: plan}
-			r.m = &bundle.Manifest{Containers: containers, Projects: []bundle.Project{{Name: "site", WorkingDir: filepath.Join(home, "site")}}}
-			r.dataDir = data
-			r.rbDir = filepath.Join(home, "rollback", "current")
-			r.undo = testUndo(t, dc, screen)
-			ctx := context.Background()
-			err := r.decide(ctx)
-			if err == nil {
-				err = r.begin()
-			}
-			if err == nil {
-				err = r.prepare(ctx)
-			}
-			if r.j != nil {
-				r.j.close()
-			}
+			chk := &checked{d: d, plan: &bundle.Plan{Containers: plan}}
+			pkg := &bundleFiles{dataDir: data,
+				m: &bundle.Manifest{Containers: containers, Projects: []bundle.Project{{Name: "site", WorkingDir: filepath.Join(home, "site")}}}}
+			mg, err := decideThenPrepare(r, chk, pkg)
 			if err != nil {
 				t.Fatalf("%v\n%s", err, out.String())
 			}
@@ -154,7 +141,7 @@ func TestReplaceFollowsProject(t *testing.T) {
 					touched = append(touched, c)
 				}
 			}
-			for _, it := range r.items {
+			for _, it := range mg.sc.items {
 				migrating = append(migrating, it.m.Name)
 			}
 			entries, _ := readJournal(r.rbDir)
@@ -169,8 +156,8 @@ func TestReplaceFollowsProject(t *testing.T) {
 			wantItems, wantOps := "web,site-app-1,other", "start,compose_old,web,old_images"
 			if keep {
 				want, wantItems, wantOps = nil, "other", "start"
-				if len(r.d.Skipped) != 1 || r.d.Skipped[0].Container != "web" || !strings.Contains(r.d.Skipped[0].Reason, "site") {
-					t.Errorf("迁移包里的 web 不迁入，要说明原因：%+v", r.d.Skipped)
+				if len(chk.d.Skipped) != 1 || chk.d.Skipped[0].Container != "web" || !strings.Contains(chk.d.Skipped[0].Reason, "site") {
+					t.Errorf("迁移包里的 web 不迁入，要说明原因：%+v", chk.d.Skipped)
 				}
 			}
 			if !slices.Equal(touched, want) || strings.Join(migrating, ",") != wantItems || strings.Join(ops, ",") != wantOps {
@@ -178,8 +165,8 @@ func TestReplaceFollowsProject(t *testing.T) {
 			}
 			// 迁入的 web 用的是 site 里已有的 web 空出来的名字：只撤销 site 时要放回已有的 web，
 			// 名字得先空出来，所以两者在同一组。
-			if !keep && r.groupOf["c:web"] != r.groupOf["p:site"] {
-				t.Errorf("迁入的 web 应和替换的 site 在同一组：%v", r.groupOf)
+			if !keep && mg.sc.groupOf["c:web"] != mg.sc.groupOf["p:site"] {
+				t.Errorf("迁入的 web 应和替换的 site 在同一组：%v", mg.sc.groupOf)
 			}
 		})
 	}
@@ -212,15 +199,18 @@ func TestReplaceNamedFollowsProject(t *testing.T) {
 					}
 					return
 				}
+				if r == nil {
+					t.Fatalf("不应在改动之前停下：%s", failed)
+				}
 				var items []string
-				for _, it := range r.items {
+				for _, it := range r.sc.items {
 					items = append(items, it.m.Name)
 				}
 				if failed != "" || !slices.Equal(touched, c.touched) || strings.Join(items, ",") != c.items || strings.Join(ops, ",") != c.ops {
 					t.Errorf("已有的 nginx：%v，迁入：%v，日志：%v\n%s", touched, items, ops, failed)
 				}
-				if c.policy == "skip" && (len(r.d.Skipped) != 1 || r.d.Skipped[0].Project != "site" || !strings.Contains(r.d.Skipped[0].Reason, "nginx")) {
-					t.Errorf("site 不迁入，要说明原因：%+v", r.d.Skipped)
+				if c.policy == "skip" && (len(r.chk.d.Skipped) != 1 || r.chk.d.Skipped[0].Project != "site" || !strings.Contains(r.chk.d.Skipped[0].Reason, "nginx")) {
+					t.Errorf("site 不迁入，要说明原因：%+v", r.chk.d.Skipped)
 				}
 			})
 		}
@@ -234,24 +224,31 @@ func TestNameHeldByKeptProject(t *testing.T) {
 	bundled := [][2]string{{"nginx", "site"}, {"proxy-app-1", "proxy"}, {"other", ""}}
 	existing := [][2]string{{"nginx", "proxy"}}
 	r, failed, touched, _ := decideAndPrepare(t, bundled, existing, preflight.Decisions{SkipProjects: []string{"proxy"}}, "")
-	if failed != "" || len(touched) > 0 || len(r.items) != 1 || r.items[0].m.Name != "other" || len(r.d.Skipped) != 1 ||
-		r.d.Skipped[0].Project != "site" || !strings.Contains(r.d.Skipped[0].Reason, "nginx 属于保留的 Compose 项目 proxy") {
-		t.Errorf("保留 proxy 时 site 不迁入：动过 %v，跳过 %+v\n%s", touched, r.d.Skipped, failed)
+	if r == nil {
+		t.Fatalf("保留 proxy 时不应停下：%s", failed)
 	}
-	if err := r.checkCompose(context.Background()); err != nil {
+	if failed != "" || len(touched) > 0 || len(r.sc.items) != 1 || r.sc.items[0].m.Name != "other" || len(r.chk.d.Skipped) != 1 ||
+		r.chk.d.Skipped[0].Project != "site" || !strings.Contains(r.chk.d.Skipped[0].Reason, "nginx 属于保留的 Compose 项目 proxy") {
+		t.Errorf("保留 proxy 时 site 不迁入：动过 %v，跳过 %+v\n%s", touched, r.chk.d.Skipped, failed)
+	}
+	if err := r.checkCompose(context.Background(), nil, r.pkg, r.sc); err != nil {
 		t.Errorf("不迁入的项目不用检查配置文件（新服务器没装 Compose 也没关系）：%v", err)
 	}
 	r, failed, touched, _ = decideAndPrepare(t, bundled, existing, preflight.Decisions{}, "")
+	if r == nil {
+		t.Fatalf("替换 proxy 时不应停下：%s", failed)
+	}
 	want := []string{"POST /containers/target-nginx/stop", "DELETE /containers/target-nginx"}
-	if failed != "" || !slices.Equal(touched, want) || len(r.items) != 3 || r.groupOf["p:site"] != r.groupOf["p:proxy"] {
-		t.Errorf("替换 proxy 时 nginx 随它备份、删除，site 和它在同一组：%v %v\n%s", touched, r.groupOf, failed)
+	if failed != "" || !slices.Equal(touched, want) || len(r.sc.items) != 3 || r.sc.groupOf["p:site"] != r.sc.groupOf["p:proxy"] {
+		t.Errorf("替换 proxy 时 nginx 随它备份、删除，site 和它在同一组：%v %v\n%s", touched, r.sc.groupOf, failed)
 	}
 }
 
 // decideAndPrepare 按迁入的顺序调用 decide、begin、prepare。bundled 是迁移包里的容器（名字和所属的 Compose
 // 项目，单独迁入的为空），existing 是新服务器上已有的容器（同样；都在运行，ID 是 target-名字），policy 是
-// --existing。返回 run、出错时屏幕上的输出、对已有容器的改动（GET 以外的请求）和事务日志里的操作。
-func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.Decisions, policy string) (r *run, failed string, touched, ops []string) {
+// --existing。返回开始改动之后的 migrate（改动之前就停下时为空）、出错时屏幕上的输出、对已有容器的改动（GET
+// 以外的请求）和事务日志里的操作。
+func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.Decisions, policy string) (mg *migrate, failed string, touched, ops []string) {
 	t.Helper()
 	var list []string
 	inspect := map[string]string{}
@@ -296,24 +293,8 @@ func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.D
 	}
 	var out bytes.Buffer
 	screen := ui.New(&out, false, nil)
-	r = testRun(t, Deps{Docker: dc, Home: home, Screen: screen}, Options{Existing: policy})
-	r.d = d
-	r.plan = &bundle.Plan{Containers: plan}
-	r.m = m
-	r.dataDir = data
-	r.rbDir = filepath.Join(home, "rollback", "current")
-	r.undo = testUndo(t, dc, screen)
-	ctx := context.Background()
-	err := r.decide(ctx)
-	if err == nil {
-		err = r.begin()
-	}
-	if err == nil {
-		err = r.prepare(ctx)
-	}
-	if r.j != nil {
-		r.j.close()
-	}
+	r := testRun(t, Deps{Docker: dc, Home: home, Screen: screen}, Options{Existing: policy})
+	mg, err := decideThenPrepare(r, &checked{d: d, plan: &bundle.Plan{Containers: plan}}, &bundleFiles{m: m, dataDir: data})
 	if err != nil {
 		failed = out.String()
 	}
@@ -326,5 +307,5 @@ func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.D
 	for _, e := range entries {
 		ops = append(ops, string(e.Op))
 	}
-	return r, failed, touched, ops
+	return mg, failed, touched, ops
 }

@@ -37,7 +37,7 @@ func TestBackupProjectStopsWhenChangesFail(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer j.close()
-	r := testRun(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, Options{})
+	r := testMigrate(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, Options{})
 	r.j = j
 	err = r.backupProject(context.Background(), "blog", []docker.ContainerSummary{{ID: "abcdef1234567890", Names: []string{"/blog-app-1"}}})
 	if err == nil || !strings.Contains(out.String(), "为了安全没有删除它") {
@@ -113,7 +113,7 @@ func TestBackupProjectKeepsFixedMAC(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	r := testRun(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, Options{})
+	r := testMigrate(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, Options{})
 	r.j = j
 	r.backupProject(context.Background(), "blog", []docker.ContainerSummary{{ID: "abcdef1234567890", Names: []string{"/blog-app-1"}}})
 	j.close()

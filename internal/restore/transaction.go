@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -14,22 +15,23 @@ import (
 // 后 commit，之后不再回滚；任何一步失败或被中断都 rollback，按日志撤销（rollback.go）。上次
 // 迁入被强制结束、留下没提交的日志时，下次运行先补救。
 
-// begin 开始事务：从这里起，对新服务器的每一处改动都先记进事务日志，失败、中断时按日志撤销。
-func (r *run) begin() error {
+// begin 开始事务：从这里起，对新服务器的每一处改动都先记进事务日志，失败、中断时按日志撤销。之后的几步
+// 都在返回的 migrate 上。
+func (r *run) begin(tool *compose.Tool, chk *checked, pkg *bundleFiles, sc *scope) (*migrate, error) {
 	if err := os.RemoveAll(r.rbDir); err != nil {
-		return r.Screen.StepFailed("无法清理回滚资料目录 "+r.rbDir, err.Error(), "")
+		return nil, r.Screen.StepFailed("无法清理回滚资料目录 "+r.rbDir, err.Error(), "")
 	}
 	j, err := openJournal(r.rbDir)
 	if err != nil {
-		return r.Screen.StepFailed("无法创建事务日志，为了安全没有改动任何东西", err.Error(), "检查 "+r.Home+" 是否可写")
+		return nil, r.Screen.StepFailed("无法创建事务日志，为了安全没有改动任何东西", err.Error(), "检查 "+r.Home+" 是否可写")
 	}
-	r.j = j
-	return nil
+	return &migrate{run: r, tool: tool, chk: chk, pkg: pkg, sc: sc, j: j,
+		imageAs: map[string]string{}, noted: map[string]bool{}}, nil
 }
 
-func (r *run) commit(ctx context.Context) error {
+func (r *migrate) commit(ctx context.Context) error {
 	s := r.Screen
-	if ok, failed := r.splitGroups(); len(failed) > 0 {
+	if ok, failed := r.sc.splitGroups(); len(failed) > 0 {
 		return r.commitPartial(ctx, ok, failed)
 	}
 	// 先把临时停下的共用数据的容器恢复；恢复不了就全部删除。
@@ -62,8 +64,8 @@ func (r *run) commit(ctx context.Context) error {
 		s.Fail()
 		return ui.ErrReported
 	}
-	r.noteKept(r.items)
-	s.End(r.countText())
+	r.noteKept(r.sc.items)
+	s.End(r.sc.countText())
 	return nil
 }
 
@@ -80,7 +82,7 @@ func (r *run) noteKept(items []*citem) {
 	}
 }
 
-func (r *run) rollback(ctx context.Context) {
+func (r *migrate) rollback(ctx context.Context) {
 	if r.Screen.FailedStage() == "" {
 		r.Screen.Fail()
 	}
@@ -116,12 +118,7 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 		return s.StepFailed("上次迁入的事务日志读不了，没法自动删除上次迁入的内容", err.Error(),
 			"回滚资料都保留在 "+r.rbDir+"（journal.jsonl 记着每一处改动），请人工处理后删除这个目录再重新运行")
 	}
-	img := r.helperImage(ctx) // 新服务器上可能一个容器都没有
-	helperBin := ""
-	if r.Docker.Local() {
-		helperBin, _ = prepareHelper(r.Home)
-	}
-	r.undo.vio = &volumeIO{dc: r.Docker, image: img, helperBin: helperBin, lock: lockPath(r.Home)}
+	r.undo.vio, _ = r.newVolumeIO(ctx)
 	if kept, ok := partialCommit(entries); ok {
 		return r.resumePartial(ctx, entries, kept)
 	}

@@ -23,13 +23,13 @@ import (
 // 恢复数据：数据卷、目录（连同软链接）、Compose 项目文件。写之前先把原来的备份好、记进事务日志，
 // 文件操作见 files.go，读写数据卷见 volumes.go。
 
-func (r *run) restoreData(ctx context.Context) error {
+func (r *migrate) restoreData(ctx context.Context) error {
 	s, dc := r.Screen, r.Docker
-	vols, binds := dataTargets(r.writes())
+	vols, binds := dataTargets(r.sc.writes(r.chk))
 	nv, nb := 0, 0
-	for _, v := range r.m.Volumes {
+	for _, v := range r.pkg.m.Volumes {
 		if !vols[v.Name] {
-			if !v.Anonymous && r.d.KeepVolume(v.Name) {
+			if !v.Anonymous && r.chk.d.KeepVolume(v.Name) {
 				s.Detail("按检查时的选择保留已有的数据卷 %s", v.Name)
 			}
 			continue
@@ -39,7 +39,7 @@ func (r *run) restoreData(ctx context.Context) error {
 			Options map[string]string `json:"Options"`
 			Labels  map[string]string `json:"Labels"`
 		}
-		if b, err := os.ReadFile(filepath.Join(r.dataDir, "volumes", v.Name+".json")); err == nil {
+		if b, err := os.ReadFile(filepath.Join(r.pkg.dataDir, "volumes", v.Name+".json")); err == nil {
 			_ = json.Unmarshal(b, &meta)
 		}
 		r.in("v:" + v.Name)
@@ -69,13 +69,13 @@ func (r *run) restoreData(ctx context.Context) error {
 				return s.StepFailed("数据卷 "+v.Name+" 创建失败", err.Error(), "不是 local 驱动的卷，需要先在新服务器安装对应的卷插件")
 			}
 		}
-		rc := bundle.OpenStream(r.dataDir, "volumes/"+v.Name, v.Parts)
+		rc := bundle.OpenStream(r.pkg.dataDir, "volumes/"+v.Name, v.Parts)
 		p := s.StartProgress("卷 "+v.Name, v.Bytes, "")
 		var werr error
 		if mustClear(v.Name, existed) {
-			werr = r.vio.replace(ctx, v.Name, io.TeeReader(rc, p))
+			werr = r.volumes(ctx).replace(ctx, v.Name, io.TeeReader(rc, p))
 		} else {
-			werr = r.vio.write(ctx, v.Name, io.TeeReader(rc, p))
+			werr = r.volumes(ctx).write(ctx, v.Name, io.TeeReader(rc, p))
 		}
 		rc.Close()
 		p.Done(werr)
@@ -85,10 +85,10 @@ func (r *run) restoreData(ctx context.Context) error {
 		if werr != nil {
 			return s.StepFailed("数据卷 "+v.Name+" 写入失败", werr.Error(), "执行 df -h 检查磁盘空间")
 		}
-		_ = os.RemoveAll(filepath.Join(r.dataDir, "volumes", v.Name))
+		_ = os.RemoveAll(filepath.Join(r.pkg.dataDir, "volumes", v.Name))
 		nv++
 	}
-	for _, b := range r.m.Binds {
+	for _, b := range r.pkg.m.Binds {
 		if spec.IsSystemPath(b.Path) {
 			s.Detail("宿主机系统路径只重建挂载、不覆盖：%s", b.Path)
 			continue
@@ -102,7 +102,7 @@ func (r *run) restoreData(ctx context.Context) error {
 		}
 		nb++
 	}
-	for _, p := range r.projects {
+	for _, p := range r.sc.projects {
 		r.in("p:" + p.Name)
 		if err := r.installProject(p); err != nil {
 			return s.StepFailed("Compose 项目 "+p.Name+" 的文件没能放回原来的位置", err.Error(), "")
@@ -123,8 +123,8 @@ func (r *run) restoreData(ctx context.Context) error {
 	if nb > 0 {
 		parts = append(parts, fmt.Sprintf("%d 个目录", nb))
 	}
-	if len(r.projects) > 0 {
-		parts = append(parts, fmt.Sprintf("%d 个 Compose 项目", len(r.projects)))
+	if len(r.sc.projects) > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个 Compose 项目", len(r.sc.projects)))
 	}
 	s.End(strings.Join(parts, " · "))
 	return nil
@@ -137,8 +137,8 @@ func volumeDriver(d string) string {
 	return d
 }
 
-func (r *run) saveVolume(ctx context.Context, name, path string) error {
-	rc, err := r.vio.read(ctx, name)
+func (r *migrate) saveVolume(ctx context.Context, name, path string) error {
+	rc, err := r.volumes(ctx).read(ctx, name)
 	if err != nil {
 		return err
 	}
@@ -161,7 +161,7 @@ func (r *run) saveVolume(ctx context.Context, name, path string) error {
 	return err
 }
 
-func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
+func (r *migrate) restoreBind(ctx context.Context, b bundle.Bind) error {
 	// 迁入前检查已经在路径本身是软链接时停下（见 preflight.LinkedBind），这里是动手之前最后再看一次：
 	// 检查之后才被换成软链接的，同样不迁入。
 	if dest, err := os.Readlink(b.Path); err == nil {
@@ -184,7 +184,7 @@ func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
 		return err
 	}
 	defer os.RemoveAll(swap.stage)
-	rc := bundle.OpenStream(r.dataDir, "binds/"+b.ID, b.Parts)
+	rc := bundle.OpenStream(r.pkg.dataDir, "binds/"+b.ID, b.Parts)
 	p := r.Screen.StartProgress("目录 "+ui.ShortPath(b.Path), b.Bytes, "")
 	err = bundle.ExtractTree(io.TeeReader(rc, p), swap.stage)
 	rc.Close()
@@ -206,7 +206,7 @@ func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
 	if err := r.swapIn(swap, staged); err != nil {
 		return err
 	}
-	_ = os.RemoveAll(filepath.Join(r.dataDir, "binds", b.ID))
+	_ = os.RemoveAll(filepath.Join(r.pkg.dataDir, "binds", b.ID))
 	for _, l := range b.AllLinks() {
 		if err := r.restoreLink(l.Link, l.Target); err != nil {
 			return err
@@ -216,7 +216,7 @@ func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
 }
 
 // restoreLink 源端挂载的是软链接时，数据已经恢复到真实路径，在原路径重建同一个链接。
-func (r *run) restoreLink(link, target string) error {
+func (r *migrate) restoreLink(link, target string) error {
 	if link == "" {
 		return nil
 	}
@@ -241,7 +241,7 @@ func (r *run) restoreLink(link, target string) error {
 
 // installProject 把 Compose 项目目录和它引用的目录外文件放回原来的位置。逐个文件
 // 安装（合并），不删除新服务器上这个目录里原有的其他文件；DockHop 自己的目录不动。
-func (r *run) installProject(p bundle.Project) error {
+func (r *migrate) installProject(p bundle.Project) error {
 	// 迁入前检查已经在要放文件的地方是软链接时停下（见 preflight.LinkedProject），这里是动手之前最后再看
 	// 一次：检查之后才被换成软链接的，同样不放。
 	var paths []string
@@ -256,7 +256,7 @@ func (r *run) installProject(p bundle.Project) error {
 			return errors.New(preflight.LinkedProject(p.Name, path, dest))
 		}
 	}
-	skip := func(path string) bool { return spec.Within(path, r.Home) || spec.Within(path, r.workdir) }
+	skip := func(path string) bool { return spec.Within(path, r.Home) || spec.Within(path, r.pkg.workdir) }
 	if p.DirParts > 0 {
 		if err := r.extractAndInstall("compose/"+p.Name+"/dir", p.DirParts, p.WorkingDir, skip); err != nil {
 			return err
@@ -272,14 +272,14 @@ func (r *run) installProject(p bundle.Project) error {
 	return nil
 }
 
-func (r *run) extractAndInstall(prefix string, parts int, dest string, skip func(string) bool) error {
-	stage := filepath.Join(r.workdir, "stage-"+strings.ReplaceAll(prefix, "/", "-"))
+func (r *migrate) extractAndInstall(prefix string, parts int, dest string, skip func(string) bool) error {
+	stage := filepath.Join(r.pkg.workdir, "stage-"+strings.ReplaceAll(prefix, "/", "-"))
 	_ = os.RemoveAll(stage)
 	if err := os.Mkdir(stage, 0o700); err != nil {
 		return err
 	}
 	defer os.RemoveAll(stage)
-	rc := bundle.OpenStream(r.dataDir, prefix, parts)
+	rc := bundle.OpenStream(r.pkg.dataDir, prefix, parts)
 	err := bundle.ExtractTree(rc, stage)
 	rc.Close()
 	if err != nil {

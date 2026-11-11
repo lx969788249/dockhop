@@ -88,12 +88,12 @@ func (u *unit) serviceOrder() []string {
 }
 
 // units 列出一组服务里的启动单位，并找出它们之间的依赖。
-func (r *run) units(g *group) []*unit {
+func (r *migrate) units(g *group) []*unit {
 	var out []*unit
 	for i := range g.projects {
 		p := &g.projects[i]
 		u := &unit{key: "p:" + p.Name, label: "项目 " + p.Name, project: p, uses: map[string][]string{}}
-		for _, it := range r.items {
+		for _, it := range r.sc.items {
 			if it.m.Project == p.Name {
 				u.items = append(u.items, it)
 			}
@@ -101,7 +101,7 @@ func (r *run) units(g *group) []*unit {
 		out = append(out, u)
 	}
 	for _, it := range g.items {
-		if it.m.Project == "" || !r.projectRestored(it.m.Project) {
+		if it.m.Project == "" || !r.sc.projectRestored(it.m.Project) {
 			out = append(out, &unit{key: "c:" + it.m.Name, label: "容器 " + it.m.Name, items: []*citem{it}})
 		}
 	}
@@ -133,7 +133,7 @@ func (r *run) units(g *group) []*unit {
 		for _, it := range u.items {
 			for _, x := range spec.Deps(it.c) {
 				name := x.Ref
-				if n := r.nameOfOld(x.Ref); n != "" {
+				if n := r.pkg.nameOfOld(x.Ref); n != "" {
 					name = n
 				}
 				if u.project != nil && owner[name] == u {
@@ -179,10 +179,10 @@ func (r *run) units(g *group) []*unit {
 
 // networkOwners 是由迁入的 Compose 项目创建的网络 → 项目名：这些网络交给 Compose 按项目文件
 // 创建（见 startServices），用到它们的其他单位要等这个项目创建好。
-func (r *run) networkOwners() map[string]string {
+func (r *migrate) networkOwners() map[string]string {
 	out := map[string]string{}
-	for _, n := range r.m.Networks {
-		raw, err := os.ReadFile(filepath.Join(r.dataDir, "networks", n+".json"))
+	for _, n := range r.pkg.m.Networks {
+		raw, err := os.ReadFile(filepath.Join(r.pkg.dataDir, "networks", n+".json"))
 		if err != nil {
 			continue
 		}
@@ -190,7 +190,7 @@ func (r *run) networkOwners() map[string]string {
 			Labels map[string]string `json:"Labels"`
 		}
 		_ = json.Unmarshal(raw, &meta)
-		if proj := meta.Labels["com.docker.compose.project"]; proj != "" && r.projectRestored(proj) &&
+		if proj := meta.Labels["com.docker.compose.project"]; proj != "" && r.sc.projectRestored(proj) &&
 			meta.Labels["com.docker.compose.network"] != "" {
 			out[n] = proj
 		}
@@ -256,7 +256,7 @@ func hexID(s string) bool {
 }
 
 // logDeps 把单位之间的依赖和原因写进日志。
-func (r *run) logDeps(units []*unit) {
+func (r *migrate) logDeps(units []*unit) {
 	for _, u := range units {
 		for _, d := range u.deps {
 			kind := "要等它先建好"

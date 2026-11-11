@@ -67,7 +67,7 @@ func (it *citem) starts() bool { return it.want() != wantStopped }
 // 写进这个容器（applyChanges）。这样每个容器的新增、修改都是它自己的，镜像只承载删除。
 
 // baseImage 是创建容器用的原镜像：旧版本镜像、改名后的 digest 镜像，或者原来的镜像名。
-func (r *run) baseImage(it *citem) string {
+func (r *migrate) baseImage(it *citem) string {
 	if it.m.OldImage != "" {
 		return it.m.OldImage
 	}
@@ -85,7 +85,7 @@ func deletedOf(it *citem) []string {
 }
 
 // image 是创建这个独立容器用的镜像：原镜像，容器里删除过文件时是删掉这些文件的镜像。
-func (r *run) image(ctx context.Context, it *citem) (string, error) {
+func (r *migrate) image(ctx context.Context, it *citem) (string, error) {
 	if it.img != "" {
 		return it.img, nil
 	}
@@ -100,7 +100,7 @@ func (r *run) image(ctx context.Context, it *citem) (string, error) {
 // serviceImage 是 Compose 服务的镜像。同一个服务的副本只能用同一个镜像（覆盖文件按服务写），
 // 所以镜像里只删掉每个副本都删过的文件；只有部分副本删过的文件，别的副本里还在，不能删，
 // 在删过它的副本里就会重新出现，这里明确提示。新增和修改的文件不在镜像里，每个副本各写各的。
-func (r *run) serviceImage(ctx context.Context, project, svc string, reps []*citem) (string, error) {
+func (r *migrate) serviceImage(ctx context.Context, project, svc string, reps []*citem) (string, error) {
 	base := r.baseImage(reps[0])
 	for _, it := range reps[1:] {
 		if b := r.baseImage(it); b != base {
@@ -145,11 +145,11 @@ func intersect(a, b []string) []string {
 // imageWithout 做出删掉 deleted 这些文件的镜像 dockhop-image:<name>：在临时容器里删除，再在
 // 这台服务器上 commit（本机 commit 没问题，只是导出 commit 的镜像有问题）。镜像的配置和原镜像
 // 相同，容器的配置照常来自原始配置。没有要删的文件时就是原镜像。
-func (r *run) imageWithout(ctx context.Context, base string, deleted []string, name string) (string, error) {
+func (r *migrate) imageWithout(ctx context.Context, base string, deleted []string, name string) (string, error) {
 	if len(deleted) == 0 {
 		return base, nil
 	}
-	if r.vio.helperBin == "" {
+	if r.volumes(ctx).helperBin == "" {
 		r.Screen.Warn("%s 里删除过 %d 个文件，Docker 不在这台服务器上，没法在新容器里删除它们（文件还在，来自镜像）", name, len(deleted))
 		return base, nil
 	}
@@ -171,7 +171,7 @@ func (r *run) imageWithout(ctx context.Context, base string, deleted []string, n
 	// 用户改回原镜像的，镜像的其他配置本来就和原镜像一样。
 	tmp := map[string]any{
 		"Image": base, "Entrypoint": append([]string{"/dockhop-helper", "__remove"}, deleted...),
-		"HostConfig": map[string]any{"NetworkMode": "none", "Binds": []string{r.vio.helperBin + ":/dockhop-helper:ro"}},
+		"HostConfig": map[string]any{"NetworkMode": "none", "Binds": []string{r.volumes(ctx).helperBin + ":/dockhop-helper:ro"}},
 	}
 	commitCfg := map[string]any{"Entrypoint": nonNil(bc.Entrypoint), "Cmd": nonNil(bc.Cmd)}
 	if bc.User != "" && bc.User != "root" && bc.User != "0" && bc.User != "0:0" {
@@ -180,7 +180,7 @@ func (r *run) imageWithout(ctx context.Context, base string, deleted []string, n
 	}
 	// 这个临时容器不能带 dockhop.helper 标签：commit 时标签会进到镜像里，再跟着镜像到
 	// 迁入的容器上。所以记进事务日志，程序被强制结束后由回滚或提交后的清理删除。
-	helper := fmt.Sprintf("dockhop-helper-%s-%d", runID, r.vio.n.Add(1))
+	helper := fmt.Sprintf("dockhop-helper-%s-%d", runID, r.volumes(ctx).n.Add(1))
 	if err := r.j.add(Entry{Op: opHelper, Name: helper}); err != nil {
 		return "", err
 	}
@@ -216,12 +216,12 @@ func nonNil(v []string) []string {
 }
 
 // applyChanges 在容器创建之后、启动之前，把它里面新增和修改的文件写进去。
-func (r *run) applyChanges(ctx context.Context, it *citem) error {
+func (r *migrate) applyChanges(ctx context.Context, it *citem) error {
 	ch := it.m.Changes
 	if ch == nil || len(ch.Paths) == 0 {
 		return nil
 	}
-	rc := bundle.OpenStream(r.dataDir, "changes/"+it.m.Name, ch.Parts)
+	rc := bundle.OpenStream(r.pkg.dataDir, "changes/"+it.m.Name, ch.Parts)
 	defer rc.Close()
 	if err := r.Docker.PutArchive(ctx, it.newID, "/", rc); err != nil {
 		return fmt.Errorf("容器 %s 里的改动没能写入：%v", it.m.Name, err)
@@ -230,7 +230,7 @@ func (r *run) applyChanges(ctx context.Context, it *citem) error {
 }
 
 // createContainer 用原始配置创建一个独立容器（不启动）。
-func (r *run) createContainer(ctx context.Context, it *citem) error {
+func (r *migrate) createContainer(ctx context.Context, it *citem) error {
 	img, err := r.image(ctx, it)
 	if err != nil {
 		return err
@@ -238,10 +238,10 @@ func (r *run) createContainer(ctx context.Context, it *citem) error {
 	imgRaw, _ := r.Docker.InspectImageRaw(ctx, img)
 	built, err := spec.Rebuild{
 		Raw: it.raw, Image: img, ImageConfig: imgRaw,
-		Source: spec.SourceDefaults{CgroupVersion: r.m.Source.CgroupVersion, LoggingDriver: r.m.Source.LoggingDriver, DefaultRuntime: r.m.Source.DefaultRuntime},
-		NameOf: r.nameOfOld,
+		Source: spec.SourceDefaults{CgroupVersion: r.pkg.m.Source.CgroupVersion, LoggingDriver: r.pkg.m.Source.LoggingDriver, DefaultRuntime: r.pkg.m.Source.DefaultRuntime},
+		NameOf: r.pkg.nameOfOld,
 		Port: func(ip, port, cport, proto string) (string, string, bool) {
-			ch, ok := r.d.PortFor(preflight.PortRef{Container: it.m.Name, HostIP: ip, HostPort: port, ContainerPort: cport, Proto: proto})
+			ch, ok := r.chk.d.PortFor(preflight.PortRef{Container: it.m.Name, HostIP: ip, HostPort: port, ContainerPort: cport, Proto: proto})
 			if !ok {
 				return ip, port, true
 			}
@@ -250,7 +250,7 @@ func (r *run) createContainer(ctx context.Context, it *citem) error {
 			}
 			return ch.NewIP, ch.NewPort, true
 		},
-		AutoIP:       func(n string) bool { return r.d.AutoIPFor(it.m.Name, n) },
+		AutoIP:       func(n string) bool { return r.chk.d.AutoIPFor(it.m.Name, n) },
 		MultiNetwork: r.Docker.AtLeast("1.44"),
 	}.Build()
 	if err != nil {
@@ -278,8 +278,8 @@ func (r *run) createContainer(ctx context.Context, it *citem) error {
 }
 
 // nameOfOld 把旧服务器上的容器 ID（或前缀）换成容器名。
-func (r *run) nameOfOld(ref string) string {
-	for _, c := range r.m.Containers {
+func (pkg *bundleFiles) nameOfOld(ref string) string {
+	for _, c := range pkg.m.Containers {
 		if c.ID == ref || c.Name == ref || (len(ref) >= 12 && strings.HasPrefix(c.ID, ref)) {
 			return c.Name
 		}
@@ -289,7 +289,7 @@ func (r *run) nameOfOld(ref string) string {
 
 // transplantAnonymous 把迁移过来的匿名卷数据放进新容器的匿名卷：匿名卷只有随机编号，
 // 新容器创建时 Docker 给它新建了一个（可能还复制了镜像里的文件），清空后写入迁移的数据。
-func (r *run) transplantAnonymous(ctx context.Context, it *citem, newID string) error {
+func (r *migrate) transplantAnonymous(ctx context.Context, it *citem, newID string) error {
 	var src struct {
 		Mounts []docker.Mount `json:"Mounts"`
 	}
@@ -299,7 +299,7 @@ func (r *run) transplantAnonymous(ctx context.Context, it *citem, newID string) 
 		if m.Type != "volume" || !spec.IsAnonymousVolume(m.Name) {
 			continue
 		}
-		v, ok := r.anonVolumes[m.Name]
+		v, ok := r.sc.anonVolumes[m.Name]
 		if !ok {
 			continue
 		}
@@ -321,8 +321,8 @@ func (r *run) transplantAnonymous(ctx context.Context, it *citem, newID string) 
 			continue
 		}
 		r.Screen.Detail("匿名卷：%s 的 %s 沿用迁移过来的数据", it.m.Name, m.Destination)
-		rc := bundle.OpenStream(r.dataDir, "volumes/"+v.Name, v.Parts)
-		err := r.vio.replace(ctx, target, rc)
+		rc := bundle.OpenStream(r.pkg.dataDir, "volumes/"+v.Name, v.Parts)
+		err := r.volumes(ctx).replace(ctx, target, rc)
 		rc.Close()
 		if err != nil {
 			return fmt.Errorf("容器 %s 的匿名卷（%s）数据写入失败：%v", it.m.Name, m.Destination, err)
@@ -332,7 +332,7 @@ func (r *run) transplantAnonymous(ctx context.Context, it *citem, newID string) 
 }
 
 // createProject 用 Compose 创建项目的容器（不启动），放回匿名卷的数据和容器里的改动。
-func (r *run) createProject(ctx context.Context, u *unit) error {
+func (r *migrate) createProject(ctx context.Context, u *unit) error {
 	if r.tool == nil {
 		return errors.New("新服务器没有安装 docker compose")
 	}
@@ -358,7 +358,7 @@ func (r *run) createProject(ctx context.Context, u *unit) error {
 		}
 	}
 	if len(override) > 0 {
-		path := filepath.Join(r.workdir, "dockhop-override-"+p.Name+".yml")
+		path := filepath.Join(r.pkg.workdir, "dockhop-override-"+p.Name+".yml")
 		b, _ := json.Marshal(map[string]any{"services": override}) // JSON 也是合法的 YAML
 		if err := os.WriteFile(path, b, 0o600); err != nil {
 			return err
@@ -472,7 +472,7 @@ func uniq(list []string) []string {
 }
 
 // ensureNetwork 按迁移记录创建网络；新服务器上已有同名、核心设置相同的网络时沿用。
-func (r *run) ensureNetwork(ctx context.Context, name string, raw json.RawMessage) error {
+func (r *migrate) ensureNetwork(ctx context.Context, name string, raw json.RawMessage) error {
 	var n struct {
 		Name       string            `json:"Name"`
 		Driver     string            `json:"Driver"`
@@ -492,11 +492,11 @@ func (r *run) ensureNetwork(ctx context.Context, name string, raw json.RawMessag
 		return fmt.Errorf("网络 %s 的配置读不懂：%v", name, err)
 	}
 	if cur, err := r.Docker.InspectNetwork(ctx, name); err == nil {
-		if r.d.ReuseExisting(name) {
+		if r.chk.d.ReuseExisting(name) {
 			r.Screen.Detail("按检查时的选择沿用新服务器上已有的网络 %s", name)
 			return nil
 		}
-		if driverName(cur.Driver) != driverName(n.Driver) || !sameSubnets(cur.IPAM.Config, n.IPAM.Config) && !r.d.AutoSubnetFor(name) {
+		if driverName(cur.Driver) != driverName(n.Driver) || !sameSubnets(cur.IPAM.Config, n.IPAM.Config) && !r.chk.d.AutoSubnetFor(name) {
 			return fmt.Errorf("新服务器上已有同名网络 %s，但设置和旧服务器不同；为了不影响用它的其他容器，没有改动它", name)
 		}
 		if !maps.Equal(cur.Labels, n.Labels) {
@@ -507,7 +507,7 @@ func (r *run) ensureNetwork(ctx context.Context, name string, raw json.RawMessag
 		return err
 	}
 	ipam := map[string]any{"Driver": n.IPAM.Driver, "Options": n.IPAM.Options}
-	if !r.d.AutoSubnetFor(name) {
+	if !r.chk.d.AutoSubnetFor(name) {
 		ipam["Config"] = n.IPAM.Config
 	}
 	body := map[string]any{

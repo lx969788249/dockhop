@@ -90,9 +90,9 @@ func TestEnding(t *testing.T) {
 		{"删除上次留下的内容之后按了 Ctrl+C", stopped, ui.ErrReported, state{rollbackDone: true}, endInterrupted},
 	}
 	for _, c := range cases {
-		r := testRun(t, Deps{}, Options{})
+		r := testMigrate(t, Deps{}, Options{})
 		if c.st.began {
-			r.j = &Journal{}
+			r.at.mg = r // 开始改动了（见 steps）
 		}
 		r.out.committed, r.out.partial, r.out.rollbackDone = c.st.committed, c.st.partial, c.st.rollbackDone
 		if got := r.ending(c.ctx, c.err); got != c.want {
@@ -208,7 +208,12 @@ func TestRestoreKeepsRunningExportHelper(t *testing.T) {
 // 不能在换目录时崩溃（问题表 D14）。挂载信息只有 Linux 上有，别的系统上只看不崩溃。
 func TestRunDefaultsMountPoint(t *testing.T) {
 	r := newRun(Deps{Home: t.TempDir()}, Options{})
-	if _, err := r.newDirSwap(t.TempDir(), true); err != nil && runtime.GOOS == "linux" {
+	mg, err := r.begin(nil, &checked{}, &bundleFiles{}, &scope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mg.j.close()
+	if _, err := mg.newDirSwap(t.TempDir(), true); err != nil && runtime.GOOS == "linux" {
 		t.Fatal(err)
 	}
 }

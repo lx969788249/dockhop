@@ -74,7 +74,7 @@ func (r *run) decidePartial(ok, failed []*group) (bool, error) {
 //  3. 删除没启动的组、删除保留下来的组的回滚资料（见 finishPartial）。之后被强制结束，下次运行
 //     接着做完；
 //  4. 记下已经迁入的服务，重试时跳过。
-func (r *run) commitPartial(ctx context.Context, ok, failed []*group) error {
+func (r *migrate) commitPartial(ctx context.Context, ok, failed []*group) error {
 	s := r.Screen
 	failedID := map[string]bool{}
 	for _, g := range failed {
