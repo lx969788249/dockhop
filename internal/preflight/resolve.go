@@ -156,258 +156,301 @@ var errCancel = errors.New("取消")
 // resolve 处理一个问题。返回 nil 表示已经记下选择，errRecheck 表示要重新检查，
 // errCancel 表示取消迁入。auto 时自动采用推荐做法，没法自动处理时返回 errCancel。
 func (r *Runner) resolve(i Issue, d *Decisions, n, total int, auto bool) error {
-	choose := func(options ...string) (int, error) {
-		if auto {
-			r.Screen.Warn("%s → 按 --yes 自动选择：%s", i.Title, strings.TrimSuffix(options[0], "（推荐）"))
-			return 1, nil
-		}
-		r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", n, total, i.Title))
-		return r.Prompt.Choose(options)
-	}
-	skipProject := func(reason string) {
-		d.SkipProjects = add(d.SkipProjects, i.Project)
-		d.Skipped = append(d.Skipped, Skip{Project: i.Project, Reason: reason})
-	}
+	q := &question{r: r, i: i, d: d, n: n, total: total, auto: auto}
 	switch i.Kind {
 	case "port", "host_ip":
-		// 只改这次选的那一项：同一个端口之前做过的其他调整（例如改绑地址）要保留。
-		changePort := func(edit func(*PortChange)) {
-			ch := d.currentPort(*i.Port)
-			edit(&ch)
-			d.setPort(ch)
-		}
-		if i.Project != "" {
-			// Compose 项目的端口写在用户自己的文件里，不替用户改，只能处理后重查或跳过。
-			if auto {
-				return errCancel
-			}
-			r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", n, total, i.Title))
-			r.Screen.Println("  Compose 项目的端口写在它的配置文件里。请停掉占用端口的程序，或在新服务器上修改 " + i.Project + " 的配置文件中的端口。")
-			c, err := r.Prompt.Choose([]string{"我已处理好，重新检查（推荐）", "暂时跳过 " + i.Project + " 项目，继续迁移其他容器", "取消迁入"})
-			if err != nil {
-				return err
-			}
-			switch c {
-			case 1:
-				return errRecheck
-			case 2:
-				skipProject("端口 " + i.Port.HostPort + " 有冲突")
-				return nil
-			}
-			return errCancel
-		}
-		if i.Kind == "host_ip" {
-			c, err := choose("改为绑定到所有地址（推荐）", "不对外开放这个端口", "取消迁入")
-			if err != nil {
-				return err
-			}
-			switch c {
-			case 1:
-				changePort(func(ch *PortChange) { ch.NewIP = "" })
-				return nil
-			case 2:
-				changePort(func(ch *PortChange) { ch.Drop = true })
-				return nil
-			}
-			return errCancel
-		}
-		if auto {
-			if i.Suggest == "" {
-				return errCancel
-			}
-			r.Screen.Warn("%s → 按 --yes 自动改用空闲端口 %s", i.Title, i.Suggest)
-			changePort(func(ch *PortChange) { ch.NewPort = i.Suggest })
-			return nil
-		}
-		first := "改用空闲端口 " + i.Suggest + "（推荐）"
-		if i.Suggest == "" {
-			first = "改用其他端口（附近没有找到空闲端口，需要手动输入）"
-		}
-		c, err := choose(first, "输入其他端口", "我先停掉占用端口的程序，然后重新检查", "不对外开放这个端口", "取消迁入")
-		if err != nil {
-			return err
-		}
-		switch c {
-		case 1, 2:
-			port := i.Suggest
-			if c == 2 || port == "" {
-				port, err = r.Prompt.Ask("新端口：", func(s string) error {
-					if n, err := strconv.Atoi(s); err != nil || n < 1 || n > 65535 {
-						return errors.New("请输入 1 到 65535 之间的端口号")
-					}
-					return nil
-				})
-				if err != nil {
-					return err
-				}
-			}
-			changePort(func(ch *PortChange) { ch.NewPort = port })
-		case 3:
-			return errRecheck
-		case 4:
-			changePort(func(ch *PortChange) { ch.Drop = true })
-		default:
-			return errCancel
-		}
-		return nil
-
+		return q.port()
 	case "existing_container", "existing_project":
-		what, keep := "容器", "保留已有的，跳过这个容器"
-		if i.Kind == "existing_project" {
-			what, keep = "项目", "保留已有的，跳过这个项目"
-		}
-		c, err := choose("替换它（推荐，迁入失败时会放回原来的）", keep, "取消迁入")
-		if err != nil {
-			return err
-		}
-		switch {
-		case c == 1 && what == "容器":
-			d.ReplaceContainers = add(d.ReplaceContainers, i.Container)
-		case c == 1:
-			d.ReplaceProjects = add(d.ReplaceProjects, i.Project)
-		case c == 2 && what == "容器":
-			d.SkipContainers = add(d.SkipContainers, i.Container)
-			d.Skipped = append(d.Skipped, Skip{Container: i.Container, Reason: "保留新服务器上已有的容器"})
-		case c == 2:
-			skipProject("保留新服务器上已有的项目")
-		default:
-			return errCancel
-		}
-		return nil
-
+		return q.existing()
 	case "skip_with_data":
-		what := "容器 " + i.Container
-		if i.Project != "" {
-			what = "Compose 项目 " + i.Project
-		}
-		c, err := choose("把"+what+"也跳过，不动保留的服务的数据（推荐）", "取消迁入")
-		if err != nil {
-			return err
-		}
-		if c != 1 {
-			return errCancel
-		}
-		if i.Project != "" {
-			skipProject("和保留的服务共用数据")
-		} else {
-			d.SkipContainers = add(d.SkipContainers, i.Container)
-			d.Skipped = append(d.Skipped, Skip{Container: i.Container, Reason: "和保留的服务共用数据"})
-		}
-		return nil
-
+		return q.sharedData()
 	case "ip_conflict", "subnet_conflict", "network_mismatch":
-		if i.Project != "" {
-			// Compose 项目的固定 IP 写在它的配置文件里，不替用户改，只能处理后重查或跳过。
-			if auto {
-				return errCancel
-			}
-			r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", n, total, i.Title))
-			c, err := r.Prompt.Choose([]string{"我已处理好，重新检查（推荐）", "暂时跳过 " + i.Project + " 项目，继续迁移其他容器", "取消迁入"})
-			if err != nil {
-				return err
-			}
-			switch c {
-			case 1:
-				return errRecheck
-			case 2:
-				reason := "固定 IP 有冲突"
-				if i.Kind != "ip_conflict" {
-					reason = "网络 " + i.Network + " 的网段有冲突，用不了配置文件里的固定 IP"
-				}
-				skipProject(reason)
-				return nil
-			}
-			return errCancel
-		}
-		first := map[string]string{
-			"ip_conflict":      "改为由 Docker 自动分配 IP（推荐）",
-			"subnet_conflict":  "让 Docker 自动选择一个不冲突的网段，网络里的容器改为自动分配 IP（推荐）",
-			"network_mismatch": "继续使用新服务器上已有的这个网络，容器改为自动分配 IP（推荐）",
-		}[i.Kind]
-		c, err := choose(first, "取消迁入")
-		if err != nil {
-			return err
-		}
-		if c != 1 {
-			return errCancel
-		}
-		switch i.Kind {
-		case "ip_conflict":
-			d.AutoIP = append(d.AutoIP, NetRef{Container: i.Container, Network: i.Network})
-		case "subnet_conflict":
-			d.AutoSubnet = add(d.AutoSubnet, i.Network)
-		default:
-			d.ReuseNetwork = add(d.ReuseNetwork, i.Network)
-		}
-		return nil
-
+		return q.network()
 	case "volume_mismatch":
-		if auto {
-			return errCancel
-		}
-		r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", n, total, i.Title))
-		c, err := r.Prompt.Choose([]string{"取消迁入，我先处理这个数据卷（推荐）", "保留已有的数据卷，不写入迁移过来的数据"})
-		if err != nil {
-			return err
-		}
-		if c != 2 {
-			return errCancel
-		}
-		d.KeepVolumes = add(d.KeepVolumes, i.Volume)
-		return nil
-
+		return q.volume()
 	case "digest":
-		c, err := choose("改用迁移包里的镜像（推荐：内容和旧服务器完全相同，只是配置里的镜像名去掉 @sha256 部分）", "取消迁入")
-		if err != nil {
-			return err
-		}
-		if c != 1 {
-			return errCancel
-		}
-		d.BundleImages = add(d.BundleImages, i.Image)
-		return nil
-
+		return q.digest()
 	case "disk_base":
-		if auto {
-			return errCancel
-		}
-		r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", n, total, i.Title))
-		c, err := r.Prompt.Choose([]string{"我先清理磁盘，然后重新检查（推荐）", "换一个目录存放下载文件", "取消迁入"})
+		return q.diskBase()
+	default: // disk_docker、disk_bind 等：只能清理后重查
+		return q.recheckOnly()
+	}
+}
+
+// question 是检查发现的一个问题（共 total 个里的第 n 个），按用户的选择记进 d。
+type question struct {
+	r        *Runner
+	i        Issue
+	d        *Decisions
+	n, total int
+	auto     bool // 按 --yes 自动采用推荐做法
+}
+
+func (q *question) show() {
+	q.r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", q.n, q.total, q.i.Title))
+}
+
+// choose 让用户从 options 里选一个，返回第几个（从 1 开始）。auto 时直接选第一个，也就是推荐的做法。
+func (q *question) choose(options ...string) (int, error) {
+	if q.auto {
+		q.r.Screen.Warn("%s → 按 --yes 自动选择：%s", q.i.Title, strings.TrimSuffix(options[0], "（推荐）"))
+		return 1, nil
+	}
+	q.show()
+	return q.r.Prompt.Choose(options)
+}
+
+// manual 用在没法自动处理的问题上：auto 时取消迁入，否则和 choose 一样让用户选。note 是选之前的说明，
+// 可以为空。
+func (q *question) manual(note string, options ...string) (int, error) {
+	if q.auto {
+		return 0, errCancel
+	}
+	q.show()
+	if note != "" {
+		q.r.Screen.Println("  " + note)
+	}
+	return q.r.Prompt.Choose(options)
+}
+
+func (q *question) skipProject(reason string) {
+	q.d.SkipProjects = add(q.d.SkipProjects, q.i.Project)
+	q.d.Skipped = append(q.d.Skipped, Skip{Project: q.i.Project, Reason: reason})
+}
+
+func (q *question) skipContainer(reason string) {
+	q.d.SkipContainers = add(q.d.SkipContainers, q.i.Container)
+	q.d.Skipped = append(q.d.Skipped, Skip{Container: q.i.Container, Reason: reason})
+}
+
+// fixOrSkipProject 处理写在 Compose 项目配置文件里的东西（端口、固定 IP）：配置文件是用户自己的，不替用户
+// 改，只能让用户处理后重新检查，或者跳过这个项目（reason 是跳过的原因）。
+func (q *question) fixOrSkipProject(note, reason string) error {
+	c, err := q.manual(note, "我已处理好，重新检查（推荐）", "暂时跳过 "+q.i.Project+" 项目，继续迁移其他容器", "取消迁入")
+	if err != nil {
+		return err
+	}
+	switch c {
+	case 1:
+		return errRecheck
+	case 2:
+		q.skipProject(reason)
+		return nil
+	}
+	return errCancel
+}
+
+// port 处理端口被占用（port）和端口绑定的地址新服务器上没有（host_ip）。
+func (q *question) port() error {
+	i := q.i
+	if i.Project != "" {
+		return q.fixOrSkipProject("Compose 项目的端口写在它的配置文件里。请停掉占用端口的程序，或在新服务器上修改 "+i.Project+" 的配置文件中的端口。",
+			"端口 "+i.Port.HostPort+" 有冲突")
+	}
+	// 只改这次选的那一项：同一个端口之前做过的其他调整（例如改绑地址）要保留。
+	changePort := func(edit func(*PortChange)) {
+		ch := q.d.currentPort(*i.Port)
+		edit(&ch)
+		q.d.setPort(ch)
+	}
+	if i.Kind == "host_ip" {
+		c, err := q.choose("改为绑定到所有地址（推荐）", "不对外开放这个端口", "取消迁入")
 		if err != nil {
 			return err
 		}
 		switch c {
 		case 1:
-			return errRecheck
+			changePort(func(ch *PortChange) { ch.NewIP = "" })
+			return nil
 		case 2:
-			dir, err := r.Prompt.Ask("目录（例如 /data/dockhop）：", func(s string) error {
-				if !filepath.IsAbs(strings.TrimSpace(s)) {
-					return errors.New("请输入以 / 开头的完整路径")
+			changePort(func(ch *PortChange) { ch.Drop = true })
+			return nil
+		}
+		return errCancel
+	}
+	if q.auto {
+		if i.Suggest == "" {
+			return errCancel
+		}
+		q.r.Screen.Warn("%s → 按 --yes 自动改用空闲端口 %s", i.Title, i.Suggest)
+		changePort(func(ch *PortChange) { ch.NewPort = i.Suggest })
+		return nil
+	}
+	first := "改用空闲端口 " + i.Suggest + "（推荐）"
+	if i.Suggest == "" {
+		first = "改用其他端口（附近没有找到空闲端口，需要手动输入）"
+	}
+	c, err := q.choose(first, "输入其他端口", "我先停掉占用端口的程序，然后重新检查", "不对外开放这个端口", "取消迁入")
+	if err != nil {
+		return err
+	}
+	switch c {
+	case 1, 2:
+		port := i.Suggest
+		if c == 2 || port == "" {
+			port, err = q.r.Prompt.Ask("新端口：", func(s string) error {
+				if n, err := strconv.Atoi(s); err != nil || n < 1 || n > 65535 {
+					return errors.New("请输入 1 到 65535 之间的端口号")
 				}
 				return nil
 			})
 			if err != nil {
 				return err
 			}
-			d.Workdir = filepath.Clean(strings.TrimSpace(dir))
-			return errRecheck
 		}
+		changePort(func(ch *PortChange) { ch.NewPort = port })
+	case 3:
+		return errRecheck
+	case 4:
+		changePort(func(ch *PortChange) { ch.Drop = true })
+	default:
 		return errCancel
+	}
+	return nil
+}
 
-	default: // disk_docker、disk_bind 等：只能清理后重查
-		if auto {
-			return errCancel
+// existing 处理新服务器上已有的同名容器、Compose 项目：替换它，或者保留它、跳过迁移过来的。
+func (q *question) existing() error {
+	project := q.i.Kind == "existing_project"
+	keep := "保留已有的，跳过这个容器"
+	if project {
+		keep = "保留已有的，跳过这个项目"
+	}
+	c, err := q.choose("替换它（推荐，迁入失败时会放回原来的）", keep, "取消迁入")
+	if err != nil {
+		return err
+	}
+	switch {
+	case c == 1 && !project:
+		q.d.ReplaceContainers = add(q.d.ReplaceContainers, q.i.Container)
+	case c == 1:
+		q.d.ReplaceProjects = add(q.d.ReplaceProjects, q.i.Project)
+	case c == 2 && !project:
+		q.skipContainer("保留新服务器上已有的容器")
+	case c == 2:
+		q.skipProject("保留新服务器上已有的项目")
+	default:
+		return errCancel
+	}
+	return nil
+}
+
+// sharedData 处理要迁入的容器和保留下来的已有服务共用数据（skip_with_data）：只能把它也跳过。
+func (q *question) sharedData() error {
+	what := "容器 " + q.i.Container
+	if q.i.Project != "" {
+		what = "Compose 项目 " + q.i.Project
+	}
+	c, err := q.choose("把"+what+"也跳过，不动保留的服务的数据（推荐）", "取消迁入")
+	if err != nil {
+		return err
+	}
+	if c != 1 {
+		return errCancel
+	}
+	if q.i.Project != "" {
+		q.skipProject("和保留的服务共用数据")
+	} else {
+		q.skipContainer("和保留的服务共用数据")
+	}
+	return nil
+}
+
+// network 处理固定 IP 冲突（ip_conflict）、网段冲突（subnet_conflict）和新服务器上已有的同名网络配置
+// 不同（network_mismatch）。
+func (q *question) network() error {
+	i := q.i
+	if i.Project != "" {
+		reason := "固定 IP 有冲突"
+		if i.Kind != "ip_conflict" {
+			reason = "网络 " + i.Network + " 的网段有冲突，用不了配置文件里的固定 IP"
 		}
-		r.Screen.Println(fmt.Sprintf("\n问题 %d/%d：%s", n, total, i.Title))
-		c, err := r.Prompt.Choose([]string{"我先处理，然后重新检查（推荐）", "取消迁入"})
+		return q.fixOrSkipProject("", reason)
+	}
+	first := map[string]string{
+		"ip_conflict":      "改为由 Docker 自动分配 IP（推荐）",
+		"subnet_conflict":  "让 Docker 自动选择一个不冲突的网段，网络里的容器改为自动分配 IP（推荐）",
+		"network_mismatch": "继续使用新服务器上已有的这个网络，容器改为自动分配 IP（推荐）",
+	}[i.Kind]
+	c, err := q.choose(first, "取消迁入")
+	if err != nil {
+		return err
+	}
+	if c != 1 {
+		return errCancel
+	}
+	switch i.Kind {
+	case "ip_conflict":
+		q.d.AutoIP = append(q.d.AutoIP, NetRef{Container: i.Container, Network: i.Network})
+	case "subnet_conflict":
+		q.d.AutoSubnet = add(q.d.AutoSubnet, i.Network)
+	default:
+		q.d.ReuseNetwork = add(q.d.ReuseNetwork, i.Network)
+	}
+	return nil
+}
+
+// volume 处理新服务器上已有的同名数据卷存储方式不同（volume_mismatch）。
+func (q *question) volume() error {
+	c, err := q.manual("", "取消迁入，我先处理这个数据卷（推荐）", "保留已有的数据卷，不写入迁移过来的数据")
+	if err != nil {
+		return err
+	}
+	if c != 2 {
+		return errCancel
+	}
+	q.d.KeepVolumes = add(q.d.KeepVolumes, q.i.Volume)
+	return nil
+}
+
+// digest 处理按摘要固定了版本、新服务器又没法按摘要拉到的镜像：改用迁移包里的。
+func (q *question) digest() error {
+	c, err := q.choose("改用迁移包里的镜像（推荐：内容和旧服务器完全相同，只是配置里的镜像名去掉 @sha256 部分）", "取消迁入")
+	if err != nil {
+		return err
+	}
+	if c != 1 {
+		return errCancel
+	}
+	q.d.BundleImages = add(q.d.BundleImages, q.i.Image)
+	return nil
+}
+
+// diskBase 处理存放下载文件的目录空间不够（disk_base）：清理后重新检查，或者换一个目录。
+func (q *question) diskBase() error {
+	c, err := q.manual("", "我先清理磁盘，然后重新检查（推荐）", "换一个目录存放下载文件", "取消迁入")
+	if err != nil {
+		return err
+	}
+	switch c {
+	case 1:
+		return errRecheck
+	case 2:
+		dir, err := q.r.Prompt.Ask("目录（例如 /data/dockhop）：", func(s string) error {
+			if !filepath.IsAbs(strings.TrimSpace(s)) {
+				return errors.New("请输入以 / 开头的完整路径")
+			}
+			return nil
+		})
 		if err != nil {
 			return err
 		}
-		if c == 1 {
-			return errRecheck
-		}
-		return errCancel
+		q.d.Workdir = filepath.Clean(strings.TrimSpace(dir))
+		return errRecheck
 	}
+	return errCancel
+}
+
+// recheckOnly 处理只能由用户处理之后重新检查的问题。
+func (q *question) recheckOnly() error {
+	c, err := q.manual("", "我先处理，然后重新检查（推荐）", "取消迁入")
+	if err != nil {
+		return err
+	}
+	if c == 1 {
+		return errRecheck
+	}
+	return errCancel
 }
 
 func (d *Decisions) setPort(p PortChange) {
