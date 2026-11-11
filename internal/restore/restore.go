@@ -58,7 +58,8 @@ type Deps struct {
 	Home     string
 	Version  string
 	Getenv   func(string) string
-	// MountPoint 判断一个目录本身是不是挂载点（见 host.IsMountPoint）：挂载点只能原地换内容。
+	// MountPoint 判断一个目录本身是不是挂载点：挂载点只能原地换内容。为空时用 host.IsMountPoint，
+	// 按这台机器的实际情况判断；测试时换成假的。
 	MountPoint func(path string) (bool, error)
 	// Succeeded 在迁入成功（已经提交，不会再回滚）时调用一次，Failed 在迁入失败（包括只迁入了
 	// 一部分）时调用一次，都可以为空；还没改动就取消、按 Ctrl+C 中断时都不调用（见 ending）。
@@ -119,8 +120,7 @@ type run struct {
 // Run 执行迁入。任何一步失败或被中断，都按事务日志回滚；不管结果如何，都会删掉临时文件和
 // 临时容器，最后打印结果摘要。
 func Run(ctx context.Context, d Deps, o Options) error {
-	r := &run{Deps: d, opts: o, started: time.Now(), imageAs: map[string]string{}, anonVolumes: map[string]bundle.Volume{},
-		rbDir: filepath.Join(d.Home, "rollback", "current")}
+	r := newRun(d, o)
 	lock, err := host.TryLock(lockPath(d.Home))
 	if err != nil {
 		d.Screen.Problem(err.Error(), "")
@@ -143,6 +143,15 @@ func Run(ctx context.Context, d Deps, o Options) error {
 	}
 	r.cleanup(err == nil)
 	return r.report(ctx, end)
+}
+
+// newRun 按 d、o 准备一次迁入，d 里为空的 MountPoint 补上默认的。
+func newRun(d Deps, o Options) *run {
+	if d.MountPoint == nil {
+		d.MountPoint = host.IsMountPoint
+	}
+	return &run{Deps: d, opts: o, started: time.Now(), imageAs: map[string]string{}, anonVolumes: map[string]bundle.Volume{},
+		rbDir: filepath.Join(d.Home, "rollback", "current")}
 }
 
 // cleanup 收尾：关掉事务日志，删掉解密出来的数据（成功时连下载的文件一起）、临时容器和

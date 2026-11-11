@@ -16,7 +16,6 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/backup"
 	"github.com/lx969788249/dockhop/internal/crypto"
-	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/restore"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -278,7 +277,7 @@ func runIn(env *Env, opts InOptions) error {
 	wait := func() {} // 迁入成功、失败时发出的计数，退出前等它结束
 	err = restore.Run(env.Context, restore.Deps{
 		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
-		Home: t.home, Version: env.Version, Getenv: env.Getenv, MountPoint: host.IsMountPoint,
+		Home: t.home, Version: env.Version, Getenv: env.Getenv,
 		Succeeded: func() { wait = countSucceeded(env) },
 		Failed:    func() { wait = countFailed(env) },
 	}, restore.Options{Link: link, Yes: opts.Yes, Existing: opts.Existing, KeepSucceeded: opts.KeepSucceeded})

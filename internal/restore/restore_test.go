@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -186,5 +187,14 @@ func TestRestoreKeepsRunningExportHelper(t *testing.T) {
 		Getenv: func(string) string { return "" }}, Options{Link: link})
 	if len(deleted) > 0 {
 		t.Errorf("删除了 %v", deleted)
+	}
+}
+
+// 不经过命令行调用迁入时可以不给 MountPoint，按这台机器的实际情况判断（见 host.IsMountPoint），
+// 不能在换目录时崩溃（问题表 D14）。挂载信息只有 Linux 上有，别的系统上只看不崩溃。
+func TestRunDefaultsMountPoint(t *testing.T) {
+	r := newRun(Deps{Home: t.TempDir()}, Options{})
+	if _, err := r.newDirSwap(t.TempDir(), true); err != nil && runtime.GOOS == "linux" {
+		t.Fatal(err)
 	}
 }
