@@ -188,7 +188,7 @@ func (r *run) startUnit(ctx context.Context, u *unit, n *int, total int) error {
 	it := u.items[0]
 	*n++
 	r.Screen.Count("启动容器", *n, total, it.m.Name)
-	if !it.running() {
+	if !it.starts() {
 		return nil
 	}
 	if err := r.Docker.StartContainer(ctx, it.newID); err != nil {
@@ -227,14 +227,14 @@ func (r *run) waitUnit(ctx context.Context, u *unit) error {
 
 // readyItem 等一个原来在运行的容器就绪；原来暂停着的，就绪后再暂停。
 func (r *run) readyItem(ctx context.Context, it *citem) error {
-	if !it.running() || it.ready {
+	if !it.starts() || it.ready {
 		return nil
 	}
 	if err := r.waitReady(ctx, it); err != nil {
 		return err
 	}
 	it.ready = true
-	if it.c.State.Paused {
+	if it.want() == wantPaused {
 		if err := r.Docker.PauseContainer(ctx, it.newID); err != nil {
 			return fmt.Errorf("没能把容器 %s 恢复成暂停状态：%v", it.m.Name, err)
 		}
@@ -249,7 +249,7 @@ func (r *run) readyItem(ctx context.Context, it *citem) error {
 func (r *run) startProject(ctx context.Context, u *unit) error {
 	allRunning := true
 	for _, it := range u.items {
-		allRunning = allRunning && it.running()
+		allRunning = allRunning && it.starts()
 	}
 	if allRunning {
 		if len(u.services) == 0 {
@@ -267,7 +267,7 @@ func (r *run) startProject(ctx context.Context, u *unit) error {
 	for _, svc := range u.serviceOrder() {
 		var up []*citem
 		for _, it := range replicas(u.items, svc) {
-			if it.running() {
+			if it.starts() {
 				up = append(up, it)
 			}
 		}

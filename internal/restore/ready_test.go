@@ -145,7 +145,8 @@ func TestConfirmReady(t *testing.T) {
 	}{
 		{"又停了", []string{`{"Id":"new-app","Name":"/app","State":{"Status":"exited","ExitCode":1}}`},
 			"容器 app 就绪之后又停了（退出码 1），最后的输出：panic: boom"},
-		{"一次性任务正常做完了", []string{`{"Id":"new-app","Name":"/app","State":{"Status":"exited","ExitCode":0}}`}, ""},
+		{"自己做完退出了", []string{`{"Id":"new-app","Name":"/app","State":{"Status":"exited","ExitCode":0}}`},
+			"容器 app 就绪之后又停了（退出码 0）"},
 		{"重启了一下又好了", []string{restarting, running}, ""},
 		{"一直在重启", []string{restarting}, "容器 app 没能稳定运行"},
 		{"不健康了一下又好了", []string{`{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true,"Health":{"Status":"unhealthy"}},` + check + `}`,
@@ -173,7 +174,7 @@ func TestPhaseOf(t *testing.T) {
 		state string
 		want  phase
 	}{
-		{`{"Status":"exited","ExitCode":0}`, phaseDone},
+		{`{"Status":"exited","ExitCode":0}`, phaseStopped},
 		{`{"Status":"exited","ExitCode":1}`, phaseStopped},
 		{`{"Status":"dead"}`, phaseStopped},
 		{`{"Status":"running"}`, phaseUp},
@@ -221,11 +222,35 @@ func TestConfirmReadyRetriesInspect(t *testing.T) {
 	}
 }
 
-// 等待就绪时，一次性任务正常做完了（退出码 0，Docker 也没有重启它）算正常；退出码不是 0 的照样失败。
-func TestWaitReadyFinishedJob(t *testing.T) {
+// 迁过去的容器要和旧服务器上一样：原来在运行的，迁完自己退出了，哪怕退出码是 0 也算没成功（以前当成
+// 一次性任务正常做完，迁入照常提交，结果却说服务在运行）。建议里说明一次性任务怎么办。
+func TestWaitReadyExitZeroFails(t *testing.T) {
 	_, _, r := fakeContainer(t, "", `{"Id":"new-app","Name":"/app","State":{"Status":"exited","ExitCode":0}}`)
-	if err := r.waitReady(context.Background(), &citem{m: bundle.Container{Name: "app"}, newID: "new-app", startedAt: time.Now()}); err != nil {
-		t.Fatalf("正常做完的一次性任务应算就绪：%v", err)
+	err := r.waitReady(context.Background(), &citem{m: bundle.Container{Name: "app"}, newID: "new-app", startedAt: time.Now()})
+	if err == nil || !strings.Contains(err.Error(), "退出码 0") || !strings.Contains(groupHint(err), "一次性任务") {
+		t.Fatalf("原来在运行的容器自己退出了应算失败，并说明一次性任务怎么办：%v %q", err, groupHint(err))
+	}
+}
+
+// 迁过去之后容器应该是什么状态，和旧服务器上一样：启动、等它就绪、提交前复查、结果摘要都按这一个判断。
+func TestWant(t *testing.T) {
+	for _, c := range []struct {
+		state string
+		want  want
+	}{
+		{`{"Status":"running","Running":true}`, wantRunning},
+		{`{"Status":"restarting","Running":true,"Restarting":true}`, wantRunning},
+		{`{"Status":"paused","Running":true,"Paused":true}`, wantPaused},
+		{`{"Status":"exited","ExitCode":0}`, wantStopped},
+		{`{"Status":"created"}`, wantStopped},
+	} {
+		var src docker.Container
+		if err := json.Unmarshal([]byte(`{"State":`+c.state+`}`), &src); err != nil {
+			t.Fatal(err)
+		}
+		if got := (&citem{c: &src}).want(); got != c.want {
+			t.Errorf("%s：%d，应为 %d", c.state, got, c.want)
+		}
 	}
 }
 

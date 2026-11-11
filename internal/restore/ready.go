@@ -52,15 +52,12 @@ func (r *run) waitReady(ctx context.Context, it *citem) error {
 		w.see(c)
 		elapsed := time.Since(since)
 		switch p := phaseOf(c); {
-		case p == phaseDone:
-			r.Log.Printf("容器 %s 正常做完退出了（退出码 0），Docker 也没有重启它：是一次性的任务，算正常", name)
-			return nil
 		case p == phaseStopped:
 			how := "启动后退出了"
 			if elapsed < 10*time.Second {
 				how = "启动后马上退出了"
 			}
-			return r.notReady(ctx, it, fmt.Sprintf("容器 %s %s（%s）", name, how, exitInfo(c)))
+			return r.notReady(ctx, it, fmt.Sprintf("容器 %s %s（%s）", name, how, exitInfo(c)), exitedHint(c))
 		case hasCheck && w.status == "healthy":
 			r.Log.Printf("容器 %s 就绪：健康检查通过（启动后 %s）", name, ui.Elapsed(elapsed))
 			return nil
@@ -68,9 +65,9 @@ func (r *run) waitReady(ctx context.Context, it *citem) error {
 			r.Log.Printf("容器 %s 就绪：已经稳定运行 %s", name, ui.Elapsed(w.upFor(c)))
 			return nil
 		case elapsed >= limit && hasCheck:
-			return r.notReady(ctx, it, fmt.Sprintf("容器 %s 的健康检查没有通过（等了 %s，%s）", name, ui.Elapsed(limit), w.summary()))
+			return r.notReady(ctx, it, fmt.Sprintf("容器 %s 的健康检查没有通过（等了 %s，%s）", name, ui.Elapsed(limit), w.summary()), "")
 		case elapsed >= limit:
-			return r.notReady(ctx, it, fmt.Sprintf("容器 %s 没能稳定运行（等了 %s，%s）", name, ui.Elapsed(limit), w.summary()))
+			return r.notReady(ctx, it, fmt.Sprintf("容器 %s 没能稳定运行（等了 %s，%s）", name, ui.Elapsed(limit), w.summary()), "")
 		}
 		r.Screen.Note(fmt.Sprintf("%s %s · %s · %d/%d 秒", name, what, statusText(w.status), int(elapsed.Seconds()), int(limit.Seconds())))
 		if err := sleep(ctx, time.Second); err != nil {
@@ -247,7 +244,7 @@ func (r *run) confirmReady(ctx context.Context) error {
 			if g.reason != "" {
 				break
 			}
-			if !it.running() {
+			if !it.starts() {
 				continue
 			}
 			c, err := r.inspectRetry(ctx, it.newID)
@@ -257,9 +254,9 @@ func (r *run) confirmReady(ctx context.Context) error {
 			var fail error
 			switch {
 			case err != nil:
-				fail = r.notReady(ctx, it, fmt.Sprintf("容器 %s 就绪之后读不到了：%v", it.m.Name, err))
+				fail = r.notReady(ctx, it, fmt.Sprintf("容器 %s 就绪之后读不到了：%v", it.m.Name, err), "")
 			case phaseOf(c) == phaseStopped:
-				fail = r.notReady(ctx, it, "容器 "+it.m.Name+" 就绪之后又停了（"+exitInfo(c)+"）")
+				fail = r.notReady(ctx, it, "容器 "+it.m.Name+" 就绪之后又停了（"+exitInfo(c)+"）", exitedHint(c))
 			case phaseOf(c) == phaseWaiting:
 				// 在重启、不健康：和等它就绪时一样接着等，从现在重新算时间。可能只是重启了一下。
 				it.startedAt = time.Time{}
@@ -296,10 +293,7 @@ type phase int
 const (
 	// phaseUp：在运行（健康检查没判它不健康），或者暂停着。
 	phaseUp phase = iota + 1
-	// phaseDone：自己正常做完退出了（退出码 0），Docker 也没有重启它（要重启的，状态会是
-	// “正在重启”）：一次性的任务，算正常。
-	phaseDone
-	// phaseStopped：退出了（退出码不是 0），或者坏了。
+	// phaseStopped：退出了（不管退出码是多少：原来在运行的，迁完自己退出了就是没成功，见 citem.want），或者坏了。
 	phaseStopped
 	// phaseWaiting：在重启、被判不健康、刚创建，要接着等。
 	phaseWaiting
@@ -307,8 +301,6 @@ const (
 
 func phaseOf(c *docker.Container) phase {
 	switch s := c.State.Status; {
-	case s == "exited" && c.State.ExitCode == 0:
-		return phaseDone
 	case s == "exited" || s == "dead":
 		return phaseStopped
 	case s == "paused", s == "running" && (c.State.Health == nil || c.State.Health.Status != "unhealthy"):
@@ -319,16 +311,28 @@ func phaseOf(c *docker.Container) phase {
 
 // notReady 是容器没能就绪的报错。容器最后的输出写进日志，报错里接上最能说明问题的一行；
 // 按名字找不到别的服务时，在建议里说明可能的原因。报错会显示在屏幕和结果里，所以先隐藏秘密。
-func (r *run) notReady(ctx context.Context, it *citem, reason string) error {
+func (r *run) notReady(ctx context.Context, it *citem, reason, hint string) error {
 	logs := r.Redactor.Redact(r.Docker.ContainerLogs(ctx, it.newID, 100))
 	if logs == "" {
-		return &startError{reason, ""}
+		return &startError{reason, hint}
 	}
 	r.Log.Printf("容器 %s 最后的输出：\n%s", it.m.Name, logs)
 	if l := keyLine(logs); l != "" {
 		reason += "，最后的输出：" + l
 	}
-	return &startError{reason, unresolvedHint(it.m.Name, logs)}
+	if hint == "" {
+		hint = unresolvedHint(it.m.Name, logs)
+	}
+	return &startError{reason, hint}
+}
+
+// exitedHint 是原来在运行的容器迁过来之后自己退出了时的建议：退出码是 0 的，多半是做完就退出的一次性任务。
+func exitedHint(c *docker.Container) string {
+	if c.State.ExitCode != 0 || c.State.OOMKilled {
+		return ""
+	}
+	return "它在旧服务器上一直在运行，迁过来却自己做完退出了。如果它本来就是做完就退出的一次性任务，" +
+		"等它在旧服务器上做完、停下之后再迁移（停着的容器迁过去照旧停着，不会启动）"
 }
 
 // keyLine 从容器的输出里挑出最能说明问题的一行：从后往前第一行带着出错字样的（error、

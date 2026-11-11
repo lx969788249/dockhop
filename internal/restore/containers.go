@@ -38,9 +38,29 @@ type citem struct {
 
 func (it *citem) name() string { return it.m.Name }
 
-func (it *citem) running() bool {
-	return it.c.State.Running || it.c.State.Paused || it.c.State.Status == "restarting"
+// want 是迁过去之后容器应该是什么状态（见 citem.want）。
+type want int
+
+const (
+	wantRunning want = iota + 1
+	wantPaused
+	wantStopped
+)
+
+// want 是迁过去之后这个容器应该是什么状态：和旧服务器上一样，一直在重启的也算在运行。启动哪些、等它
+// 就绪、提交前复查、结果摘要都按它判断：原来在运行的，迁完自己退出了，哪怕退出码是 0 也算没成功。
+func (it *citem) want() want {
+	switch {
+	case it.c.State.Paused:
+		return wantPaused
+	case it.c.State.Running || it.c.State.Status == "restarting":
+		return wantRunning
+	}
+	return wantStopped
 }
+
+// starts 表示迁过去要启动它（暂停着的启动、就绪之后再暂停）。
+func (it *citem) starts() bool { return it.want() != wantStopped }
 
 // 容器里没挂载出来的改动分两部分恢复：删除的文件做进镜像（Docker 没有删除容器里文件的接口，
 // 只能在临时容器里删掉再 commit，见 imageWithout）；新增和修改的文件在容器创建之后、启动之前

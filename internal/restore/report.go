@@ -19,10 +19,10 @@ import (
 func (r *run) countText() string {
 	running, paused, stopped := 0, 0, 0
 	for _, it := range r.items {
-		switch {
-		case it.c.State.Paused:
+		switch it.want() {
+		case wantPaused:
 			paused++
-		case it.running():
+		case wantRunning:
 			running++
 		default:
 			stopped++
