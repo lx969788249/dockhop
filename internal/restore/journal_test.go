@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -75,6 +76,35 @@ func TestRewriteJournal(t *testing.T) {
 }
 
 // 日志中间有一条记录损坏时，不知道漏掉的是哪一处改动，不能当它不存在。
+// 原地换内容的目录顶层东西极多时，记下它们名字的那一行可能很长：一行多长都要读得出来，不能因为超过
+// 某个长度就把整份日志当成损坏（问题表 D13）。
+func TestJournalLongLine(t *testing.T) {
+	if testing.Short() {
+		t.Skip("要写一行 64MB 以上的日志")
+	}
+	dir := filepath.Join(t.TempDir(), "rb")
+	j, err := openJournal(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 300000)
+	for i := range names {
+		names[i] = fmt.Sprintf("%0250d", i) // 合计 75MB
+	}
+	disk := filepath.Join(dir, "disk")
+	if err := j.add(Entry{Op: opContents, Path: disk, Backup: filepath.Join(disk, ".dockhop-old-x"), Meta: &FileMeta{}, Names: names}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.add(Entry{Op: opVolume, Name: "data"}); err != nil {
+		t.Fatal(err)
+	}
+	j.close()
+	entries, err := readJournal(dir)
+	if err != nil || len(entries) != 3 || entries[1].Op != opContents || len(entries[1].Names) != len(names) || entries[2].Op != opVolume {
+		t.Fatalf("很长的一行应读得出来：%d 条 %v", len(entries), err)
+	}
+}
+
 func TestJournalDamagedMiddleLine(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "rb")
 	j, err := openJournal(dir)

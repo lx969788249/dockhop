@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -248,14 +249,21 @@ func readJournal(dir string) ([]Entry, error) {
 	defer f.Close()
 	var out []Entry
 	bad := 0 // 读不懂的那一行的行号
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 64<<20)
-	for n := 1; sc.Scan(); n++ {
+	rd := bufio.NewReader(f)
+	for n := 1; ; n++ {
+		// 一行多长都读完：原地换内容的目录顶层东西极多时，记下它们名字的那一行可能很长。
+		line, err := rd.ReadBytes('\n')
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		if len(line) == 0 { // 读完了
+			return out, nil
+		}
 		if bad > 0 {
 			return nil, fmt.Errorf("%w（第 %d 行）", ErrJournalDamaged, bad)
 		}
 		var e Entry
-		if err := json.Unmarshal(sc.Bytes(), &e); err != nil || e.Op == "" {
+		if err := json.Unmarshal(line, &e); err != nil || e.Op == "" {
 			bad = n
 			continue
 		}
@@ -264,10 +272,6 @@ func readJournal(dir string) ([]Entry, error) {
 		}
 		out = append(out, upgrade(e))
 	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 // upgrade 把以前的版本写的记录换成现在的写法。读旧日志只在这里处理：v1.2.7 及以前把原地换内容
