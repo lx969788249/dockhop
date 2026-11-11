@@ -183,6 +183,14 @@ func (r *run) buildGroups(writers []writer) {
 	for _, w := range writers {
 		k := "w:" + w.summary.Name()
 		uf.find(k)
+		// 借用别的要停下的容器的网络、进程空间的，和它在同一组：放回它之前，借用的不能先启动。
+		for _, ref := range spec.Dependencies(w.full) {
+			for _, o := range writers {
+				if refersTo(ref, o) {
+					uf.union(k, "w:"+o.summary.Name())
+				}
+			}
+		}
 		for _, m := range w.full.Mounts {
 			switch {
 			case m.Type == "volume" && vols[m.Name]:

@@ -165,7 +165,7 @@ func (r *run) findWriters(ctx context.Context, existing []docker.ContainerSummar
 	for _, n := range strings.Split(r.Getenv("DOCKHOP_TEST_IGNORE"), ",") {
 		ignore[strings.TrimSpace(n)] = true
 	}
-	var writers []writer
+	var writers, others []writer
 	for _, c := range existing {
 		name := c.Name()
 		kept := match.Kept(name)
@@ -182,6 +182,7 @@ func (r *run) findWriters(ctx context.Context, existing []docker.ContainerSummar
 		case err != nil:
 			return nil, s.StepFailed("读不到新服务器上的容器 "+name+"，没法确认它有没有在用要写入的数据（还没有改动已有的服务和数据）", err.Error(), "确认 Docker 运行正常后重新运行")
 		case !spec.UsesData(full, volumes, paths):
+			others = append(others, writer{summary: c, full: full})
 			continue
 		case kept:
 			return nil, s.StepFailed("保留的已有容器 "+name+" 和要迁入的容器共用数据，迁入会覆盖它正在用的数据（还没有改动已有的服务和数据）", "",
@@ -189,7 +190,40 @@ func (r *run) findWriters(ctx context.Context, existing []docker.ContainerSummar
 		}
 		writers = append(writers, writer{summary: c, full: full})
 	}
-	return writers, nil
+	return withBorrowers(writers, others), nil
+}
+
+// withBorrowers 把借用要停下的容器的网络、进程空间的已有容器（例如 VPN 的边车）也加进来：被借用的一停，
+// 它们就断了，重新启动后也不会自己接回去（迁出时一样）。借用的排在被借用的前面：先停借用的，恢复时
+// 倒过来、后启动。
+func withBorrowers(writers, others []writer) []writer {
+	stopping := map[string]bool{}
+	for _, w := range writers {
+		stopping[w.full.ID] = true
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, o := range others {
+			if stopping[o.full.ID] {
+				continue
+			}
+			for _, ref := range spec.Dependencies(o.full) {
+				if slices.ContainsFunc(writers, func(w writer) bool { return refersTo(ref, w) }) {
+					writers = append([]writer{o}, writers...)
+					stopping[o.full.ID] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+	return writers
+}
+
+// refersTo 表示容器配置里写的 ref（名字、ID 或者 ID 的前 12 位以上）指的是不是 w。
+func refersTo(ref string, w writer) bool {
+	ref = strings.TrimPrefix(ref, "/")
+	return ref == w.summary.Name() || ref == w.full.ID || len(ref) >= 12 && strings.HasPrefix(w.full.ID, ref)
 }
 
 // scene 是新服务器上和这次迁入有关的已有容器：要替换的（名字、ID），要临时停下的、和迁入的

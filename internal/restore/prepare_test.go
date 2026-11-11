@@ -122,3 +122,32 @@ func TestBackupProjectKeepsFixedMAC(t *testing.T) {
 		}
 	}
 }
+
+// 和迁入的数据共用的已有容器要临时停下；借用它的网络、进程空间的已有容器（例如 VPN 的边车）也要一起停下：
+// 被借用的一停，它们就断了，重新启动后也不会自己接回去（迁出时一样）。先停借用的、再停被借用的，恢复时
+// 倒过来；不相干的不停。
+func TestPrepareStopsBorrowersFirst(t *testing.T) {
+	failed, stopped := prepareWith(t, preflight.Decisions{}, func(w http.ResponseWriter, p, shared string) bool {
+		switch p {
+		case "/containers/json":
+			io.WriteString(w, `[{"Id":"db-id","Names":["/db"],"State":"running"},{"Id":"vpn-id","Names":["/vpn"],"State":"running"},`+
+				`{"Id":"lone-id","Names":["/lone"],"State":"running"}]`)
+		case "/containers/db-id/json":
+			io.WriteString(w, `{"Id":"db-id","Name":"/db","State":{"Status":"running","Running":true},"HostConfig":{},`+
+				`"Mounts":[{"Type":"bind","Source":"`+shared+`","RW":true}]}`)
+		case "/containers/vpn-id/json":
+			io.WriteString(w, `{"Id":"vpn-id","Name":"/vpn","State":{"Status":"running","Running":true},"HostConfig":{"NetworkMode":"container:db-id"}}`)
+		case "/containers/lone-id/json":
+			io.WriteString(w, `{"Id":"lone-id","Name":"/lone","State":{"Status":"running","Running":true},"HostConfig":{}}`)
+		default:
+			return false
+		}
+		return true
+	})
+	if failed != "" {
+		t.Fatal(failed)
+	}
+	if got := strings.Join(stopped, " "); got != "/containers/vpn-id/stop /containers/db-id/stop" {
+		t.Errorf("停下的：%s，应先停借用网络的 vpn、再停共用数据的 db，不相干的 lone 不停", got)
+	}
+}
