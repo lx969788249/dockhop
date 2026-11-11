@@ -2,7 +2,6 @@ package bundle
 
 import (
 	"archive/tar"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +11,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/lx969788249/dockhop/internal/host"
 )
 
 // 迁移包里卷、目录、Compose 项目的数据都是 tar。迁入时先完整检查一遍（ScanArchive），
@@ -247,9 +248,6 @@ func applyMeta(p string, h *tar.Header, root bool) error {
 			return err
 		}
 	}
-	ts := []unix.Timespec{unix.NsecToTimespec(h.ModTime.UnixNano()), unix.NsecToTimespec(h.ModTime.UnixNano())}
-	if err := unix.UtimesNanoAt(unix.AT_FDCWD, p, ts, unix.AT_SYMLINK_NOFOLLOW); err != nil && !errors.Is(err, unix.ENOTSUP) {
-		return err
-	}
+	host.SetModTime(p, h.ModTime)
 	return nil
 }

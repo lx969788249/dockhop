@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 )
 
 func TestParseHexAddr(t *testing.T) {
@@ -193,4 +194,26 @@ func TestMountsUnder(t *testing.T) {
 	if err != nil || strings.Join(got, ",") != "/srv/app/media,/srv/app/media/my disk" {
 		t.Fatalf("mountsUnder = %v %v", got, err)
 	}
+}
+
+// SetModTime 设的是路径本身：软链接设它自己，不跟到指向的文件上；设不上时不报错。
+func TestSetModTime(t *testing.T) {
+	dir := t.TempDir()
+	file, link := filepath.Join(dir, "file"), filepath.Join(dir, "link")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(file, link); err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2020, 1, 2, 3, 4, 5, 6000, time.UTC)
+	SetModTime(file, want)
+	SetModTime(link, want.Add(time.Hour))
+	if st, err := os.Lstat(file); err != nil || !st.ModTime().Equal(want) {
+		t.Errorf("文件的修改时间：%v %v", st.ModTime(), err)
+	}
+	if st, err := os.Lstat(link); err != nil || !st.ModTime().Equal(want.Add(time.Hour)) {
+		t.Errorf("软链接自己的修改时间：%v %v", st.ModTime(), err)
+	}
+	SetModTime(filepath.Join(dir, "missing"), want)
 }

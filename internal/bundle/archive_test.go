@@ -112,3 +112,12 @@ func TestExtractTree(t *testing.T) {
 		t.Errorf("目录权限：%v", ds.Mode())
 	}
 }
+
+// 解开迁移包时修改时间设不上也不算失败，和迁入时复制文件一样（见 host.SetModTime）。这里让设修改时间
+// 这一步失败：不改属主，软链接不改权限，只剩它会去碰这个不存在的路径。
+func TestApplyMetaModTimeBestEffort(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	if err := applyMeta(missing, &tar.Header{Typeflag: tar.TypeSymlink, ModTime: time.Now()}, false); err != nil {
+		t.Fatalf("修改时间设不上不应算失败：%v", err)
+	}
+}

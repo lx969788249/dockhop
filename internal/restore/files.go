@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -36,7 +37,8 @@ func metaOf(info fs.FileInfo) FileMeta {
 }
 
 // applyMeta 把属主、权限和修改时间设到 path 本身上（是软链接时不跟过去）：属主只有 root 能改成别人；
-// 改属主会清掉 setuid 位，所以权限放在属主之后设置，软链接没有自己的权限；修改时间最后设置。
+// 改属主会清掉 setuid 位，所以权限放在属主之后设置，软链接没有自己的权限；修改时间最后设置，设不上
+// 不算失败（见 host.SetModTime）。
 func applyMeta(path string, m FileMeta) error {
 	if os.Geteuid() == 0 {
 		if err := os.Lchown(path, m.UID, m.GID); err != nil {
@@ -48,10 +50,7 @@ func applyMeta(path string, m FileMeta) error {
 			return err
 		}
 	}
-	ts := []unix.Timespec{unix.NsecToTimespec(m.MTime), unix.NsecToTimespec(m.MTime)}
-	if err := unix.UtimesNanoAt(unix.AT_FDCWD, path, ts, unix.AT_SYMLINK_NOFOLLOW); err != nil && !errors.Is(err, unix.ENOTSUP) {
-		return err
-	}
+	host.SetModTime(path, time.Unix(0, m.MTime))
 	return nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // 跨磁盘移动时复制到一半失败：不能留下一个看起来完整的备份，原件也不能动。
@@ -44,5 +45,17 @@ func TestMoveOrCopyPartialFailure(t *testing.T) {
 	}
 	if _, err := os.Lstat(src); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("原来的应删除")
+	}
+}
+
+// 修改时间设不上不算失败（有的网络盘、FUSE 不让改）：它不影响数据，也不影响程序能不能用。这里让设修改
+// 时间这一步失败：不是 root 时不改属主，软链接不改权限，只剩它会去碰这个不存在的路径。
+func TestApplyMetaModTimeBestEffort(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 会先改属主")
+	}
+	missing := filepath.Join(t.TempDir(), "missing")
+	if err := applyMeta(missing, FileMeta{Link: true, MTime: time.Now().UnixNano()}); err != nil {
+		t.Fatalf("修改时间设不上不应算失败：%v", err)
 	}
 }
