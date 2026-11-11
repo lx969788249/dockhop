@@ -7,7 +7,6 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -43,10 +43,8 @@ func TestDriftReason(t *testing.T) {
 // 容器的卷时，打包时要一起临时停止；Swarm 服务的容器停不住（会被马上重新创建），只能取消。
 func TestSharedWritersIncludeUnlisted(t *testing.T) {
 	for label, want := range map[string]string{`"com.docker.compose.oneoff":"True"`: "停止", `"com.docker.swarm.service.id":"s1","com.docker.swarm.service.name":"jobs"`: "取消"} {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch strings.TrimPrefix(r.URL.Path, "/v1.44") {
-			case "/version":
-				io.WriteString(w, `{"Version":"29.0.0","ApiVersion":"1.44"}`)
+		fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
+			switch r.URL.Path {
 			case "/containers/json":
 				io.WriteString(w, `[{"Id":"web-id","Names":["/web"]},{"Id":"writer-id","Names":["/writer"]}]`)
 			case "/containers/web-id/json":
@@ -62,11 +60,9 @@ func TestSharedWritersIncludeUnlisted(t *testing.T) {
 			default:
 				http.NotFound(w, r)
 			}
-		}))
-		dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
-		if err != nil {
-			t.Fatal(err)
-		}
+			return true
+		})
+		dc := fake.Client()
 		var out bytes.Buffer
 		s := ui.New(&out, false, nil)
 		inv, err := buildInventory(context.Background(), dc, s)
@@ -80,7 +76,6 @@ func TestSharedWritersIncludeUnlisted(t *testing.T) {
 		case want == "取消" && (err == nil || s.Failure() == nil || !strings.Contains(s.Failure().Hint, "docker service scale jobs=0")):
 			t.Errorf("Swarm 服务的容器应取消：%v\n%s", err, out.String())
 		}
-		srv.Close()
 	}
 }
 
@@ -106,11 +101,9 @@ func TestSharedWritersIncludeProjectFiles(t *testing.T) {
 		// 只读地挂着项目的上级目录（例如监控）：改不了数据，不用停。
 		"monitor": `"Config":{"Image":"alpine"},"Mounts":[{"Type":"bind","Source":` + strconv.Quote(root) + `,"Destination":"/host","RW":false}]`,
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := strings.TrimPrefix(r.URL.Path, "/v1.44")
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
+		p := r.URL.Path
 		switch {
-		case p == "/version":
-			io.WriteString(w, `{"Version":"29.0.0","ApiVersion":"1.44"}`)
 		case p == "/containers/json":
 			var list []string
 			for name := range containers {
@@ -127,12 +120,9 @@ func TestSharedWritersIncludeProjectFiles(t *testing.T) {
 		default:
 			http.NotFound(w, r)
 		}
-	}))
-	defer srv.Close()
-	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
-	if err != nil {
-		t.Fatal(err)
-	}
+		return true
+	})
+	dc := fake.Client()
 	var out bytes.Buffer
 	s := ui.New(&out, false, nil)
 	inv, err := buildInventory(context.Background(), dc, s)
@@ -192,13 +182,11 @@ func TestRecheckBeforeStop(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			var mu sync.Mutex
 			cur := maps.Clone(before)
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
 				mu.Lock()
 				defer mu.Unlock()
-				p := strings.TrimPrefix(r.URL.Path, "/v1.44")
+				p := r.URL.Path
 				switch {
-				case p == "/version":
-					io.WriteString(w, `{"Version":"29.0.0","ApiVersion":"1.44"}`)
 				case p == "/containers/json":
 					var list []string
 					for name, x := range cur {
@@ -212,7 +200,7 @@ func TestRecheckBeforeStop(t *testing.T) {
 							running := x.state == "running" || x.state == "paused"
 							fmt.Fprintf(w, `{"Id":%q,"Name":"/%s","Image":"sha256:img","Config":{"Image":"alpine"},"State":{"Status":%q,"Running":%t,"Paused":%t}%s}`,
 								x.id, name, x.state, running, x.state == "paused", x.mounts)
-							return
+							return true
 						}
 					}
 					http.NotFound(w, r)
@@ -225,12 +213,9 @@ func TestRecheckBeforeStop(t *testing.T) {
 				default:
 					http.NotFound(w, r)
 				}
-			}))
-			defer srv.Close()
-			dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
-			if err != nil {
-				t.Fatal(err)
-			}
+				return true
+			})
+			dc := fake.Client()
 			var out bytes.Buffer
 			s := ui.New(&out, false, nil)
 			inv, err := buildInventory(context.Background(), dc, s)

@@ -22,6 +22,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -427,7 +428,8 @@ func TestUndoContentsDiskNotMounted(t *testing.T) {
 
 // 回滚时 Docker 出错、没法确认新建的容器已经删掉：不能接着动数据（它可能还在写）。
 func TestRollbackStopsWhenDockerErrors(t *testing.T) {
-	dc, calls := faultyDocker(t, func(http.ResponseWriter, *http.Request) bool { return false })
+	fake := dockertest.New(t, func(http.ResponseWriter, *http.Request) bool { return false })
+	dc, calls := fake.Client(), fake.Calls
 	root := t.TempDir()
 	dir, backup := filepath.Join(root, "data"), filepath.Join(root, ".data.old")
 	os.MkdirAll(dir, 0o755)
@@ -468,7 +470,7 @@ func sharedWriters(t *testing.T, stopOK bool) (r *run, dataReplacedWhileRunning 
 	os.WriteFile(filepath.Join(backup, "state"), []byte("old"), 0o600)
 	var mu sync.Mutex
 	runningB, replaced, replacedWhileRunning := false, false, false
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, q *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, q *http.Request) bool {
 		mu.Lock()
 		defer mu.Unlock()
 		// 数据是在两次请求之间被换掉的：第一次看到旧数据时，b 的状态就是换数据那一刻的状态。
@@ -491,6 +493,7 @@ func sharedWriters(t *testing.T, stopOK bool) (r *run, dataReplacedWhileRunning 
 		}
 		return true
 	})
+	dc := fake.Client()
 	var out bytes.Buffer
 	screen := ui.New(&out, false, nil)
 	rb := filepath.Join(root, "rb")
@@ -545,8 +548,8 @@ func TestRollbackKeepsDataWhenWriterWontStop(t *testing.T) {
 func TestRollbackStopsRebuiltOldCompose(t *testing.T) {
 	for _, stopOK := range []bool{true, false} {
 		running, clearedWhileRunning, cleared := true, false, false
-		dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-			p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
+			p := req.URL.Path
 			switch {
 			case p == "/volumes/data":
 				io.WriteString(w, `{"Name":"data","Driver":"local"}`)
@@ -585,6 +588,7 @@ func TestRollbackStopsRebuiltOldCompose(t *testing.T) {
 			}
 			return true
 		})
+		dc := fake.Client()
 		backup := filepath.Join(t.TempDir(), "data.tar")
 		f, _ := os.Create(backup)
 		tw := tar.NewWriter(f)
@@ -629,10 +633,10 @@ func TestRollbackAgainKeepsRebuiltOldCompose(t *testing.T) {
 		}
 		return "", nil
 	}
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
 		mu.Lock()
 		defer mu.Unlock()
-		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		p := req.URL.Path
 		ref, _, _ := strings.Cut(strings.TrimPrefix(p, "/containers/"), "/")
 		switch {
 		case p == "/containers/json": // 按 Compose 项目列出：这里的容器都是这个项目的
@@ -670,6 +674,7 @@ func TestRollbackAgainKeepsRebuiltOldCompose(t *testing.T) {
 		}
 		return true
 	})
+	dc := fake.Client()
 	j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
 	if err != nil {
 		t.Fatal(err)
@@ -704,8 +709,8 @@ func TestRollbackAgainKeepsRebuiltOldCompose(t *testing.T) {
 // 重建的原来的 Compose 容器没能记进事务日志（比如磁盘满了），不算回滚失败：原来的服务已经回来了。
 // 算失败的话回滚资料会留下，下次运行又回滚一遍，反而会把它删掉重建。
 func TestRollbackRebuiltNotRecorded(t *testing.T) {
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
+		p := req.URL.Path
 		switch {
 		case p == "/containers/old-app/json", p == "/containers/stack-app-1/json":
 			http.Error(w, `{"message":"No such container"}`, 404)
@@ -722,6 +727,7 @@ func TestRollbackRebuiltNotRecorded(t *testing.T) {
 		}
 		return true
 	})
+	dc := fake.Client()
 	var out bytes.Buffer
 	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false },
 		record: func(Entry) error { return errors.New("磁盘满了") }}
@@ -736,8 +742,8 @@ func TestRollbackRebuiltNotRecorded(t *testing.T) {
 // 写进卷里的数据又改回去。
 func TestRollbackRestoresVolumeOnce(t *testing.T) {
 	writes := 0
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
+		p := req.URL.Path
 		switch {
 		case p == "/volumes/data":
 			io.WriteString(w, `{"Name":"data","Driver":"local"}`)
@@ -755,6 +761,7 @@ func TestRollbackRestoresVolumeOnce(t *testing.T) {
 		}
 		return true
 	})
+	dc := fake.Client()
 	backup := filepath.Join(t.TempDir(), "volume-0001")
 	f, _ := os.Create(backup)
 	tw := tar.NewWriter(f)
@@ -780,8 +787,8 @@ func TestRollbackOldComposeNamespace(t *testing.T) {
 	vpnID, sideID := strings.Repeat("a", 64), strings.Repeat("b", 64)
 	var created []string
 	sideMode := ""
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
+		p := req.URL.Path
 		switch {
 		case strings.HasPrefix(p, "/images/"):
 			io.WriteString(w, `{"Id":"sha256:original"}`)
@@ -801,6 +808,7 @@ func TestRollbackOldComposeNamespace(t *testing.T) {
 		}
 		return true
 	})
+	dc := fake.Client()
 	raw := func(id, name, mode string) json.RawMessage {
 		b, _ := json.Marshal(map[string]any{"Id": id, "Name": "/" + name, "Image": "sha256:original",
 			"Config": map[string]any{"Image": "alpine"}, "HostConfig": map[string]any{"NetworkMode": mode}})
@@ -824,8 +832,8 @@ func TestRollbackOldComposeNamespace(t *testing.T) {
 func TestUndoRenameResumes(t *testing.T) {
 	for _, connected := range []bool{false, true} {
 		var connects []string
-		dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-			p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
+			p := req.URL.Path
 			switch {
 			case p == "/containers/web.dockhop-backup-x/json":
 				http.Error(w, `{"message":"No such container"}`, 404)
@@ -844,6 +852,7 @@ func TestUndoRenameResumes(t *testing.T) {
 			}
 			return true
 		})
+		dc := fake.Client()
 		var out bytes.Buffer
 		u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
 		problems := u.rollback(context.Background(), []Entry{{Op: opRename, Name: "web", ID: "old-web", Backup: "web.dockhop-backup-x",
@@ -864,8 +873,8 @@ func TestUndoRenameResumes(t *testing.T) {
 // 用的镜像跟着删掉。
 func TestUndoTag(t *testing.T) {
 	var tagged, removed []string
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
+		p := req.URL.Path
 		switch {
 		case req.Method == "GET" && p == "/images/nginx:1.27/json":
 			io.WriteString(w, `{"Id":"sha256:migrated"}`)
@@ -886,6 +895,7 @@ func TestUndoTag(t *testing.T) {
 		}
 		return true
 	})
+	dc := fake.Client()
 	var out bytes.Buffer
 	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(&out, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
 	problems := u.rollback(context.Background(), []Entry{
@@ -925,8 +935,8 @@ func TestRollbackRestoresAcrossProjects(t *testing.T) {
 			}
 			live := map[string]*box{} // 名字 → 新服务器上的容器
 			var events []string
-			dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-				p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+			fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
+				p := req.URL.Path
 				ref := strings.Split(strings.TrimPrefix(p, "/containers/"), "/")[0]
 				switch {
 				case strings.HasPrefix(p, "/images/"):
@@ -959,6 +969,7 @@ func TestRollbackRestoresAcrossProjects(t *testing.T) {
 				}
 				return true
 			})
+			dc := fake.Client()
 			var entries []Entry
 			for _, p := range order {
 				entries = append(entries, Entry{Op: opComposeOld, Name: p, Old: []OldContainer{old[p]}})
@@ -984,8 +995,8 @@ type images struct {
 }
 
 func (d *images) docker(t *testing.T) *docker.Client {
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-		ref, ok := strings.CutPrefix(strings.TrimPrefix(req.URL.Path, "/v1.44"), "/images/")
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
+		ref, ok := strings.CutPrefix(req.URL.Path, "/images/")
 		if !ok {
 			return false
 		}
@@ -1050,6 +1061,7 @@ func (d *images) docker(t *testing.T) *docker.Client {
 		}
 		return true
 	})
+	dc := fake.Client()
 	return dc
 }
 
@@ -1120,11 +1132,11 @@ func TestRollbackKeepsImagesThatWereThere(t *testing.T) {
 // 以前留着，成了没人用的卷。还挂在别的容器上的卷不是没人用的，不删，也不算没删掉的回滚资料。
 func TestCleanupRemovesOldAnonymousVolumes(t *testing.T) {
 	var deleted []string
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
 		if req.Method != "DELETE" {
 			return false
 		}
-		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+		p := req.URL.Path
 		if req.URL.RawQuery != "" {
 			p += "?" + req.URL.RawQuery
 		}
@@ -1136,6 +1148,7 @@ func TestCleanupRemovesOldAnonymousVolumes(t *testing.T) {
 		w.WriteHeader(204)
 		return true
 	})
+	dc := fake.Client()
 	u := &undo{mountPoint: noMounts, dc: dc, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false }}
 	entries := []Entry{
 		{Op: opRename, Name: "web", ID: "old-web", Backup: "web.dockhop-backup-1"},
@@ -1208,7 +1221,7 @@ func TestEveryOpHandled(t *testing.T) {
 			t.Errorf("%s 没有写在 opRules 里", op)
 		}
 	}
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
 		if strings.HasSuffix(req.URL.Path, "/json") && !strings.Contains(req.URL.Path, "/containers/") && !strings.Contains(req.URL.Path, "/images/") ||
 			strings.HasSuffix(req.URL.Path, "/containers/json") {
 			io.WriteString(w, "[]")
@@ -1217,6 +1230,7 @@ func TestEveryOpHandled(t *testing.T) {
 		}
 		return true
 	})
+	dc := fake.Client()
 	u := &undo{dc: dc, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
 		mountPoint: noMounts, record: func(Entry) error { return nil }}
 	for _, p := range append(u.rollback(context.Background(), entries), u.cleanupCommitted(context.Background(), entries)...) {
@@ -1246,8 +1260,8 @@ func TestRollbackRemovesOnlyCreatedContainers(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var deleted []string
-			dc, _ := faultyDocker(t, func(w http.ResponseWriter, q *http.Request) bool {
-				p := strings.TrimPrefix(q.URL.Path, "/v1.44")
+			fake := dockertest.New(t, func(w http.ResponseWriter, q *http.Request) bool {
+				p := q.URL.Path
 				switch {
 				case q.Method == http.MethodGet && p == "/containers/web/json":
 					io.WriteString(w, c.web)
@@ -1259,6 +1273,7 @@ func TestRollbackRemovesOnlyCreatedContainers(t *testing.T) {
 				}
 				return true
 			})
+			dc := fake.Client()
 			u := &undo{dc: dc, screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
 				mountPoint: noMounts, record: func(Entry) error { return nil }}
 			if problems := u.rollback(context.Background(), c.entries); len(problems) > 0 {
@@ -1277,8 +1292,8 @@ func TestCreateContainerRecordsID(t *testing.T) {
 	for _, journalFails := range []bool{false, true} {
 		t.Run(fmt.Sprintf("记不下来=%v", journalFails), func(t *testing.T) {
 			var r *run
-			dc, calls := faultyDocker(t, func(w http.ResponseWriter, q *http.Request) bool {
-				p := strings.TrimPrefix(q.URL.Path, "/v1.44")
+			fake := dockertest.New(t, func(w http.ResponseWriter, q *http.Request) bool {
+				p := q.URL.Path
 				switch {
 				case q.Method == http.MethodGet && strings.HasPrefix(p, "/images/"):
 					io.WriteString(w, `{"Id":"sha256:img","Config":{}}`)
@@ -1295,11 +1310,12 @@ func TestCreateContainerRecordsID(t *testing.T) {
 				}
 				return true
 			})
+			dc, calls := fake.Client(), fake.Calls
 			r = &run{Deps: Deps{Docker: dc, Screen: ui.New(io.Discard, false, nil)}, m: &bundle.Manifest{}, j: testJournal(t)}
 			raw := json.RawMessage(`{"Name":"/web","Config":{"Image":"alpine"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`)
 			it := &citem{m: bundle.Container{Name: "web"}, raw: raw, c: &docker.Container{}, img: "alpine"}
 			err := r.createContainer(context.Background(), it)
-			removed := slices.Contains(calls(), "DELETE /v1.44/containers/new-id")
+			removed := slices.Contains(calls(), "DELETE /containers/new-id")
 			if journalFails {
 				if err == nil || !removed {
 					t.Fatalf("记不下 ID 时应报错并马上删掉新容器：%v %v", err, calls())

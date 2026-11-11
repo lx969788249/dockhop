@@ -20,6 +20,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/crypto"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/transfer"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -75,7 +76,7 @@ func TestImageSources(t *testing.T) {
 	var mu sync.Mutex
 	pulled := map[string]bool{}
 	var loaded, tags []string
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, r *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
 		p := r.URL.Path
 		switch {
 		case strings.HasSuffix(p, "/images/sha256:here/json"):
@@ -130,6 +131,7 @@ func TestImageSources(t *testing.T) {
 		}
 		return true
 	})
+	dc := fake.Client()
 
 	var out bytes.Buffer
 	r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil), Getenv: func(string) string { return "" }},
@@ -188,7 +190,7 @@ func TestLoadImagesNamesPinned(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			pulled := false
-			dc, _ := faultyDocker(t, func(w http.ResponseWriter, q *http.Request) bool {
+			fake := dockertest.New(t, func(w http.ResponseWriter, q *http.Request) bool {
 				switch {
 				case q.Method == "POST" && strings.HasSuffix(q.URL.Path, "/images/load"):
 					io.Copy(io.Discard, q.Body)
@@ -209,6 +211,7 @@ func TestLoadImagesNamesPinned(t *testing.T) {
 				}
 				return true
 			})
+			dc := fake.Client()
 			id := "sha256:" + strings.Repeat("b", 64)
 			var out bytes.Buffer
 			r := &run{Deps: Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, dataDir: t.TempDir(), imageAs: map[string]string{},

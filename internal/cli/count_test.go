@@ -75,7 +75,7 @@ func TestStopBeforeChangeNotCounted(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
-	t.Setenv("DOCKER_HOST", fakeDockerSock(t))
+	t.Setenv("DOCKER_HOST", localDocker(t))
 	link, _ := crypto.NewLink("127.0.0.1", 1)
 	cases := []struct {
 		name string

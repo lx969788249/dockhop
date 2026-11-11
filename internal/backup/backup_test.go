@@ -6,13 +6,12 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/transfer"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -38,25 +37,20 @@ func TestDropStaleOutWork(t *testing.T) {
 // 那一步“失败”了。被打断的那一步返回什么错误都有可能，看的是用户有没有按 Ctrl+C。
 func TestCancelWhileChecking(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
-		case r.URL.Path == "/version":
-			w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
 		case strings.HasSuffix(r.URL.Path, "/info"):
 			cancel() // 读取 Docker 信息时用户按了 Ctrl+C
 			<-r.Context().Done()
 		default:
 			http.Error(w, `{"message":"x"}`, http.StatusInternalServerError)
 		}
-	}))
-	defer srv.Close()
-	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
-	if err != nil {
-		t.Fatal(err)
-	}
+		return true
+	})
+	dc := fake.Client()
 	var out bytes.Buffer
 	failed := 0
-	err = Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: t.TempDir(),
+	err := Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: t.TempDir(),
 		Getenv: func(string) string { return "" }, Failed: func() { failed++ }}, Options{})
 	if !errors.Is(err, ui.ErrCancelled) || !strings.Contains(out.String(), "已取消，这台服务器上什么都没有改动") || strings.Contains(out.String(), "✗") {
 		t.Fatalf("应按已取消处理、不显示失败：%v\n%s", err, out.String())
@@ -69,21 +63,14 @@ func TestCancelWhileChecking(t *testing.T) {
 // 还没改动这台服务器就停下了（这里是读取 Docker 信息就失败）：照样显示迁出失败、留着日志，但不算一次失败
 // （问题表 D10）；失败的次数只算动了手之后没成功的（见 TestEnding）。
 func TestStopBeforeChangeNotCounted(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/version" {
-			w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
-			return
-		}
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, `{"message":"x"}`, http.StatusInternalServerError) // 读取 Docker 信息就失败
-	}))
-	defer srv.Close()
-	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
-	if err != nil {
-		t.Fatal(err)
-	}
+		return true
+	})
+	dc := fake.Client()
 	var out bytes.Buffer
 	failed := 0
-	err = Run(context.Background(), Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: t.TempDir(),
+	err := Run(context.Background(), Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: t.TempDir(),
 		Getenv: func(string) string { return "" }, Failed: func() { failed++ }}, Options{})
 	if !errors.Is(err, ui.ErrReported) || !strings.Contains(out.String(), "❌ 迁出失败") || failed != 0 {
 		t.Fatalf("应显示失败，不算一次失败（算了 %d 次）：%v\n%s", failed, err, out.String())

@@ -10,13 +10,14 @@ import (
 	"testing"
 
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 // 读不到已有的 Compose 容器里有没有改动时，不能当作没有改动、直接删掉它。
 func TestBackupProjectStopsWhenChangesFail(t *testing.T) {
-	dc, calls := faultyDocker(t, func(w http.ResponseWriter, r *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/changes"):
 			return false
@@ -29,6 +30,7 @@ func TestBackupProjectStopsWhenChangesFail(t *testing.T) {
 		}
 		return true
 	})
+	dc, calls := fake.Client(), fake.Calls
 	var out bytes.Buffer
 	j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
 	if err != nil {
@@ -89,9 +91,9 @@ func TestPrepareUnreadableContainer(t *testing.T) {
 // 回滚时要原样重建原有的 Compose 容器：读它们的配置时也要带上用户指定的 MAC 地址（Docker 29 起读出来
 // 的配置里没有了，见 docker.InspectForRebuild），不然回滚后网卡用的是随机的 MAC。
 func TestBackupProjectKeepsFixedMAC(t *testing.T) {
-	dc, _ := faultyDockerAt(t, "1.56", func(w http.ResponseWriter, r *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
-		case r.URL.Path == "/v1.51/containers/abcdef1234567890/json":
+		case r.URL.Path == "/containers/abcdef1234567890/json" && dockertest.Version(r) == "1.51":
 			w.Write([]byte(`{"Id":"abcdef1234567890","Config":{"Image":"alpine","MacAddress":"02:42:ac:14:00:0a"}}`))
 		case strings.HasSuffix(r.URL.Path, "/changes"):
 			return false
@@ -103,7 +105,8 @@ func TestBackupProjectKeepsFixedMAC(t *testing.T) {
 			return false
 		}
 		return true
-	})
+	}, dockertest.API("1.56"))
+	dc := fake.Client()
 	j, err := openJournal(filepath.Join(t.TempDir(), "rb"))
 	if err != nil {
 		t.Fatal(err)

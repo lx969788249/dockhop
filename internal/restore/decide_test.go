@@ -14,6 +14,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/spec"
 	"github.com/lx969788249/dockhop/internal/ui"
@@ -94,8 +95,8 @@ func TestReplaceFollowsProject(t *testing.T) {
 		t.Run(fmt.Sprintf("保留site=%v", keep), func(t *testing.T) {
 			web := `{"Id":"target-web","Name":"/web","State":{"Status":"running","Running":true},"HostConfig":{},` +
 				`"Config":{"Image":"nginx","Labels":{"com.docker.compose.project":"site"}}}`
-			dc, calls := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-				switch p := strings.TrimPrefix(req.URL.Path, "/v1.44"); {
+			fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
+				switch p := req.URL.Path; {
 				case p == "/containers/json":
 					io.WriteString(w, `[{"Id":"target-web","Names":["/web"],"State":"running","Labels":{"com.docker.compose.project":"site"}}]`)
 				case p == "/containers/target-web/json", p == "/containers/web/json":
@@ -109,6 +110,7 @@ func TestReplaceFollowsProject(t *testing.T) {
 				}
 				return true
 			})
+			dc, calls := fake.Client(), fake.Calls
 			home := t.TempDir()
 			data := filepath.Join(home, "unpacked")
 			os.MkdirAll(filepath.Join(data, "containers"), 0o700)
@@ -147,7 +149,7 @@ func TestReplaceFollowsProject(t *testing.T) {
 			var touched, migrating []string
 			for _, c := range calls() {
 				if !strings.HasPrefix(c, "GET") && strings.Contains(c, "target-web") {
-					touched = append(touched, strings.Replace(c, "/v1.44", "", 1))
+					touched = append(touched, c)
 				}
 			}
 			for _, it := range r.items {
@@ -261,8 +263,8 @@ func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.D
 			`"Config":{"Image":"nginx","Labels":` + labels + `}}`
 		inspect["/containers/target-"+e[0]+"/json"], inspect["/containers/"+e[0]+"/json"] = js, js
 	}
-	dc, calls := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-		switch p := strings.TrimPrefix(req.URL.Path, "/v1.44"); {
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
+		switch p := req.URL.Path; {
 		case p == "/containers/json":
 			io.WriteString(w, "["+strings.Join(list, ",")+"]")
 		case req.Method == http.MethodGet && inspect[p] != "":
@@ -276,6 +278,7 @@ func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.D
 		}
 		return true
 	})
+	dc, calls := fake.Client(), fake.Calls
 	home := t.TempDir()
 	data := filepath.Join(home, "unpacked")
 	os.MkdirAll(filepath.Join(data, "containers"), 0o700)
@@ -311,7 +314,7 @@ func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.D
 	}
 	for _, c := range calls() {
 		if !strings.HasPrefix(c, "GET") {
-			touched = append(touched, strings.Replace(c, "/v1.44", "", 1))
+			touched = append(touched, c)
 		}
 	}
 	entries, _ := readJournal(r.rbDir)

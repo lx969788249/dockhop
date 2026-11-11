@@ -15,6 +15,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -65,8 +66,8 @@ esac
 	}
 	var mu sync.Mutex
 	var started []string
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-		p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
+		p := req.URL.Path
 		switch {
 		case p == "/networks":
 			io.WriteString(w, `[]`)
@@ -86,6 +87,7 @@ esac
 		}
 		return true
 	})
+	dc := fake.Client()
 	member := func(name, svc, number string, running bool) *citem {
 		c := &docker.Container{}
 		c.Config.Image = "alpine"

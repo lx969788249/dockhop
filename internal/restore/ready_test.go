@@ -16,6 +16,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -199,7 +200,7 @@ func TestPhaseOf(t *testing.T) {
 func TestConfirmReadyRetriesInspect(t *testing.T) {
 	var mu sync.Mutex
 	n := 0
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
 		if !strings.HasSuffix(req.URL.Path, "/containers/new-app/json") {
 			return false
 		}
@@ -211,6 +212,7 @@ func TestConfirmReadyRetriesInspect(t *testing.T) {
 		io.WriteString(w, `{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true}}`)
 		return true
 	})
+	dc := fake.Client()
 	_, _, r := fakeContainer(t, "", "{}")
 	r.Docker = dc
 	src := &docker.Container{}
@@ -324,19 +326,20 @@ func TestHealthTimeout(t *testing.T) {
 // 连接串时，两处都要隐藏（报错会显示在结果里，用户可能整段复制去求助）。
 func TestStartupFailureHidesEnvSecrets(t *testing.T) {
 	const secret = "postgres://app:only-for-test@db/app"
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
 		switch req.URL.Path {
-		case "/v1.44/containers/json":
+		case "/containers/json":
 			io.WriteString(w, `[]`)
-		case "/v1.44/containers/new-web/json":
+		case "/containers/new-web/json":
 			io.WriteString(w, `{"Id":"new-web","Name":"/web","State":{"Status":"exited","ExitCode":1}}`)
-		case "/v1.44/containers/new-web/logs":
+		case "/containers/new-web/logs":
 			io.WriteString(w, "cannot connect using "+secret)
 		default:
 			return false
 		}
 		return true
 	})
+	dc := fake.Client()
 	root := t.TempDir()
 	data := filepath.Join(root, "data")
 	os.MkdirAll(filepath.Join(data, "containers"), 0o700)

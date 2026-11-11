@@ -4,14 +4,13 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 
-	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/host"
 )
 
@@ -35,10 +34,8 @@ func TestClean(t *testing.T) {
 		}
 		var mu sync.Mutex
 		var removed []string
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
 			switch {
-			case r.URL.Path == "/version":
-				fmt.Fprint(w, `{"Version":"29.0.0","ApiVersion":"1.44"}`)
 			case strings.HasSuffix(r.URL.Path, "/containers/json"):
 				var list []string
 				for id, lock := range helpers {
@@ -57,13 +54,10 @@ func TestClean(t *testing.T) {
 			default:
 				http.NotFound(w, r)
 			}
-		}))
-		dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
-		if err != nil {
-			t.Fatal(err)
-		}
+			return true
+		})
+		dc := fake.Client()
 		Clean(context.Background(), dc, in)
-		srv.Close()
 		running.Unlock()
 		outLock.Unlock()
 		slices.Sort(removed)
@@ -81,10 +75,8 @@ func TestClean(t *testing.T) {
 // 也就判断不了那个任务还在不在：不删。
 func TestCleanKeepsUnknownOwner(t *testing.T) {
 	var removed []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
-		case r.URL.Path == "/version":
-			fmt.Fprint(w, `{"Version":"29.0.0","ApiVersion":"1.44"}`)
 		case strings.HasSuffix(r.URL.Path, "/containers/json"):
 			fmt.Fprint(w, `[{"Id":"rel","Names":["/dockhop-helper-x-1"],"Labels":{"dockhop.helper":"home/locks/out.lock"}}]`)
 		case r.Method == http.MethodDelete:
@@ -93,12 +85,9 @@ func TestCleanKeepsUnknownOwner(t *testing.T) {
 		default:
 			http.NotFound(w, r)
 		}
-	}))
-	defer srv.Close()
-	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
-	if err != nil {
-		t.Fatal(err)
-	}
+		return true
+	})
+	dc := fake.Client()
 	Clean(context.Background(), dc, filepath.Join(t.TempDir(), "locks", "in.lock"))
 	if len(removed) > 0 {
 		t.Errorf("认不出是谁的临时容器不应删：%v", removed)

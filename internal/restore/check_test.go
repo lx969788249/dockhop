@@ -15,6 +15,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/crypto"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/transfer"
@@ -82,7 +83,7 @@ func TestRefusesOtherPlanVersions(t *testing.T) {
 // 迁入前检查读新服务器的情况时按 Ctrl+C：马上停下，当作取消（以前这一段不响应 Ctrl+C，要等 Docker
 // 回话；被取消了也报成“读取新服务器的情况失败”）。
 func TestCheckStopsOnCancel(t *testing.T) {
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
 		if strings.HasSuffix(req.URL.Path, "/info") {
 			select {
 			case <-req.Context().Done():
@@ -91,6 +92,7 @@ func TestCheckStopsOnCancel(t *testing.T) {
 		}
 		return false
 	})
+	dc := fake.Client()
 	dir := t.TempDir()
 	log, err := logging.Open(filepath.Join(dir, "logs"), "in", &logging.Redactor{})
 	if err != nil {

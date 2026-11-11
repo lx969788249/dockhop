@@ -3,49 +3,42 @@ package backup
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
-// fakeDocker 是只认识几个接口的假 Docker：容器都是停着的，记下启动了哪些。
-func fakeDocker(t *testing.T) (*docker.Client, func() []string) {
+// stoppedDocker 是容器都停着的假 Docker（见 dockertest）；返回的函数列出启动过哪些容器。
+func stoppedDocker(t *testing.T) (*docker.Client, func() []string) {
 	t.Helper()
-	var mu sync.Mutex
-	var started []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
-		case r.URL.Path == "/version":
-			w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/json"):
-			w.Write([]byte(`{"Id":"abc","Name":"/web","State":{"Status":"exited","Running":false}}`))
+			io.WriteString(w, `{"Id":"abc","Name":"/web","State":{"Status":"exited","Running":false}}`)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
-			mu.Lock()
-			started = append(started, r.URL.Path)
-			mu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
 		}
-	}))
-	t.Cleanup(srv.Close)
-	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return dc, func() []string {
-		mu.Lock()
-		defer mu.Unlock()
-		return append([]string(nil), started...)
+		return true
+	})
+	return fake.Client(), func() []string {
+		var started []string
+		for _, c := range fake.Calls() {
+			if strings.HasSuffix(c, "/start") {
+				started = append(started, c)
+			}
+		}
+		return started
 	}
 }
 
@@ -64,7 +57,7 @@ func TestRecoverInterruptedUsesLock(t *testing.T) {
 
 	// 那次迁出还在运行：拿着锁。不能动它停下的容器。
 	write()
-	dc, started := fakeDocker(t)
+	dc, started := stoppedDocker(t)
 	lock, err := host.TryLock(lockPath(home))
 	if err != nil {
 		t.Fatal(err)
@@ -104,20 +97,13 @@ func TestRecoverInterruptedKeepsRecordOnDockerError(t *testing.T) {
 	if err := writeStopped(home, []StoppedContainer{{Name: "web", ID: "abc", State: "running"}}); err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/version" {
-			w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
-			return
-		}
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, `{"message":"模拟的 Docker 内部错误"}`, http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
-	if err != nil {
-		t.Fatal(err)
-	}
+		return true
+	})
+	dc := fake.Client()
 	var out bytes.Buffer
-	err = RecoverInterrupted(context.Background(), dc, home, ui.New(&out, false, nil), ui.NewPrompter(nil, &out))
+	err := RecoverInterrupted(context.Background(), dc, home, ui.New(&out, false, nil), ui.NewPrompter(nil, &out))
 	if err == nil || !strings.Contains(err.Error(), "停机记录保留") {
 		t.Fatalf("应报错：%v", err)
 	}
@@ -135,11 +121,9 @@ func TestRecoverInterruptedFinishesWhenCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	running := map[string]bool{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1.44/containers/"), "/")[0]
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
+		id := strings.Split(strings.TrimPrefix(r.URL.Path, "/containers/"), "/")[0]
 		switch {
-		case r.URL.Path == "/version":
-			w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/json"):
 			w.Write([]byte(`{"Id":"` + id + `","Name":"/` + id + `","State":{"Running":` + strconv.FormatBool(running[id]) + `}}`))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
@@ -149,12 +133,9 @@ func TestRecoverInterruptedFinishesWhenCancelled(t *testing.T) {
 		default:
 			http.NotFound(w, r)
 		}
-	}))
-	defer srv.Close()
-	dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
-	if err != nil {
-		t.Fatal(err)
-	}
+		return true
+	})
+	dc := fake.Client()
 	var out bytes.Buffer
 	if err := RecoverInterrupted(ctx, dc, home, ui.New(&out, false, nil), ui.NewPrompter(nil, &out)); err != nil {
 		t.Fatalf("应全部恢复：%v\n%s", err, out.String())
@@ -196,10 +177,8 @@ func TestRecoverInterruptedStates(t *testing.T) {
 			}
 			now := c.now
 			var calls []string
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
 				switch {
-				case r.URL.Path == "/version":
-					w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
 				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/json"):
 					w.Write([]byte(`{"Id":"abc","Name":"/web","State":{` + states[now] + `}}`))
 				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
@@ -209,21 +188,18 @@ func TestRecoverInterruptedStates(t *testing.T) {
 					calls = append(calls, "pause")
 					if !c.pauseOK {
 						http.Error(w, `{"message":"模拟暂停失败"}`, http.StatusInternalServerError)
-						return
+						return true
 					}
 					now = "paused"
 					w.WriteHeader(http.StatusNoContent)
 				default:
 					http.NotFound(w, r)
 				}
-			}))
-			defer srv.Close()
-			dc, err := docker.New(context.Background(), docker.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")))
-			if err != nil {
-				t.Fatal(err)
-			}
+				return true
+			})
+			dc := fake.Client()
 			var out bytes.Buffer
-			err = RecoverInterrupted(context.Background(), dc, home, ui.New(&out, false, nil), ui.NewPrompter(nil, &out))
+			err := RecoverInterrupted(context.Background(), dc, home, ui.New(&out, false, nil), ui.NewPrompter(nil, &out))
 			if got := strings.Join(calls, " "); got != c.want {
 				t.Errorf("操作：%q，应该：%q", got, c.want)
 			}
@@ -241,7 +217,7 @@ func TestRecoverInterruptedKeepsBrokenRecord(t *testing.T) {
 	home := t.TempDir()
 	os.MkdirAll(filepath.Dir(statePath(home)), 0o700)
 	os.WriteFile(statePath(home), []byte(`{"pid": 12, "containers": [{"na`), 0o600)
-	dc, started := fakeDocker(t)
+	dc, started := stoppedDocker(t)
 	var out bytes.Buffer
 	err := RecoverInterrupted(context.Background(), dc, home, ui.New(&out, false, nil), ui.NewPrompter(nil, &out))
 	if err == nil || !strings.Contains(err.Error(), "docker ps -a") {

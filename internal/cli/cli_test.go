@@ -4,14 +4,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -144,45 +143,22 @@ func TestMenuClearsScreen(t *testing.T) {
 	}
 }
 
-// fakeDockerSock 在 unix socket 上模拟一个 Docker。
-func fakeDockerSock(t *testing.T) string {
+// localDocker 启动一个本机上的假 Docker（见 dockertest，监听 Unix 套接字），返回它的地址（DOCKER_HOST）：
+// 上面有 Compose 项目 site 的容器 web，以及它的网络和数据卷。
+func localDocker(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "dh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	sock := filepath.Join(dir, "d.sock")
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/version", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `{"Version":"29.2.1","ApiVersion":"1.53"}`)
-	})
-	mux.HandleFunc("/v1.53/info", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `{"ServerVersion":"29.2.1","OperatingSystem":"Debian","Architecture":"x86_64","NCPU":2,"MemTotal":2147483648,"Driver":"overlay2","DockerRootDir":"/","CgroupVersion":"2","Runtimes":{"runc":{}},"DefaultRuntime":"runc","Swarm":{"LocalNodeState":"inactive"}}`)
-	})
-	mux.HandleFunc("/v1.53/containers/json", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `[{"Id":"0123456789abcdef","Names":["/web"],"Image":"nginx","State":"running","Status":"Up 2 hours","Labels":{"com.docker.compose.project":"site"},"Ports":[{"IP":"0.0.0.0","PrivatePort":80,"PublicPort":8080,"Type":"tcp"}]}]`)
-	})
-	mux.HandleFunc("/v1.53/networks", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `[{"Name":"site_default","Driver":"bridge","IPAM":{"Config":[{"Subnet":"172.18.0.0/16"}]}}]`)
-	})
-	mux.HandleFunc("/v1.53/volumes", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `{"Volumes":[{"Name":"site_data","Driver":"local","Labels":{"com.docker.compose.project":"site"}}]}`)
-	})
-	srv := &http.Server{Handler: mux}
-	go srv.Serve(ln)
-	t.Cleanup(func() { srv.Close() })
-	return "unix://" + sock
+	fake := dockertest.New(t, dockertest.NotFound, dockertest.API("1.53"), dockertest.Socket())
+	fake.Reply("GET /info", `{"ServerVersion":"29.2.1","OperatingSystem":"Debian","Architecture":"x86_64","NCPU":2,"MemTotal":2147483648,"Driver":"overlay2","DockerRootDir":"/","CgroupVersion":"2","Runtimes":{"runc":{}},"DefaultRuntime":"runc","Swarm":{"LocalNodeState":"inactive"}}`)
+	fake.Reply("GET /containers/json", `[{"Id":"0123456789abcdef","Names":["/web"],"Image":"nginx","State":"running","Status":"Up 2 hours","Labels":{"com.docker.compose.project":"site"},"Ports":[{"IP":"0.0.0.0","PrivatePort":80,"PublicPort":8080,"Type":"tcp"}]}]`)
+	fake.Reply("GET /networks", `[{"Name":"site_default","Driver":"bridge","IPAM":{"Config":[{"Subnet":"172.18.0.0/16"}]}}]`)
+	fake.Reply("GET /volumes", `{"Volumes":[{"Name":"site_data","Driver":"local","Labels":{"com.docker.compose.project":"site"}}]}`)
+	return fake.Host()
 }
 
 // 失败时保留的日志里要有系统和 Docker 的情况：反馈问题时附上日志就够了。
 func TestFailureLogRecordsEnvironment(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("DOCKER_HOST", fakeDockerSock(t))
+	t.Setenv("DOCKER_HOST", localDocker(t))
 	r := runCLI(t, "", map[string]string{"DOCKHOP_HOME": home}, "out", "--include", "nosuch")
 	if r.code != ExitFailed {
 		t.Fatalf("应失败：%d %q", r.code, r.stderr)

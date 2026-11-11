@@ -16,6 +16,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -311,13 +312,14 @@ func checkPartialDone(t *testing.T, root string) {
 
 // partialRun 是只有空的 Docker 的迁入（没有容器和镜像），回滚资料在 dir。
 func partialRun(t *testing.T, dir string) *run {
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
 		if strings.HasSuffix(req.URL.Path, "/containers/json") || strings.HasSuffix(req.URL.Path, "/images/json") {
 			io.WriteString(w, "[]")
 			return true
 		}
 		return false
 	})
+	dc := fake.Client()
 	log, err := logging.Open(filepath.Join(t.TempDir(), "logs"), "in", &logging.Redactor{})
 	if err != nil {
 		t.Fatal(err)
@@ -399,7 +401,7 @@ func TestRecoverPicksHelperImage(t *testing.T) {
 	}
 	j.close()
 	r := partialRun(t, dir)
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
 		switch {
 		case strings.HasSuffix(req.URL.Path, "/containers/json"):
 			io.WriteString(w, "[]")
@@ -410,6 +412,7 @@ func TestRecoverPicksHelperImage(t *testing.T) {
 		}
 		return true
 	})
+	dc := fake.Client()
 	r.Docker, r.undo.dc = dc, dc
 	if err := r.recoverInterrupted(context.Background()); err != nil {
 		t.Fatal(err)

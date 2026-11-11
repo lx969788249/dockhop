@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -21,7 +22,7 @@ import (
 // 检查环境时按 Ctrl+C：还没改动新服务器，按“已取消”处理，不显示被打断的那一步“失败”了。
 func TestCancelWhileChecking(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, r *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
 		if strings.HasSuffix(r.URL.Path, "/info") {
 			cancel() // 读取 Docker 信息时用户按了 Ctrl+C
 			<-r.Context().Done()
@@ -29,6 +30,7 @@ func TestCancelWhileChecking(t *testing.T) {
 		}
 		return false
 	})
+	dc := fake.Client()
 	link, _ := crypto.NewLink("127.0.0.1", 1)
 	var out bytes.Buffer
 	var counted []string
@@ -47,7 +49,8 @@ func TestCancelWhileChecking(t *testing.T) {
 // 还没改动这台服务器就停下了（这里是读取 Docker 信息就失败）：照样显示迁入失败、留着日志，但不算一次失败
 // （问题表 D10）；失败的次数只算动了手之后没成功的（见 TestEnding）。
 func TestStopBeforeChangeNotCounted(t *testing.T) {
-	dc, _ := faultyDocker(t, func(http.ResponseWriter, *http.Request) bool { return false }) // 读取 Docker 信息就失败
+	fake := dockertest.New(t, func(http.ResponseWriter, *http.Request) bool { return false })
+	dc := fake.Client() // 读取 Docker 信息就失败
 	link, _ := crypto.NewLink("127.0.0.1", 1)
 	var out bytes.Buffer
 	var counted []string
@@ -115,8 +118,8 @@ func TestCancelDuringRecovery(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			var deleted []string
-			dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
-				p := strings.TrimPrefix(req.URL.Path, "/v1.44")
+			fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
+				p := req.URL.Path
 				switch {
 				case p == "/info":
 					io.WriteString(w, `{"ServerVersion":"29.0.0"}`)
@@ -137,6 +140,7 @@ func TestCancelDuringRecovery(t *testing.T) {
 				}
 				return true
 			})
+			dc := fake.Client()
 			link, _ := crypto.NewLink("127.0.0.1", 1)
 			var out bytes.Buffer
 			err = Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: home,
@@ -171,7 +175,7 @@ func TestRestoreKeepsRunningExportHelper(t *testing.T) {
 	}
 	defer lock.Unlock()
 	var deleted []string
-	dc, _ := faultyDocker(t, func(w http.ResponseWriter, req *http.Request) bool {
+	fake := dockertest.New(t, func(w http.ResponseWriter, req *http.Request) bool {
 		switch {
 		case strings.HasSuffix(req.URL.Path, "/containers/json"):
 			io.WriteString(w, `[{"Id":"export-helper","Names":["/dockhop-helper-x-1"],"Labels":{"dockhop.helper":"1"}}]`)
@@ -183,6 +187,7 @@ func TestRestoreKeepsRunningExportHelper(t *testing.T) {
 		}
 		return true
 	})
+	dc := fake.Client()
 	link, _ := crypto.NewLink("127.0.0.1", 1)
 	var out bytes.Buffer
 	Run(context.Background(), Deps{Docker: dc, Home: home, Screen: ui.New(&out, false, nil), Prompt: ui.NewPrompter(nil, &out),
