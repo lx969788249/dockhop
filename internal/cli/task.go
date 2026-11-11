@@ -17,6 +17,7 @@ import (
 type task struct {
 	env      *Env
 	home     string
+	ownHome  bool // home 是 DockHop 自己的目录（默认的 ~/.dockhop），空了连它一起删（见 tidyHome）
 	log      *logging.Logger
 	redactor *logging.Redactor
 	screen   *ui.Screen
@@ -25,12 +26,12 @@ type task struct {
 }
 
 func startTask(env *Env, kind string) (*task, error) {
-	home, err := env.dockhopHome()
+	home, own, err := env.dockhopHome()
 	if err != nil {
 		env.screen.Problem(err.Error(), "设置 HOME，或者用 DOCKHOP_HOME 指定 DockHop 放文件的目录")
 		return nil, ui.ErrReported
 	}
-	t := &task{env: env, home: home, redactor: &logging.Redactor{}}
+	t := &task{env: env, home: home, ownHome: own, redactor: &logging.Redactor{}}
 	log, err := logging.Open(filepath.Join(t.home, "logs"), kind, t.redactor)
 	if err != nil {
 		// 没有日志也能继续，只是出错时没有日志可以反馈。
@@ -60,8 +61,8 @@ func startTask(env *Env, kind string) (*task, error) {
 }
 
 // finish 结束任务：按结局处理日志（见 logging.Outcome；测试时 DOCKHOP_TEST_KEEP_LOG=1 都保留），
-// 再删掉 DockHop 目录里空了的子目录，目录整个空了就把它也删掉。迁移成功、只是看看之后，
-// 服务器上不留东西；失败时留下的日志、下载照旧留着。
+// 再删掉 DockHop 目录里空了的子目录，DockHop 自己的目录整个空了就把它也删掉。迁移成功、只是看看
+// 之后，服务器上不留东西；失败时留下的日志、下载照旧留着。
 func (t *task) finish(err error) {
 	outcome := logging.Failed
 	switch {
@@ -71,16 +72,18 @@ func (t *task) finish(err error) {
 		outcome = logging.Cancelled
 	}
 	t.log.Finish(outcome, t.env.Getenv("DOCKHOP_TEST_KEEP_LOG") == "1")
-	tidyHome(t.home)
+	tidyHome(t.home, t.ownHome)
 }
 
-// tidyHome 删掉 home 里空了的子目录（DockHop 自己建的这几个），home 空了也删掉。只删空目录，
-// 有内容的不动。
-func tidyHome(home string) {
+// tidyHome 删掉 home 里空了的子目录（DockHop 自己建的这几个）；home 是 DockHop 自己的目录（own）
+// 时，空了也删掉。用 DOCKHOP_HOME 指定的目录是用户的，空了也留着。只删空目录，有内容的不动。
+func tidyHome(home string, own bool) {
 	for _, sub := range []string{"logs", "work", "state", "rollback", "bin", "locks"} {
 		_ = os.Remove(filepath.Join(home, sub))
 	}
-	_ = os.Remove(home)
+	if own {
+		_ = os.Remove(home)
+	}
 }
 
 func explainDockerError(err error) (string, string) {

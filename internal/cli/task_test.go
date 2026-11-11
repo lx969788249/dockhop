@@ -25,7 +25,7 @@ func TestFinishLeavesNothing(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tk := &task{env: &Env{Getenv: func(string) string { return "" }}, home: home, log: log}
+		tk := &task{env: &Env{Getenv: func(string) string { return "" }}, home: home, ownHome: true, log: log}
 		tk.finish(c.err)
 		if _, err := os.Stat(log.Path()); (err == nil) != c.keep {
 			t.Errorf("%s：日志留着=%v，应为 %v", c.name, err == nil, c.keep)
@@ -40,13 +40,29 @@ func TestFinishLeavesNothing(t *testing.T) {
 	}
 }
 
+// 用 DOCKHOP_HOME 指定的目录是用户自己的：任务结束时只删 DockHop 在里面建的、空了的子目录，目录本身
+// 留着（问题表 D17）。默认的 ~/.dockhop 是 DockHop 自己的，空了才整个删掉（见 TestFinishLeavesNothing）。
+func TestFinishKeepsUserHome(t *testing.T) {
+	home := t.TempDir()
+	os.MkdirAll(filepath.Join(home, "work"), 0o700)
+	log, err := logging.Open(filepath.Join(home, "logs"), "out", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk := &task{env: &Env{Getenv: func(string) string { return "" }}, home: home, log: log}
+	tk.finish(nil)
+	if left, err := os.ReadDir(home); err != nil || len(left) != 0 {
+		t.Fatalf("用户的目录应留着，里面 DockHop 建的空目录删掉：%v %v", left, err)
+	}
+}
+
 // 只删 DockHop 自己建的空目录：有内容的、不认识的都不动，这时 DockHop 的目录也留着。
 func TestTidyHomeKeepsContent(t *testing.T) {
 	home := filepath.Join(t.TempDir(), ".dockhop")
 	os.MkdirAll(filepath.Join(home, "work", "in-x"), 0o700)
 	os.MkdirAll(filepath.Join(home, "mine"), 0o700)
 	os.MkdirAll(filepath.Join(home, "locks"), 0o700)
-	tidyHome(home)
+	tidyHome(home, true)
 	for p, keep := range map[string]bool{"work/in-x": true, "mine": true, "locks": false} {
 		if _, err := os.Stat(filepath.Join(home, p)); (err == nil) != keep {
 			t.Errorf("%s：留着=%v，应为 %v", p, err == nil, keep)
