@@ -138,16 +138,16 @@ func TestProjectDirLinkGuard(t *testing.T) {
 	for name, target := range map[string]string{"ok": filepath.Join(root, "disk", "app"), "parent": apps, "system": "/usr"} {
 		link := filepath.Join(apps, name)
 		os.Symlink(target, link)
-		_, _, err := approveRoot(projectRoot, link)
+		_, _, err := approveRoot(projectRoot, link, "")
 		if (name == "ok") != (err == nil) {
 			t.Errorf("%s：%v", name, err)
 		}
 	}
-	if real, _, err := approveRoot(projectRoot, filepath.Join(root, "disk", "app")); err != nil || !strings.HasSuffix(real, filepath.Join("disk", "app")) {
+	if real, _, err := approveRoot(projectRoot, filepath.Join(root, "disk", "app"), ""); err != nil || !strings.HasSuffix(real, filepath.Join("disk", "app")) {
 		t.Errorf("普通目录：%s %v", real, err)
 	}
 	// 不经过软链接的项目目录照原样打包，哪怕它是系统目录（例如 compose.yml 直接放在 /root 下）。
-	if real, _, err := approveRoot(projectRoot, "/usr"); err != nil || real != "/usr" {
+	if real, _, err := approveRoot(projectRoot, "/usr", ""); err != nil || real != "/usr" {
 		t.Errorf("普通的系统目录：%s %v", real, err)
 	}
 }
@@ -168,5 +168,42 @@ func TestOwnDirsThroughLink(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), ".dockhop") {
 		t.Errorf("DockHop 自己的目录不应打进迁移包：%v", r.ownDirs(link))
+	}
+}
+
+// 项目目录外的文件、迁入前检查用的配置文件，经过软链接指向项目目录（或者它自己）的上级目录时不能打包：会把
+// 整个项目、连同旁边别的项目一起打进去，用户自己也想不到。直接写的上级目录（例如 build: ..，构建上下文是
+// 仓库根目录）是配置里写明要用的，照样打包。是（或者指向）系统路径的不打包：以前检查用的配置文件什么都
+// 不查，软链接到系统文件时会把它的内容打进迁移包。
+func TestApproveRootAroundProject(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	apps := filepath.Join(root, "apps")
+	project := filepath.Join(apps, "blog")
+	conf := filepath.Join(root, "conf")
+	os.MkdirAll(project, 0o755)
+	os.MkdirAll(conf, 0o755)
+	os.WriteFile(filepath.Join(conf, "plain.env"), []byte("A=1\n"), 0o644)
+	os.Symlink(apps, filepath.Join(conf, "up.env"))
+	os.Symlink(conf, filepath.Join(conf, "self.env"))
+	os.Symlink("/dev/null", filepath.Join(conf, "sys.env"))
+	for _, pol := range []rootPolicy{outsideRoot, checkRoot} {
+		for _, c := range []struct {
+			path         string
+			system, stop bool
+		}{
+			{filepath.Join(conf, "plain.env"), false, false},
+			{apps, false, false},                           // build: ..，配置里写明的
+			{filepath.Join(conf, "up.env"), false, true},   // 软链接指向项目目录的上级目录
+			{filepath.Join(conf, "self.env"), false, true}, // 软链接指向它自己的上级目录
+			{filepath.Join(conf, "sys.env"), true, false},
+		} {
+			_, system, err := approveRoot(pol, c.path, project)
+			if system != c.system || (err != nil) != c.stop {
+				t.Errorf("%s %s：system=%v err=%v", pol.what, c.path, system, err)
+			}
+		}
 	}
 }

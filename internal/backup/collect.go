@@ -191,7 +191,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 				}
 				vols[m.Name] = v
 			case "bind":
-				real, system, err := approveRoot(bindRoot, m.Source)
+				real, system, err := approveRoot(bindRoot, m.Source, "")
 				if err != nil {
 					return nil, fmt.Errorf("容器 %s 挂载的目录 %s 读不到：%v", it.name(), m.Source, err)
 				}
@@ -296,7 +296,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 				"把它改成普通的目录或文件（或者让它指向一个单独的地方）后重新运行，或者不迁移这个项目")
 		}
 		// 挂载目录记的是真实路径，项目目录本身是软链接时也按它的真实路径比较。
-		dir, _, err := approveRoot(projectRoot, u.workingDir)
+		dir, _, err := approveRoot(projectRoot, u.workingDir, "")
 		if err != nil {
 			return nil, stop(err)
 		}
@@ -314,7 +314,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		cp := compose.Project{Name: u.project, WorkingDir: u.workingDir, Files: u.files}
 		if p.inBind {
 			for _, f := range compose.CheckFiles(cp) {
-				_, system, err := approveRoot(checkRoot, f)
+				_, system, err := approveRoot(checkRoot, f, dir)
 				if err != nil {
 					return nil, stop(err)
 				}
@@ -325,7 +325,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		}
 		files, unknown := compose.DeclaredFiles(cp)
 		for _, r := range files {
-			_, system, err := approveRoot(outsideRoot, r)
+			_, system, err := approveRoot(outsideRoot, r, dir)
 			if err != nil {
 				return nil, stop(err)
 			}
@@ -518,21 +518,23 @@ type rootPolicy struct {
 	what       string // 给人看的叫法
 	mustExist  bool   // 读不到就停下
 	skipSystem bool   // 它本身或者它指向的地方是系统路径时不打包（新服务器上自己有）
-	guardLink  bool   // 经过软链接时不能指向系统路径或者它自己的上级目录：会把整个系统目录、或者别的项目一起打进去
+	guardLink  bool   // 经过软链接时不能指向系统路径、它自己的上级目录或者项目目录的上级目录：会把整个系统目录、或者别的项目一起打进去
 }
 
-// 要从宿主机上打包的每一处都过 approveRoot，各种路径的规则都写在这里。Compose 项目目录不经过软链接时
-// 照原样打包，哪怕是系统路径（例如 compose.yml 直接放在 /root 下）。
+// 要从宿主机上打包的每一处都过 approveRoot，各种路径的规则都写在这里。不经过软链接、配置里直接写的照原样
+// 打包：项目目录哪怕是系统路径（例如 compose.yml 直接放在 /root 下），项目目录外的文件哪怕是项目的上级
+// 目录（例如 build: ..，构建上下文是仓库根目录）。
 var (
 	bindRoot    = rootPolicy{what: "挂载的目录", mustExist: true, skipSystem: true}
 	projectRoot = rootPolicy{what: "项目目录", guardLink: true}
-	outsideRoot = rootPolicy{what: "项目目录外的文件", skipSystem: true}
-	checkRoot   = rootPolicy{what: "迁入前检查用的配置文件"}
+	outsideRoot = rootPolicy{what: "项目目录外的文件", skipSystem: true, guardLink: true}
+	checkRoot   = rootPolicy{what: "迁入前检查用的配置文件", skipSystem: true, guardLink: true}
 )
 
 // approveRoot 按 pol 检查一处要从宿主机上打包的路径，返回它的实际位置（解析掉软链接，打包的是它指向的
-// 内容，见 walkRoot）。system 表示它是系统路径、不打包；返回错误表示不能迁移，要停下。
-func approveRoot(pol rootPolicy, path string) (real string, system bool, err error) {
+// 内容，见 walkRoot）。project 是它所属的 Compose 项目目录的实际位置，不属于项目时为空。system 表示它是
+// 系统路径、不打包；返回错误表示不能迁移，要停下。
+func approveRoot(pol rootPolicy, path, project string) (real string, system bool, err error) {
 	if pol.skipSystem && spec.IsSystemPath(path) {
 		return "", true, nil
 	}
@@ -546,9 +548,11 @@ func approveRoot(pol rootPolicy, path string) (real string, system bool, err err
 		return real, true, nil
 	}
 	if pol.guardLink && real != filepath.Clean(path) {
-		parent := host.RealPath(filepath.Dir(path))
-		if spec.IsSystemPath(real) || parent == real || strings.HasPrefix(parent, real+string(filepath.Separator)) {
-			return "", false, fmt.Errorf("%s %s 经过软链接指向 %s（系统目录，或者它自己的上级目录），打包会把整个目录一起打进去", pol.what, path, real)
+		around := func(p string) bool {
+			return p != "" && (p == real || strings.HasPrefix(p, real+string(filepath.Separator)))
+		}
+		if spec.IsSystemPath(real) || around(host.RealPath(filepath.Dir(path))) || around(project) {
+			return "", false, fmt.Errorf("%s %s 经过软链接指向 %s（系统目录，或者它自己、项目目录的上级目录），打包会把整个目录一起打进去", pol.what, path, real)
 		}
 	}
 	return real, false, nil
