@@ -201,15 +201,15 @@ func (r *run) steps(ctx context.Context) error {
 	disk, err := host.DiskOf(r.workdir)
 	if err == nil && disk.Free < uint64(need) {
 		return &ui.Failure{Reason: fmt.Sprintf("磁盘空间可能不够：迁移包最多需要约 %s（压缩前），%s 所在磁盘只剩 %s",
-			ui.HumanBytes(need), disk.Path, ui.HumanBytes(int64(disk.Free))) +
-			"：清理磁盘，或在命令前面加上 DOCKHOP_HOME=空间更大的目录 再运行"}
+			ui.HumanBytes(need), disk.Path, ui.HumanBytes(int64(disk.Free))),
+			Hint: "清理磁盘，或在命令前面加上 DOCKHOP_HOME=空间更大的目录 再运行"}
 	}
 	if err := os.MkdirAll(r.workdir, 0o700); err != nil {
 		return &ui.Failure{Reason: "无法创建工作目录 " + r.workdir, Err: err}
 	}
 	ln, port, err := transfer.Listen(r.opts.Port)
 	if err != nil {
-		return &ui.Failure{Reason: err.Error() + "：用 --port 换一个端口"}
+		return &ui.Failure{Err: err, Hint: "用 --port 换一个端口"}
 	}
 	addr := transfer.Address{Host: r.opts.Host}
 	if addr.Host == "" {

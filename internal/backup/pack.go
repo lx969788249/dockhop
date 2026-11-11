@@ -158,7 +158,7 @@ func (r *run) stopSources(ctx context.Context, col *collected) error {
 	}
 	r.stopped, r.toRestore = stopList, len(stopList)
 	if err := stopContainers(ctx, r.Docker, waves, s); err != nil {
-		return &ui.Failure{Reason: err.Error() + "：执行 docker ps 检查容器状态"}
+		return &ui.Failure{Err: err, Hint: "执行 docker ps 检查容器状态"}
 	}
 	r.testPause(ctx, "after-stop")
 	return nil
@@ -173,8 +173,8 @@ func (r *run) resumeSources(ctx context.Context, downStart time.Time) error {
 	var failed []string
 	r.Screen.Finish(ctx, func(ctx context.Context) { failed = restoreStates(ctx, r.Docker, r.stopped, r.Screen) })
 	if len(failed) > 0 {
-		return &ui.Failure{Reason: fmt.Sprintf("有 %d 个源容器没能恢复原来的状态：%s", len(failed), strings.Join(failed, "、")) +
-			"：立即执行 docker ps -a 检查，并用 docker start 容器名 手动启动"}
+		return &ui.Failure{Reason: fmt.Sprintf("有 %d 个源容器没能恢复原来的状态：%s", len(failed), strings.Join(failed, "、")),
+			Hint: "立即执行 docker ps -a 检查，并用 docker start 容器名 手动启动"}
 	}
 	r.restored = len(r.stopped)
 	r.stopped = nil

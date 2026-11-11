@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/transfer"
 	"github.com/lx969788249/dockhop/internal/ui"
@@ -118,4 +122,58 @@ func TestEnding(t *testing.T) {
 			t.Errorf("%s：%v，应为 %v", c.name, got, c.want)
 		}
 	}
+}
+
+// 迁出停下时，建议单独写在建议里（结果摘要的“建议：”一行），不接在原因后面：以前磁盘可能不够、端口都被占用、
+// 容器停不下、停下的容器恢复不了这四处，把建议当成了出错的细节和原因连成一句，结果摘要里没有建议。
+func TestAdviceIsHint(t *testing.T) {
+	hintApart(t, "磁盘可能不够", outSteps(t, 1<<60, 0))
+	if ln, err := net.Listen("tcp", ":65535"); err == nil { // 占不上是别的程序在用，一样
+		defer ln.Close()
+	}
+	hintApart(t, "端口都被占用", outSteps(t, 10, 65535))
+
+	fake := dockertest.New(t, func(http.ResponseWriter, *http.Request) bool { return false }) // 停止、启动都失败
+	r := testRun(t, Deps{Docker: fake.Client()}, Options{})
+	web := &docker.Container{ID: "web-id", Name: "/web"}
+	web.State.Running = true
+	hintApart(t, "容器停不下", r.stopSources(context.Background(), &collected{sel: &selection{items: []*item{{c: web}}}}))
+	r.stopped = []StoppedContainer{{Name: "web", ID: "web-id", State: "running"}}
+	hintApart(t, "停下的容器恢复不了", r.resumeSources(context.Background(), time.Now()))
+}
+
+// hintApart 确认 err 是带建议的 *ui.Failure，建议没有接在原因里。
+func hintApart(t *testing.T, what string, err error) {
+	t.Helper()
+	var f *ui.Failure
+	if !errors.As(err, &f) || f.Hint == "" || strings.Contains(f.Error(), f.Hint) {
+		t.Errorf("%s：建议应单独写在建议里：%v（建议：%q）", what, err, ui.HintOf(err))
+	}
+}
+
+// outSteps 用只有一个容器 web（挂着数据卷 data，大小 size）的假 Docker 按步骤迁出 web，--port 是 port；
+// 返回在提供下载之前停下时出的错。
+func outSteps(t *testing.T, size int64, port int) error {
+	t.Helper()
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
+		switch r.URL.Path {
+		case "/info":
+			io.WriteString(w, `{"ServerVersion":"27.5.1"}`)
+		case "/containers/json":
+			io.WriteString(w, `[{"Id":"web-id","Names":["/web"],"State":"running"}]`)
+		case "/containers/web-id/json":
+			io.WriteString(w, `{"Id":"web-id","Name":"/web","Image":"sha256:img","Config":{"Image":"alpine"},"State":{"Status":"running","Running":true},`+
+				`"Mounts":[{"Type":"volume","Name":"data","Destination":"/data","RW":true}]}`)
+		case "/system/df":
+			fmt.Fprintf(w, `{"Volumes":[{"Name":"data","UsageData":{"Size":%d}}]}`, size)
+		case "/images/sha256:img/json":
+			io.WriteString(w, `{"Id":"sha256:img","Size":100}`)
+		case "/volumes/data":
+			io.WriteString(w, `{"Name":"data","Driver":"local"}`)
+		default:
+			return false
+		}
+		return true
+	})
+	return testRun(t, Deps{Docker: fake.Client()}, Options{Include: []string{"web"}, Port: port}).steps(context.Background())
 }
