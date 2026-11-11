@@ -39,6 +39,12 @@ func TestRedact(t *testing.T) {
 		{"\"Password\": \"abc\n后面这行日志要留着\"", "\"Password\": \"***\"\n后面这行日志要留着\""},
 		{"API_TOKEN=abc，def 后面是普通文字", "API_TOKEN=*** 后面是普通文字"},
 		{"PASSWORD=abc，def", "PASSWORD=***"},
+		// 引号在等号后面：引号里的整个值都遮掉，遮到配对的引号为止
+		{"-e DB_PASSWORD=\"a b\" -e MODE=prod", "-e DB_PASSWORD=\"***\" -e MODE=prod"},
+		{"X_TOKEN=\"a b;c\"", "X_TOKEN=\"***\""},
+		{"DB_PASSWORD='a b' MODE=prod", "DB_PASSWORD='***' MODE=prod"},
+		{`DB_PASSWORD="pa\"ss" MODE=prod`, `DB_PASSWORD="***" MODE=prod`},
+		{"DB_PASSWORD=\"abc\n后面这行日志要留着", "DB_PASSWORD=\"***\"\n后面这行日志要留着"},
 	} {
 		cases[c.in] = c.want
 	}
