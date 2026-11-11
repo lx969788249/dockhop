@@ -94,7 +94,7 @@ func TestEnding(t *testing.T) {
 		if c.st.began {
 			r.j = &Journal{}
 		}
-		r.committed, r.partial, r.rollbackDone = c.st.committed, c.st.partial, c.st.rollbackDone
+		r.out.committed, r.out.partial, r.out.rollbackDone = c.st.committed, c.st.partial, c.st.rollbackDone
 		if got := r.ending(c.ctx, c.err); got != c.want {
 			t.Errorf("%s：%v，应为 %v", c.name, got, c.want)
 		}

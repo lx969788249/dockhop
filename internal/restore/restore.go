@@ -110,6 +110,12 @@ type run struct {
 
 	done []string // 同一个链接上次已经迁入、这次跳过的服务
 
+	out outcome // 结局：开始是零值，提交、回滚时填
+}
+
+// outcome 是一次迁入的结局：提交了没有、是不是只保留了一部分服务，撤销过迁入的内容没有、没能撤销和没能
+// 清理的地方。结果摘要（report）和迁移次数（ending）按它定。
+type outcome struct {
 	committed      bool
 	partial        bool // 只保留了一部分服务
 	rollbackDone   bool
@@ -138,7 +144,7 @@ func Run(ctx context.Context, d Deps, o Options) error {
 	case (end == endPartial || end == endFailed) && d.Failed != nil:
 		d.Failed()
 	}
-	if err != nil && r.j != nil && !r.committed {
+	if err != nil && r.j != nil && !r.out.committed {
 		r.Screen.Finish(ctx, r.rollback)
 	}
 	r.cleanup(err == nil)

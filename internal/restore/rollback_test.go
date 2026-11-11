@@ -543,7 +543,7 @@ func TestRollbackKeepsDataWhenWriterWontStop(t *testing.T) {
 	if b, _ := os.ReadFile(filepath.Join(dst, "state")); string(b) != "new" {
 		t.Errorf("数据不应被动过，实际：%q", b)
 	}
-	if issues := strings.Join(r.rollbackIssues, "；"); !strings.Contains(issues, "没能停下") || !strings.Contains(issues, "没有动数据") {
+	if issues := strings.Join(r.out.rollbackIssues, "；"); !strings.Contains(issues, "没能停下") || !strings.Contains(issues, "没有动数据") {
 		t.Errorf("应说明为什么没动数据：%s", issues)
 	}
 }

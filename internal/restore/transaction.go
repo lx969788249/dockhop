@@ -43,22 +43,22 @@ func (r *run) commit(ctx context.Context) error {
 	if err := r.j.add(Entry{Op: opCommit}); err != nil {
 		return s.StepFailed(err.Error(), "", "")
 	}
-	r.committed = true
+	r.out.committed = true
 	entries, err := readJournal(r.rbDir)
 	if err != nil {
-		r.cleanupLeft = []string{"事务日志读不了（" + err.Error() + "），回滚资料没有删除"}
+		r.out.cleanupLeft = []string{"事务日志读不了（" + err.Error() + "），回滚资料没有删除"}
 	} else {
-		r.cleanupLeft = r.undo.cleanupCommitted(ctx, entries)
+		r.out.cleanupLeft = r.undo.cleanupCommitted(ctx, entries)
 	}
-	if len(r.cleanupLeft) == 0 {
+	if len(r.out.cleanupLeft) == 0 {
 		r.j.close()
 		if err := os.RemoveAll(r.rbDir); err != nil {
-			r.cleanupLeft = append(r.cleanupLeft, r.rbDir)
+			r.out.cleanupLeft = append(r.out.cleanupLeft, r.rbDir)
 		}
 	}
 	r.clearDone()
-	if len(r.cleanupLeft) > 0 {
-		s.Warn("服务和数据都已迁入，但有些回滚资料没能删除：%s", strings.Join(r.cleanupLeft, "；"))
+	if len(r.out.cleanupLeft) > 0 {
+		s.Warn("服务和数据都已迁入，但有些回滚资料没能删除：%s", strings.Join(r.out.cleanupLeft, "；"))
 		s.Fail()
 		return ui.ErrReported
 	}
@@ -87,12 +87,12 @@ func (r *run) rollback(ctx context.Context) {
 	r.Screen.Println("迁入没有完成，正在删除这次迁入的内容，让新服务器回到迁入前的样子……")
 	entries, err := readJournal(r.rbDir)
 	if err != nil {
-		r.rollbackIssues = []string{"事务日志读不了：" + err.Error()}
+		r.out.rollbackIssues = []string{"事务日志读不了：" + err.Error()}
 		return
 	}
-	r.rollbackIssues = r.undo.rollback(ctx, entries)
-	r.rollbackDone = true
-	if len(r.rollbackIssues) == 0 {
+	r.out.rollbackIssues = r.undo.rollback(ctx, entries)
+	r.out.rollbackDone = true
+	if len(r.out.rollbackIssues) == 0 {
 		r.j.close()
 		if err := os.RemoveAll(r.rbDir); err != nil {
 			r.Log.Printf("回滚资料目录没能删除：%v", err)
@@ -164,9 +164,9 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 	}
 	// 和这次迁入失败时的撤销一样（见 Run）：一旦开始就做完，不因为一次 Ctrl+C 停在一半（见 ui.Screen.Finish）；
 	// 没能撤销的地方也一样列在结果摘要里。
-	s.Finish(ctx, func(ctx context.Context) { r.rollbackIssues = r.undo.rollback(ctx, entries) })
-	r.rollbackDone = true
-	if len(r.rollbackIssues) > 0 {
+	s.Finish(ctx, func(ctx context.Context) { r.out.rollbackIssues = r.undo.rollback(ctx, entries) })
+	r.out.rollbackDone = true
+	if len(r.out.rollbackIssues) > 0 {
 		return s.StepFailed("上次迁入的内容没能全部删除", "", "")
 	}
 	s.Info("已删除上次迁入的内容，回到了上次迁入之前的样子")

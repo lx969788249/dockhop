@@ -64,7 +64,7 @@ func (r *run) servicesText() string {
 
 // changed 表示这次运行改动过这台服务器：开始了这次迁入的事务，或者撤销过迁入的内容（这次的，
 // 或者上次被强制结束时留下的）。
-func (r *run) changed() bool { return r.j != nil || r.rollbackDone }
+func (r *run) changed() bool { return r.j != nil || r.out.rollbackDone }
 
 // ending 是一次迁入的结局：结果摘要按它写，迁移次数按它统计（见 Deps 的 Succeeded、Failed）。
 type ending int
@@ -90,9 +90,9 @@ func (r *run) ending(ctx context.Context, err error) ending {
 		return endSucceeded
 	case !r.changed():
 		return endStopped
-	case r.partial:
+	case r.out.partial:
 		return endPartial
-	case r.committed:
+	case r.out.committed:
 		return endCommitted
 	case interrupted:
 		return endInterrupted
@@ -138,19 +138,19 @@ func (r *run) report(ctx context.Context, end ending) error {
 		if len(r.done) > 0 {
 			lines = append(lines, "上次已经迁入："+strings.Join(r.done, "、"))
 		}
-		if len(r.rollbackIssues) == 0 {
+		if len(r.out.rollbackIssues) == 0 {
 			lines = append(lines, "没有迁入（已删除）："+labels(failed))
 		} else {
 			lines = append(lines, "没有迁入、也没能删干净："+labels(failed))
 			lines = append(lines, "重要：请先不要启动它们，按下面的情况人工处理")
-			for _, p := range r.rollbackIssues {
+			for _, p := range r.out.rollbackIssues {
 				lines = append(lines, "  · "+p)
 			}
 			lines = append(lines, "回滚资料："+r.rbDir+"（下次运行迁入时会提示继续删除）")
 		}
-		if len(r.cleanupLeft) > 0 {
-			left := "有些回滚资料没能删除：" + strings.Join(r.cleanupLeft, "；")
-			if len(r.rollbackIssues) == 0 {
+		if len(r.out.cleanupLeft) > 0 {
+			left := "有些回滚资料没能删除：" + strings.Join(r.out.cleanupLeft, "；")
+			if len(r.out.rollbackIssues) == 0 {
 				left += "（下次运行迁入时会接着删除）"
 			}
 			lines = append(lines, left)
@@ -162,21 +162,21 @@ func (r *run) report(ctx context.Context, end ending) error {
 		rep.Result = "⚠️ 服务和数据都已迁入，但清理没有完成"
 		lines = append(lines, "待清理的回滚资料："+r.rbDir)
 		status.Result = "success"
-	case r.rollbackDone && len(r.rollbackIssues) == 0:
+	case r.out.rollbackDone && len(r.out.rollbackIssues) == 0:
 		if interrupted {
 			rep.Result = "⚠️ 迁入已中断，迁入的内容已全部删除"
 		} else {
 			rep.Result = "❌ 迁入失败，迁入的内容已全部删除"
 		}
 		lines = append(lines, "新服务器：回到了迁入前的样子，原来的服务和数据都在")
-	case r.rollbackDone || len(r.rollbackIssues) > 0:
+	case r.out.rollbackDone || len(r.out.rollbackIssues) > 0:
 		if interrupted {
 			rep.Result = "⚠️ 迁入已中断，迁入的内容没能全部删除"
 		} else {
 			rep.Result = "⚠️ 迁入失败，迁入的内容没能全部删除"
 		}
 		lines = append(lines, "重要：请先不要启动相关容器，按下面的情况人工处理")
-		for _, p := range r.rollbackIssues {
+		for _, p := range r.out.rollbackIssues {
 			lines = append(lines, "  · "+p)
 		}
 		lines = append(lines, "回滚资料："+r.rbDir+"（下次运行迁入时会提示继续删除）")
