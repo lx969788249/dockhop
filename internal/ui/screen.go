@@ -13,6 +13,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -63,6 +64,8 @@ type Screen struct {
 	kept     []string // 清屏重画时要留下的行：步骤结果、警告、说明
 	asked    bool     // 当前步骤里问过问题
 	ctx      context.Context
+	// finishing 是正在做的收尾（见 Finish）有几处：大于 0 时按 Ctrl+C 先提醒、再按一次才立即结束。
+	finishing atomic.Int32
 }
 
 // New 创建屏幕输出。tty 为 true 时使用颜色并原地刷新进度。
@@ -369,6 +372,26 @@ func (s *Screen) Warnings() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.warnings...)
+}
+
+// Finish 做开始了就要做完的收尾 f（回滚、恢复停下的容器）：给它的 context 不随 Ctrl+C 取消。收尾时用户按
+// Ctrl+C，先提醒现在停止可能留下没收拾完的东西，再按一次才立即结束（按键的处理见 cli）。
+func (s *Screen) Finish(ctx context.Context, f func(context.Context)) {
+	s.finishing.Add(1)
+	defer s.finishing.Add(-1)
+	f(context.WithoutCancel(ctx))
+}
+
+// Finishing 表示眼下正在做 Finish 的收尾。
+func (s *Screen) Finishing() bool { return s.finishing.Load() > 0 }
+
+// Remind 显示一条提醒，写进日志。和警告一样醒目，但不汇总到最终结果（见 Warn）。
+func (s *Screen) Remind(msg string) {
+	s.log.Printf("提醒：%s", msg)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clearLine()
+	s.keep("    " + s.Orange("!") + " " + msg)
 }
 
 // Println 输出普通文字（菜单、说明等），会先清掉进度行。

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/lx969788249/dockhop/internal/crypto"
+	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 type run struct {
@@ -223,5 +224,48 @@ func TestDockhopHomeNotTmp(t *testing.T) {
 	t.Setenv("HOME", "")
 	if h, err := userHome(); err != nil || h == "" {
 		t.Fatalf("HOME 没设置时应按用户信息找：%q %v", h, err)
+	}
+}
+
+// Ctrl+C（问题表 D18）：平时让手上的事停下（已经改动过的接着收尾）；收尾时（见 ui.Screen.Finish）按，先提醒
+// 现在停止可能留下没收拾完的东西、确定就再按一次，提醒之后再按才立即结束。平时连按两下只是停下、提醒，
+// 第三下才结束：第一下引起的收尾要做完。
+func TestInterrupts(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		finishing bool
+		presses   int
+		reminded  bool
+		exited    bool
+	}{
+		{"平时按一下", false, 1, false, false},
+		{"平时连按两下", false, 2, true, false},
+		{"平时连按三下", false, 3, true, true},
+		{"收尾时按一下", true, 1, true, false},
+		{"收尾时按两下", true, 2, true, true},
+	} {
+		var out bytes.Buffer
+		sigs := make(chan os.Signal)
+		code := -1
+		ctx, cancel := context.WithCancel(context.Background())
+		e := &Env{Context: ctx, Interrupts: sigs, Exit: func(c int) { code = c }}
+		e.screen = ui.New(&out, false, nil)
+		release, started := make(chan struct{}), make(chan struct{})
+		if c.finishing {
+			go e.screen.Finish(ctx, func(context.Context) { close(started); <-release })
+			<-started
+		}
+		done := make(chan struct{})
+		go func() { e.watchInterrupts(cancel); close(done) }()
+		for range c.presses {
+			sigs <- os.Interrupt
+		}
+		close(sigs)
+		<-done
+		close(release)
+		reminded := strings.Contains(out.String(), "再按一次 Ctrl+C")
+		if ctx.Err() == nil || reminded != c.reminded || (code == ExitInterrupted) != c.exited {
+			t.Errorf("%s：取消了 %v，提醒了 %v，立即结束了 %v\n%s", c.name, ctx.Err() != nil, reminded, code == ExitInterrupted, out.String())
+		}
 	}
 }

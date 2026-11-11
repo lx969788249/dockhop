@@ -170,7 +170,9 @@ func (r *run) resumeSources(ctx context.Context, downStart time.Time) error {
 		return nil
 	}
 	r.downtime = time.Since(downStart)
-	if failed := restoreStates(context.WithoutCancel(ctx), r.Docker, r.stopped, r.Screen); len(failed) > 0 {
+	var failed []string
+	r.Screen.Finish(ctx, func(ctx context.Context) { failed = restoreStates(ctx, r.Docker, r.stopped, r.Screen) })
+	if len(failed) > 0 {
 		return r.Screen.StepFailed(fmt.Sprintf("有 %d 个源容器没能恢复原来的状态：%s", len(failed), strings.Join(failed, "、")),
 			"立即执行 docker ps -a 检查，并用 docker start 容器名 手动启动", "")
 	}

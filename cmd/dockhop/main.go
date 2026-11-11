@@ -2,7 +2,6 @@
 package main
 
 import (
-	"context"
 	"io"
 	"os"
 	"os/signal"
@@ -17,20 +16,21 @@ import (
 var version = "dev"
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	defer stop()
+	// Ctrl+C（以及 SIGTERM、SIGHUP）交给 cli：平时让手上的事停下，收尾时先提醒、再按一次才立即结束。
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
 	tty := term.IsTerminal(int(os.Stderr.Fd()))
 	code := cli.Run(os.Args[1:], cli.Env{
-		Stdout:  os.Stdout,
-		Stderr:  os.Stderr,
-		TTY:     tty,
-		Input:   terminalInput(tty),
-		Version: version,
-		Context: ctx,
-		Width:   terminalWidth,
-		Count:   "https://dockhop.run/count",
-		Failed:  "https://dockhop.run/failed",
+		Stdout:     os.Stdout,
+		Stderr:     os.Stderr,
+		TTY:        tty,
+		Input:      terminalInput(tty),
+		Version:    version,
+		Interrupts: sigs,
+		Width:      terminalWidth,
+		Count:      "https://dockhop.run/count",
+		Failed:     "https://dockhop.run/failed",
 	})
 	os.Exit(code)
 }

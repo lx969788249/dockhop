@@ -162,15 +162,14 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 	} else {
 		s.Println("没有可以输入的终端，直接删除上次迁入的内容。")
 	}
-	// 和这次迁入失败时的撤销一样（见 Run）：一旦开始就做完，不因为 Ctrl+C 停在一半；没能撤销的
-	// 地方也一样列在结果摘要里。
-	ctx = context.WithoutCancel(ctx)
-	r.rollbackIssues = r.undo.rollback(ctx, entries)
+	// 和这次迁入失败时的撤销一样（见 Run）：一旦开始就做完，不因为一次 Ctrl+C 停在一半（见 ui.Screen.Finish）；
+	// 没能撤销的地方也一样列在结果摘要里。
+	s.Finish(ctx, func(ctx context.Context) { r.rollbackIssues = r.undo.rollback(ctx, entries) })
 	r.rollbackDone = true
 	if len(r.rollbackIssues) > 0 {
 		return s.StepFailed("上次迁入的内容没能全部删除", "", "")
 	}
 	s.Info("已删除上次迁入的内容，回到了上次迁入之前的样子")
-	r.cleanHelpers(ctx)
+	r.cleanHelpers(context.WithoutCancel(ctx))
 	return os.RemoveAll(r.rbDir)
 }

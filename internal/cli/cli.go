@@ -43,6 +43,10 @@ type Env struct {
 	Args     []string
 	Count    string // 成功完成迁移的次数的地址（见 count.go）；为空时不访问
 	Failed   string // 迁移失败的次数的地址（见 count.go）；为空时不访问
+	// Interrupts 是用户按的 Ctrl+C（以及 SIGTERM、SIGHUP），按 watchInterrupts 的规则处理；为空时不处理。
+	Interrupts <-chan os.Signal
+	// Exit 立即结束程序（收尾时用户确认要停止，见 watchInterrupts），默认 os.Exit。
+	Exit func(code int)
 
 	// 一次运行只有一个屏幕和一个提问器：同一个终端输入只能有一个地方在读。
 	screen *ui.Screen
@@ -64,6 +68,31 @@ func (e *Env) fill() {
 	}
 	if e.Version == "" {
 		e.Version = "dev"
+	}
+	if e.Exit == nil {
+		e.Exit = os.Exit
+	}
+}
+
+// watchInterrupts 处理用户按的 Ctrl+C（以及 SIGTERM、SIGHUP）：平时让手上的事停下（cancel），已经改动过的
+// 接着收尾（删除迁入的内容、放回原来的服务，恢复停下的容器），收尾要做完才退出。收尾时（见
+// ui.Screen.Finish）按，或者已经停下了又按，提醒现在停止可能留下没收拾完的东西、确定就再按一次；提醒之后
+// 再按，立即结束，下次运行接着收尾。平时连按两下只会停下、提醒：第一下引起的收尾照样做完。
+func (e *Env) watchInterrupts(cancel func()) {
+	reminded := false
+	for range e.Interrupts {
+		switch {
+		case reminded:
+			e.Exit(ExitInterrupted)
+			return
+		case e.Context.Err() == nil && !e.screen.Finishing():
+			cancel()
+		default:
+			cancel()
+			e.screen.Remind("正在收尾。现在停止可能会留下没收拾完的东西（比如没删完的迁入内容、还停着的服务），下次运行 DockHop " +
+				"会接着处理。确定要立即停止，请再按一次 Ctrl+C")
+			reminded = true
+		}
 	}
 }
 
@@ -156,9 +185,17 @@ func Run(args []string, env Env) int {
 		cmd, rest = rest[0], rest[1:]
 	}
 	env.Args = args
+	cancel := func() {}
+	if env.Interrupts != nil {
+		env.Context, cancel = context.WithCancel(env.Context)
+		defer cancel()
+	}
 	env.screen = ui.New(env.Stderr, env.TTY, nil).WithContext(env.Context)
 	env.screen.SetWidth(env.Width)
 	env.screen.SetBanner(ui.Banner(env.Version, env.TTY))
+	if env.Interrupts != nil {
+		go env.watchInterrupts(cancel)
+	}
 	env.prompt = ui.NewPrompter(env.Input, env.Stderr).WithContext(env.Context)
 	err := dispatch(cmd, rest, &env)
 	return exitCode(err, env.Stderr)

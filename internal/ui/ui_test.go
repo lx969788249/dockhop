@@ -419,3 +419,22 @@ func TestStepFailedWhenInterrupted(t *testing.T) {
 		t.Fatalf("没有屏幕时也应返回 ErrReported：%v", err)
 	}
 }
+
+// Finish 做开始了就要做完的收尾：给它的 context 不随外面的取消而取消，做的时候 Finishing 为真（按 Ctrl+C 时
+// 据此先提醒，见 cli）；做完就不是了。
+func TestFinish(t *testing.T) {
+	s := New(io.Discard, false, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if s.Finishing() {
+		t.Fatal("还没开始收尾")
+	}
+	s.Finish(ctx, func(ctx context.Context) {
+		if ctx.Err() != nil || !s.Finishing() {
+			t.Errorf("收尾时：取消了 %v，Finishing %v", ctx.Err(), s.Finishing())
+		}
+	})
+	if s.Finishing() {
+		t.Error("收尾做完了")
+	}
+}

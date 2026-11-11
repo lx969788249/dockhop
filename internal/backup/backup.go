@@ -252,31 +252,33 @@ func (r *run) steps(ctx context.Context) error {
 const largeLayer = 100 << 20
 
 // cleanup 收尾：恢复还停着的源容器、删掉临时快照和临时容器、关闭下载服务、
-// 删除工作目录。中断时也会执行。
+// 删除工作目录。中断时也会执行，开始了就做完（见 ui.Screen.Finish），最多等 5 分钟。
 func (r *run) cleanup() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	if r.server != nil {
-		_ = r.server.Shutdown(ctx)
-	}
-	if len(r.stopped) > 0 {
-		failed := restoreStates(ctx, r.Docker, r.stopped, r.Screen)
-		r.restored = r.toRestore - len(failed)
-		if len(failed) == 0 {
-			_ = removeStopped(r.Home)
-		} else {
-			r.Screen.Error(fmt.Sprintf("有 %d 个源容器没能恢复原来的状态：%s", len(failed), strings.Join(failed, "、")),
-				"立即执行 docker ps -a 检查，并用 docker start 容器名 手动启动")
+	r.Screen.Finish(context.Background(), func(ctx context.Context) {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		if r.server != nil {
+			_ = r.server.Shutdown(ctx)
 		}
-		r.stopped = nil
-	}
-	r.removeTempTags()
-	helper.Clean(ctx, r.Docker, lockPath(r.Home))
-	if r.workdir != "" {
-		if err := os.RemoveAll(r.workdir); err != nil {
-			r.Screen.Warn("临时文件没能删除，请手动删除：%s", r.workdir)
+		if len(r.stopped) > 0 {
+			failed := restoreStates(ctx, r.Docker, r.stopped, r.Screen)
+			r.restored = r.toRestore - len(failed)
+			if len(failed) == 0 {
+				_ = removeStopped(r.Home)
+			} else {
+				r.Screen.Error(fmt.Sprintf("有 %d 个源容器没能恢复原来的状态：%s", len(failed), strings.Join(failed, "、")),
+					"立即执行 docker ps -a 检查，并用 docker start 容器名 手动启动")
+			}
+			r.stopped = nil
 		}
-	}
+		r.removeTempTags()
+		helper.Clean(ctx, r.Docker, lockPath(r.Home))
+		if r.workdir != "" {
+			if err := os.RemoveAll(r.workdir); err != nil {
+				r.Screen.Warn("临时文件没能删除，请手动删除：%s", r.workdir)
+			}
+		}
+	})
 }
 
 // removeTempTags 删掉为导出旧版本镜像临时加的名字（只删名字，镜像本身还在用）。

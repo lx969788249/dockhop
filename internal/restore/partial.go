@@ -103,7 +103,7 @@ func (r *run) commitPartial(ctx context.Context, ok, failed []*group) error {
 	r.j.close()
 	r.committed, r.partial = true, true
 	s.Note("删除没启动的服务")
-	r.rollbackIssues, r.cleanupLeft = r.finishPartial(context.WithoutCancel(ctx), entries, kept)
+	s.Finish(ctx, func(ctx context.Context) { r.rollbackIssues, r.cleanupLeft = r.finishPartial(ctx, entries, kept) })
 	r.rollbackDone = true
 	var items []*citem
 	for _, g := range ok {
@@ -170,10 +170,10 @@ func (r *run) resumePartial(ctx context.Context, entries []Entry, kept []string)
 	s := r.Screen
 	s.Hold()
 	s.Println("上次迁入只保留了正常运行的服务，删除没启动的服务时被结束了，现在接着删除……")
-	ctx = context.WithoutCancel(ctx)
-	issues, left := r.finishPartial(ctx, entries, kept)
+	var issues, left []string
+	s.Finish(ctx, func(ctx context.Context) { issues, left = r.finishPartial(ctx, entries, kept) })
 	r.rollbackIssues, r.rollbackDone = issues, true // 改动过这台服务器：之后取消、失败时结果里要这样写
-	r.cleanHelpers(ctx)
+	r.cleanHelpers(context.WithoutCancel(ctx))
 	if len(left) > 0 {
 		s.Warn("上次迁入保留下来的服务有些回滚资料没能删除：%s", strings.Join(left, "；"))
 	}

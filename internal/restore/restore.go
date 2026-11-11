@@ -139,7 +139,7 @@ func Run(ctx context.Context, d Deps, o Options) error {
 		d.Failed()
 	}
 	if err != nil && r.j != nil && !r.committed {
-		r.rollback(context.WithoutCancel(ctx))
+		r.Screen.Finish(ctx, r.rollback)
 	}
 	r.cleanup(err == nil)
 	return r.report(ctx, end)
