@@ -1,0 +1,5 @@
+# 文本文件一律用 LF：脚本（run.sh 等）换成 CRLF 就运行不了，在 Windows 上检出也不转换。
+* text=auto eol=lf
+# 逐字节比较的测试数据（终端输出，里面有控制字符）和图片不当文本处理。
+*.golden -text
+*.png binary
