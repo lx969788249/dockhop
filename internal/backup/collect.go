@@ -191,15 +191,11 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 				}
 				vols[m.Name] = v
 			case "bind":
-				if spec.IsSystemPath(m.Source) {
-					out.systemOnly = append(out.systemOnly, m.Source)
-					continue
-				}
-				real, err := filepath.EvalSymlinks(m.Source)
+				real, system, err := approveRoot(bindRoot, m.Source)
 				if err != nil {
 					return nil, fmt.Errorf("容器 %s 挂载的目录 %s 读不到：%v", it.name(), m.Source, err)
 				}
-				if spec.IsSystemPath(real) {
+				if system {
 					out.systemOnly = append(out.systemOnly, m.Source)
 					continue
 				}
@@ -295,11 +291,14 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 			continue
 		}
 		p := &projectInfo{u: u}
+		stop := func(err error) error {
+			return screen.StepFailed("Compose 项目 "+u.project+" 没法迁移："+err.Error(), "",
+				"把它改成普通的目录或文件（或者让它指向一个单独的地方）后重新运行，或者不迁移这个项目")
+		}
 		// 挂载目录记的是真实路径，项目目录本身是软链接时也按它的真实路径比较。
-		dir, err := projectDir(u.workingDir)
+		dir, _, err := approveRoot(projectRoot, u.workingDir)
 		if err != nil {
-			return nil, screen.StepFailed("Compose 项目 "+u.project+" 没法迁移："+err.Error(), "",
-				"把项目目录改成普通目录（或者让它指向一个单独的目录）后重新运行，或者不迁移这个项目")
+			return nil, stop(err)
 		}
 		for _, b := range out.binds {
 			if b.path == dir || strings.HasPrefix(dir, b.path+"/") {
@@ -314,12 +313,23 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		}
 		cp := compose.Project{Name: u.project, WorkingDir: u.workingDir, Files: u.files}
 		if p.inBind {
-			p.check = compose.CheckFiles(cp)
+			for _, f := range compose.CheckFiles(cp) {
+				_, system, err := approveRoot(checkRoot, f)
+				if err != nil {
+					return nil, stop(err)
+				}
+				if !system {
+					p.check = append(p.check, f)
+				}
+			}
 		}
 		files, unknown := compose.DeclaredFiles(cp)
 		for _, r := range files {
-			// 系统路径不迁移（新服务器上自己有）；本身是软链接、指向系统路径的也一样，打包的会是它指向的内容。
-			if spec.IsSystemPath(r) || spec.IsSystemPath(host.RealPath(r)) {
+			_, system, err := approveRoot(outsideRoot, r)
+			if err != nil {
+				return nil, stop(err)
+			}
+			if system {
 				continue
 			}
 			p.outside = append(p.outside, r)
@@ -503,19 +513,45 @@ func sharesData(it *item, vols map[string]bool, paths []string) bool {
 	return false
 }
 
-// projectDir 返回 Compose 项目目录的真实路径。项目目录可能经过软链接（例如指向数据盘），打包的是它
-// 指向的目录（见 walkRoot）；指向系统目录或者它自己的上级目录时返回错误：那样会把整个系统目录、
-// 或者别的项目和 DockHop 自己的文件一起打进迁移包。不经过软链接的照原样打包。
-func projectDir(workingDir string) (string, error) {
-	real := host.RealPath(workingDir)
-	if real == filepath.Clean(workingDir) {
-		return real, nil
+// rootPolicy 是一种要从宿主机上打包的路径过检查的规则（见 approveRoot）。
+type rootPolicy struct {
+	what       string // 给人看的叫法
+	mustExist  bool   // 读不到就停下
+	skipSystem bool   // 它本身或者它指向的地方是系统路径时不打包（新服务器上自己有）
+	guardLink  bool   // 经过软链接时不能指向系统路径或者它自己的上级目录：会把整个系统目录、或者别的项目一起打进去
+}
+
+// 要从宿主机上打包的每一处都过 approveRoot，各种路径的规则都写在这里。Compose 项目目录不经过软链接时
+// 照原样打包，哪怕是系统路径（例如 compose.yml 直接放在 /root 下）。
+var (
+	bindRoot    = rootPolicy{what: "挂载的目录", mustExist: true, skipSystem: true}
+	projectRoot = rootPolicy{what: "项目目录", guardLink: true}
+	outsideRoot = rootPolicy{what: "项目目录外的文件", skipSystem: true}
+	checkRoot   = rootPolicy{what: "迁入前检查用的配置文件"}
+)
+
+// approveRoot 按 pol 检查一处要从宿主机上打包的路径，返回它的实际位置（解析掉软链接，打包的是它指向的
+// 内容，见 walkRoot）。system 表示它是系统路径、不打包；返回错误表示不能迁移，要停下。
+func approveRoot(pol rootPolicy, path string) (real string, system bool, err error) {
+	if pol.skipSystem && spec.IsSystemPath(path) {
+		return "", true, nil
 	}
-	parent := host.RealPath(filepath.Dir(workingDir))
-	if spec.IsSystemPath(real) || parent == real || strings.HasPrefix(parent, real+string(filepath.Separator)) {
-		return "", fmt.Errorf("项目目录 %s 经过软链接指向 %s（系统目录，或者它自己的上级目录），没法只打包这个项目", workingDir, real)
+	real = host.RealPath(path)
+	if pol.mustExist {
+		if real, err = filepath.EvalSymlinks(path); err != nil {
+			return "", false, err
+		}
 	}
-	return real, nil
+	if pol.skipSystem && spec.IsSystemPath(real) {
+		return real, true, nil
+	}
+	if pol.guardLink && real != filepath.Clean(path) {
+		parent := host.RealPath(filepath.Dir(path))
+		if spec.IsSystemPath(real) || parent == real || strings.HasPrefix(parent, real+string(filepath.Separator)) {
+			return "", false, fmt.Errorf("%s %s 经过软链接指向 %s（系统目录，或者它自己的上级目录），打包会把整个目录一起打进去", pol.what, path, real)
+		}
+	}
+	return real, false, nil
 }
 
 // treeSize 统计目录或文件的大小，和打包时一样，root 本身是软链接时统计它指向的内容（见 walkRoot）。

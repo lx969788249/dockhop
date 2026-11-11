@@ -138,16 +138,16 @@ func TestProjectDirLinkGuard(t *testing.T) {
 	for name, target := range map[string]string{"ok": filepath.Join(root, "disk", "app"), "parent": apps, "system": "/usr"} {
 		link := filepath.Join(apps, name)
 		os.Symlink(target, link)
-		_, err := projectDir(link)
+		_, _, err := approveRoot(projectRoot, link)
 		if (name == "ok") != (err == nil) {
 			t.Errorf("%s：%v", name, err)
 		}
 	}
-	if real, err := projectDir(filepath.Join(root, "disk", "app")); err != nil || !strings.HasSuffix(real, filepath.Join("disk", "app")) {
+	if real, _, err := approveRoot(projectRoot, filepath.Join(root, "disk", "app")); err != nil || !strings.HasSuffix(real, filepath.Join("disk", "app")) {
 		t.Errorf("普通目录：%s %v", real, err)
 	}
 	// 不经过软链接的项目目录照原样打包，哪怕它是系统目录（例如 compose.yml 直接放在 /root 下）。
-	if real, err := projectDir("/usr"); err != nil || real != "/usr" {
+	if real, _, err := approveRoot(projectRoot, "/usr"); err != nil || real != "/usr" {
 		t.Errorf("普通的系统目录：%s %v", real, err)
 	}
 }
