@@ -139,52 +139,28 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		packed += n
 		m.Volumes = append(m.Volumes, bundle.Volume{Name: v.name, Driver: v.driver, Anonymous: v.anonymous, Bytes: n, Parts: parts})
 	}
-	for _, b := range col.binds {
-		rc := hostTar{ctx: ctx, roots: []string{b.path}, base: "/", excludes: r.ownDirs(b.path), logf: r.Log.Printf}.stream()
-		parts, n, err := r.addStream(w, "binds/"+b.id, "目录 "+ui.ShortPath(b.path), rc, b.bytes)
+	// 宿主机上的数据（见 hostRoots）；迁移包清单里记着每一份分了几段。
+	parts := map[string]int{}
+	for _, root := range col.hostRoots() {
+		excludes := append(append([]string(nil), root.excludes...), r.ownDirs(root.paths...)...)
+		rc := hostTar{ctx: ctx, roots: root.paths, base: root.base, excludes: excludes, bigLimit: root.bigLimit, logf: r.Log.Printf}.stream()
+		n, size, err := r.addStream(w, root.stream, root.label, rc, root.bytes)
 		rc.Close()
 		if err != nil {
-			return nil, 0, "", s.StepFailed("打包目录 "+b.path+" 失败", err.Error(), "")
+			return nil, 0, "", s.StepFailed(root.fail, err.Error(), "")
 		}
-		packed += n
-		m.Binds = append(m.Binds, bundle.Bind{ID: b.id, Path: b.path, Link: b.link(), Links: b.links, Dir: b.dir, Bytes: b.bytes, Parts: parts})
+		parts[root.stream] = n
+		packed += size
+	}
+	for _, b := range col.binds {
+		m.Binds = append(m.Binds, bundle.Bind{ID: b.id, Path: b.path, Link: b.link(), Links: b.links, Dir: b.dir, Bytes: b.bytes, Parts: parts[bindStream(b)]})
 	}
 	for _, p := range col.projects {
 		mp := bundle.Project{Name: p.u.project, WorkingDir: p.u.workingDir, ConfigFiles: p.u.files, ConfigArgs: p.u.fileArgs,
-			Outside: p.outside, Skipped: p.skipped, ConfigDrift: p.drift}
+			Outside: p.outside, Skipped: p.skipped, ConfigDrift: p.drift,
+			DirParts: parts[projectStream(p, "dir")], CheckParts: parts[projectStream(p, "check")], OutParts: parts[projectStream(p, "outside")]}
 		for _, it := range p.u.items {
 			mp.Services = append(mp.Services, it.c.Config.Labels[labelService])
-		}
-		if !p.inBind {
-			excludes := append(append([]string(nil), p.excludes...), r.ownDirs(p.u.workingDir)...)
-			rc := hostTar{ctx: ctx, roots: []string{p.u.workingDir}, base: p.u.workingDir, excludes: excludes, bigLimit: bigFileLimit, logf: r.Log.Printf}.stream()
-			parts, n, err := r.addStream(w, "compose/"+p.u.project+"/dir", "Compose 项目 "+p.u.project, rc, p.dirBytes)
-			rc.Close()
-			if err != nil {
-				return nil, 0, "", s.StepFailed("打包 Compose 项目 "+p.u.project+" 失败", err.Error(), "")
-			}
-			mp.DirParts = parts
-			packed += n
-		}
-		if len(p.check) > 0 {
-			rc := hostTar{ctx: ctx, roots: p.check, base: p.u.workingDir, logf: r.Log.Printf}.stream()
-			parts, n, err := r.addStream(w, "compose/"+p.u.project+"/check", "Compose 项目 "+p.u.project+" 的配置文件", rc, 0)
-			rc.Close()
-			if err != nil {
-				return nil, 0, "", s.StepFailed("打包 Compose 项目 "+p.u.project+" 的配置文件失败", err.Error(), "")
-			}
-			mp.CheckParts = parts
-			packed += n
-		}
-		if len(p.outside) > 0 {
-			rc := hostTar{ctx: ctx, roots: p.outside, base: "/", excludes: r.ownDirs(p.outside...), logf: r.Log.Printf}.stream()
-			parts, n, err := r.addStream(w, "compose/"+p.u.project+"/outside", "Compose 项目 "+p.u.project+" 引用的文件", rc, p.outBytes)
-			rc.Close()
-			if err != nil {
-				return nil, 0, "", s.StepFailed("打包 Compose 项目 "+p.u.project+" 引用的文件失败", err.Error(), "")
-			}
-			mp.OutParts = parts
-			packed += n
 		}
 		m.Projects = append(m.Projects, mp)
 	}

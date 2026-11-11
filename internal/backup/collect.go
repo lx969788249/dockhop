@@ -100,19 +100,56 @@ type collected struct {
 	secrets    []string        // 需要在日志里隐藏的值
 }
 
-// hostPaths 是打包时要读的宿主机上的地方（真实路径）：挂载目录、Compose 项目目录（在挂载目录里的
-// 随挂载目录打包）和项目目录外的文件。
-func (c *collected) hostPaths() []string {
-	var out []string
+// hostRoot 是要从宿主机上打包的一份：迁移包里的一段（stream），里面是 paths 这几处（都过了 approveRoot）。
+// 要从宿主机上打包什么只写在 hostRoots 这一处：打包（pack）、打包期间要一起停的容器（hostPaths）、估计的
+// 大小（dataBytes）都从它来。
+type hostRoot struct {
+	stream   string   // 迁移包里的名字（见 bindStream、projectStream）
+	label    string   // 进度里显示的
+	fail     string   // 打包失败时的说明
+	paths    []string // 要打包的路径（声明的写法）
+	base     string   // 打包后的名字从哪里算起："/"，或者 Compose 项目目录
+	excludes []string // 不打包的：已经作为挂载目录打包的子目录（DockHop 自己的目录打包时另外排除）
+	bigLimit int64    // 大于 0 时，超过它的文件不打包（Compose 项目目录）
+	bytes    int64    // 估计的大小
+}
+
+func bindStream(b *bindInfo) string { return "binds/" + b.id }
+
+// projectStream 是 Compose 项目的一部分在迁移包里的名字：dir 项目目录、check 迁入前检查用的配置文件（项目
+// 目录在挂载目录里时）、outside 项目目录外的文件。
+func projectStream(p *projectInfo, part string) string { return "compose/" + p.u.project + "/" + part }
+
+func (c *collected) hostRoots() []hostRoot {
+	var out []hostRoot
 	for _, b := range c.binds {
-		out = append(out, b.path)
+		out = append(out, hostRoot{stream: bindStream(b), label: "目录 " + ui.ShortPath(b.path), fail: "打包目录 " + b.path + " 失败",
+			paths: []string{b.path}, base: "/", bytes: b.bytes})
 	}
 	for _, p := range c.projects {
+		name := "Compose 项目 " + p.u.project
 		if !p.inBind {
-			out = append(out, host.RealPath(p.u.workingDir))
+			out = append(out, hostRoot{stream: projectStream(p, "dir"), label: name, fail: "打包 " + name + " 失败",
+				paths: []string{p.u.workingDir}, base: p.u.workingDir, excludes: p.excludes, bigLimit: bigFileLimit, bytes: p.dirBytes})
 		}
-		for _, o := range p.outside {
-			out = append(out, host.RealPath(o))
+		if len(p.check) > 0 {
+			out = append(out, hostRoot{stream: projectStream(p, "check"), label: name + " 的配置文件", fail: "打包 " + name + " 的配置文件失败",
+				paths: p.check, base: p.u.workingDir})
+		}
+		if len(p.outside) > 0 {
+			out = append(out, hostRoot{stream: projectStream(p, "outside"), label: name + " 引用的文件", fail: "打包 " + name + " 引用的文件失败",
+				paths: p.outside, base: "/", bytes: p.outBytes})
+		}
+	}
+	return out
+}
+
+// hostPaths 是打包时要读的宿主机上的地方（实际位置），见 hostRoots。
+func (c *collected) hostPaths() []string {
+	var out []string
+	for _, r := range c.hostRoots() {
+		for _, p := range r.paths {
+			out = append(out, host.RealPath(p))
 		}
 	}
 	return out
@@ -134,11 +171,8 @@ func (c *collected) dataBytes() int64 {
 			n += v.bytes
 		}
 	}
-	for _, b := range c.binds {
-		n += b.bytes
-	}
-	for _, p := range c.projects {
-		n += p.dirBytes + p.outBytes
+	for _, r := range c.hostRoots() {
+		n += r.bytes
 	}
 	for _, b := range c.layerBytes {
 		n += b
