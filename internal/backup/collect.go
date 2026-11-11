@@ -364,7 +364,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 }
 
 // sharers 找出打包时要和选中的容器 sel 一起临时停止的容器，菜单里不能选的容器（docker compose run
-// 的临时容器等）也算：没选中、正在运行、和选中的容器共用数据的（见 sharesData），否则打包时它还在写，
+// 的临时容器等）也算：没选中、正在运行、打包期间还可能改动要打包的数据的（见 spec.WritesData），否则打包时它还在写，
 // 数据前后对不上；借用要停止的容器的网络、进程空间的（如 VPN 的 sidecar），被借用的容器一停它们就断了，
 // 重启后也不会自己接回去，所以一起临时停止、再一起恢复。Swarm 服务的容器一停就会被重新创建，停不住，
 // 遇到时停下。
@@ -385,7 +385,7 @@ func sharers(inv *inventory, sel []*item, vols map[string]bool, paths []string, 
 		return nil
 	}
 	for _, it := range inv.all {
-		if stopping[it] || !it.c.State.Running || ignore[it.name()] || !sharesData(it, vols, paths) {
+		if stopping[it] || !it.c.State.Running || ignore[it.name()] || !spec.WritesData(it.c, vols, paths) {
 			continue
 		}
 		if err := share(it); err != nil {
@@ -488,29 +488,6 @@ func scene(items []*item) []string {
 	}
 	slices.Sort(out)
 	return out
-}
-
-// sharesData 表示容器有没有用到要打包的数据卷 vols，或者挂载了要打包的宿主机上的地方 paths（真实路径）。
-func sharesData(it *item, vols map[string]bool, paths []string) bool {
-	for _, m := range it.c.Mounts {
-		switch m.Type {
-		case "volume":
-			if vols[m.Name] {
-				return true
-			}
-		case "bind":
-			if spec.IsSystemPath(m.Source) {
-				continue
-			}
-			src := host.RealPath(m.Source)
-			for _, p := range paths {
-				if spec.PathsOverlap(src, p) {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }
 
 // rootPolicy 是一种要从宿主机上打包的路径过检查的规则（见 approveRoot）。

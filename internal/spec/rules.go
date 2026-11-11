@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/lx969788249/dockhop/internal/docker"
+	"github.com/lx969788249/dockhop/internal/host"
 )
 
 // 宿主机系统路径只在新服务器上重建挂载关系，不迁移内容：这些路径属于宿主机本身
@@ -43,6 +44,43 @@ func IsSystemPath(p string) bool {
 		}
 	}
 	return IsDockerSocket(p)
+}
+
+// 迁出、迁入共用的“谁在用这些数据”：迁出时找打包期间还可能改动数据的容器（要一起临时停下），迁入时找
+// 在用要被换掉的数据的已有容器（要临时停下，保留着的就不能迁入）。数据是数据卷（按名字）和宿主机上的
+// 地方（paths，都是解析软链接之后的实际位置，见 host.RealPath）。
+
+// WritesData 表示容器 c 能不能改动这些数据：可写地挂载了其中的数据卷，或者可写地挂载的宿主机目录和它们
+// 重叠（挂着上级目录也算，例如挂着 /srv、要打包的在 /srv/app）。只读挂载的改不了，不算。
+func WritesData(c *docker.Container, volumes map[string]bool, paths []string) bool {
+	return mountsData(c, volumes, paths, true)
+}
+
+// UsesData 表示容器 c 有没有在用这些数据，只读挂载的也算。
+func UsesData(c *docker.Container, volumes map[string]bool, paths []string) bool {
+	return mountsData(c, volumes, paths, false)
+}
+
+func mountsData(c *docker.Container, volumes map[string]bool, paths []string, writable bool) bool {
+	for _, m := range c.Mounts {
+		if writable && !m.RW {
+			continue
+		}
+		switch m.Type {
+		case "volume":
+			if volumes[m.Name] {
+				return true
+			}
+		case "bind":
+			src := host.RealPath(m.Source)
+			for _, p := range paths {
+				if PathsOverlap(src, p) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // IsDockerSocket 表示路径是不是容器引擎的 socket（新服务器挂载它自己的）。

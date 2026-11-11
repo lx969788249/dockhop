@@ -50,9 +50,9 @@ func TestSharedWritersIncludeUnlisted(t *testing.T) {
 			case "/containers/json":
 				io.WriteString(w, `[{"Id":"web-id","Names":["/web"]},{"Id":"writer-id","Names":["/writer"]}]`)
 			case "/containers/web-id/json":
-				io.WriteString(w, `{"Id":"web-id","Name":"/web","Image":"sha256:img","Config":{"Image":"alpine"},"State":{"Running":true},"Mounts":[{"Type":"volume","Name":"data","Destination":"/data"}]}`)
+				io.WriteString(w, `{"Id":"web-id","Name":"/web","Image":"sha256:img","Config":{"Image":"alpine"},"State":{"Running":true},"Mounts":[{"Type":"volume","Name":"data","Destination":"/data","RW":true}]}`)
 			case "/containers/writer-id/json":
-				io.WriteString(w, `{"Id":"writer-id","Name":"/writer","Image":"sha256:img","Config":{"Image":"alpine","Labels":{`+label+`}},"State":{"Running":true},"Mounts":[{"Type":"volume","Name":"data","Destination":"/data"}]}`)
+				io.WriteString(w, `{"Id":"writer-id","Name":"/writer","Image":"sha256:img","Config":{"Image":"alpine","Labels":{`+label+`}},"State":{"Running":true},"Mounts":[{"Type":"volume","Name":"data","Destination":"/data","RW":true}]}`)
 			case "/system/df":
 				io.WriteString(w, `{"Volumes":[{"Name":"data","UsageData":{"Size":10}}]}`)
 			case "/images/sha256:img/json":
@@ -96,13 +96,15 @@ func TestSharedWritersIncludeProjectFiles(t *testing.T) {
 	labels := `{"com.docker.compose.project":"app","com.docker.compose.service":"web","com.docker.compose.project.working_dir":` +
 		strconv.Quote(dir) + `,"com.docker.compose.project.config_files":` + strconv.Quote(filepath.Join(dir, "compose.yml")) + `}`
 	bind := func(src string) string {
-		return `"Mounts":[{"Type":"bind","Source":` + strconv.Quote(src) + `,"Destination":"/x"}]`
+		return `"Mounts":[{"Type":"bind","Source":` + strconv.Quote(src) + `,"Destination":"/x","RW":true}]`
 	}
 	containers := map[string]string{
 		"web":       `"Config":{"Image":"alpine","Labels":` + labels + `}`,
 		"sidecar":   `"Config":{"Image":"alpine"},` + bind(dir),
 		"envreader": `"Config":{"Image":"alpine"},` + bind(filepath.Join(root, "shared.env")),
 		"other":     `"Config":{"Image":"alpine"},` + bind(filepath.Join(root, "elsewhere")),
+		// 只读地挂着项目的上级目录（例如监控）：改不了数据，不用停。
+		"monitor": `"Config":{"Image":"alpine"},"Mounts":[{"Type":"bind","Source":` + strconv.Quote(root) + `,"Destination":"/host","RW":false}]`,
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimPrefix(r.URL.Path, "/v1.44")
@@ -165,7 +167,7 @@ func TestSharedWritersIncludeProjectFiles(t *testing.T) {
 // 没停下，打包时它还在写；已经停下的容器打包完会被启动起来。停机之前再看一次，有变化就停下，什么都
 // 不动；和这次迁出无关的容器怎么变都不管。
 func TestRecheckBeforeStop(t *testing.T) {
-	vol := `,"Mounts":[{"Type":"volume","Name":"data","Destination":"/data"}]`
+	vol := `,"Mounts":[{"Type":"volume","Name":"data","Destination":"/data","RW":true}]`
 	type ctr struct{ id, state, mounts string }
 	before := map[string]ctr{
 		"web":    {"web-id", "running", vol},

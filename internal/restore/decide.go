@@ -159,6 +159,7 @@ func (r *run) findWriters(ctx context.Context, existing []docker.ContainerSummar
 	s := r.Screen
 	match := r.counterparts(existing)
 	volumes, dirs := r.writeSet()
+	paths := realPaths(dirs)
 	self, _ := os.Hostname()
 	ignore := map[string]bool{}
 	for _, n := range strings.Split(r.Getenv("DOCKHOP_TEST_IGNORE"), ",") {
@@ -180,7 +181,7 @@ func (r *run) findWriters(ctx context.Context, existing []docker.ContainerSummar
 			continue // 刚好被删掉了
 		case err != nil:
 			return nil, s.StepFailed("读不到新服务器上的容器 "+name+"，没法确认它有没有在用要写入的数据（还没有改动已有的服务和数据）", err.Error(), "确认 Docker 运行正常后重新运行")
-		case !usesData(full, volumes, dirs):
+		case !spec.UsesData(full, volumes, paths):
 			continue
 		case kept:
 			return nil, s.StepFailed("保留的已有容器 "+name+" 和要迁入的容器共用数据，迁入会覆盖它正在用的数据（还没有改动已有的服务和数据）", "",
@@ -362,20 +363,11 @@ func (r *run) usedData() (map[string]bool, map[string]bool) {
 	return vols, binds
 }
 
-func usesData(c *docker.Container, vols map[string]bool, dirs []writeTarget) bool {
-	for _, m := range c.Mounts {
-		switch m.Type {
-		case "volume":
-			if vols[m.Name] {
-				return true
-			}
-		case "bind":
-			for _, d := range dirs {
-				if spec.PathsOverlap(host.RealPath(m.Source), host.RealPath(d.path)) {
-					return true
-				}
-			}
-		}
+// realPaths 是这些要写的地方的实际位置（解析软链接之后），和容器挂载的路径比较用（见 spec.UsesData）。
+func realPaths(dirs []writeTarget) []string {
+	out := make([]string, len(dirs))
+	for i, d := range dirs {
+		out[i] = host.RealPath(d.path)
 	}
-	return false
+	return out
 }

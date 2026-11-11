@@ -31,7 +31,7 @@ type fixture struct {
 	project string
 	web     string // 独立容器：卷、挂载目录（含软链接）、固定 IP、停止等待时间、可写层改动
 	side    string // 借用 web 网络的容器（没有选中，应自动加入）
-	reader  string // 没选中、但和 web 共用卷的容器（需要临时停止）
+	writer  string // 没选中、但和 web 共用卷、会写这个卷的容器（打包时要临时停止；只读挂载的不用停）
 	app     string // Compose 服务：命名卷 + 匿名卷 + 项目目录以外的 env_file
 	worker  string
 }
@@ -40,7 +40,7 @@ func setup(t *testing.T) *fixture {
 	t.Helper()
 	p := fmt.Sprintf("dmtest_it%d", os.Getpid())
 	f := &fixture{prefix: p, dir: t.TempDir(), project: p + "proj"}
-	f.web, f.side, f.reader = p+"_web", p+"_side", p+"_reader"
+	f.web, f.side, f.writer = p+"_web", p+"_side", p+"_writer"
 	octet := 100 + os.Getpid()%100
 	t.Cleanup(func() { f.teardown() })
 
@@ -64,7 +64,7 @@ func setup(t *testing.T) *fixture {
 		"alpine:3.20", "sh")
 	sh(t, "docker", "exec", f.web, "sh", "-c", "echo changed >/etc/dockhop-changed")
 	sh(t, "docker", "run", "-d", "--name", f.side, "--network", "container:"+f.web, "alpine:3.20", "sleep", "600")
-	sh(t, "docker", "run", "-d", "--name", f.reader, "-v", p+"_vol:/shared:ro", "alpine:3.20", "sleep", "600")
+	sh(t, "docker", "run", "-d", "--name", f.writer, "-v", p+"_vol:/shared", "alpine:3.20", "sleep", "600")
 
 	proj := filepath.Join(f.dir, "proj")
 	os.MkdirAll(filepath.Join(proj, "web"), 0o755)
@@ -94,7 +94,7 @@ volumes:
 }
 
 func (f *fixture) teardown() {
-	for _, n := range []string{f.web, f.side, f.reader} {
+	for _, n := range []string{f.web, f.side, f.writer} {
 		try("docker", "rm", "-f", n)
 	}
 	ids := try("docker", "ps", "-aq", "--filter", "label=com.docker.compose.project="+f.project)
@@ -138,11 +138,11 @@ func TestOutBundleContents(t *testing.T) {
 			sharedLine = l
 		}
 	}
-	if !strings.Contains(sharedLine, f.side) || !strings.Contains(sharedLine, f.reader) {
-		t.Errorf("借用网络的 side 和共用卷的 reader 都应临时停止：%s", sharedLine)
+	if !strings.Contains(sharedLine, f.side) || !strings.Contains(sharedLine, f.writer) {
+		t.Errorf("借用网络的 side 和共用卷的 writer 都应临时停止：%s", sharedLine)
 	}
 	// 打包完成后源容器已经恢复原状，下载期间不停机。
-	for _, n := range []string{f.web, f.side, f.reader, f.app, f.worker} {
+	for _, n := range []string{f.web, f.side, f.writer, f.app, f.worker} {
 		if s := state(t, n); s != "running" {
 			t.Errorf("提供下载时 %s 应已恢复运行，实际 %s", n, s)
 		}
@@ -177,7 +177,7 @@ func TestOutBundleContents(t *testing.T) {
 			t.Errorf("迁移包里缺少容器 %s", n)
 		}
 	}
-	for _, n := range []string{f.reader, f.side} {
+	for _, n := range []string{f.writer, f.side} {
 		if _, ok := names[n]; ok {
 			t.Errorf("没选中的容器 %s 只应临时停止，不应迁移", n)
 		}
@@ -341,7 +341,7 @@ func TestOutKilledWhileStopped(t *testing.T) {
 	}
 	_ = p.cmd.Process.Kill() // 相当于 kill -9
 	p.wait(t, time.Minute)
-	for _, n := range []string{f.web, f.side, f.reader} {
+	for _, n := range []string{f.web, f.side, f.writer} {
 		if s := state(t, n); s != "exited" {
 			t.Fatalf("被强制结束后 %s 应仍停着（用来验证恢复），实际 %s", n, s)
 		}
@@ -357,7 +357,7 @@ func TestOutKilledWhileStopped(t *testing.T) {
 	if !strings.Contains(out, "上次迁出") || !strings.Contains(out, "已恢复上次迁出时停下的 3 个容器") {
 		t.Fatalf("应提示并恢复上次停下的容器：\n%s", out)
 	}
-	for _, n := range []string{f.web, f.side, f.reader} {
+	for _, n := range []string{f.web, f.side, f.writer} {
 		if s := state(t, n); s != "running" {
 			t.Errorf("%s 应已恢复运行，实际 %s", n, s)
 		}

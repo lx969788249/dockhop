@@ -99,3 +99,35 @@ func TestPanelAndSwarm(t *testing.T) {
 		t.Error("匿名卷识别不对")
 	}
 }
+
+// 迁出、迁入共用的“谁在用这些数据”。迁出看谁在打包期间还可能改动数据：只读挂载的改不了，不算（以前也
+// 要停下，挂着上级目录的 --rm 容器会让整次迁出被拒）；挂着 /srv 这种系统目录、而要打包的就在里面的，
+// 照样能写进去，要算（以前跳过）。迁入看谁在用要被换掉的数据：只读的也在用。
+func TestWritesAndUsesData(t *testing.T) {
+	var c docker.Container
+	c.Mounts = []docker.Mount{
+		{Type: "volume", Name: "rw-vol", RW: true},
+		{Type: "volume", Name: "ro-vol"},
+		{Type: "bind", Source: "/srv", RW: true},
+		{Type: "bind", Source: "/opt/apps"},
+	}
+	for _, x := range []struct {
+		name          string
+		vols          map[string]bool
+		paths         []string
+		writes, using bool
+	}{
+		{"可写的数据卷", map[string]bool{"rw-vol": true}, nil, true, true},
+		{"只读的数据卷", map[string]bool{"ro-vol": true}, nil, false, true},
+		{"可写地挂着系统目录，要打包的在里面", nil, []string{"/srv/app"}, true, true},
+		{"只读地挂着上级目录", nil, []string{"/opt/apps/blog"}, false, true},
+		{"不相干", map[string]bool{"other": true}, []string{"/data/x"}, false, false},
+	} {
+		if got := WritesData(&c, x.vols, x.paths); got != x.writes {
+			t.Errorf("%s：WritesData = %v", x.name, got)
+		}
+		if got := UsesData(&c, x.vols, x.paths); got != x.using {
+			t.Errorf("%s：UsesData = %v", x.name, got)
+		}
+	}
+}

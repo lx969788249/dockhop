@@ -15,6 +15,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/preflight"
+	"github.com/lx969788249/dockhop/internal/spec"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -27,7 +28,7 @@ func TestWriteSetIncludesProjectFiles(t *testing.T) {
 		t.Fatalf("要写的地方：%v %v", vols, dirs)
 	}
 	c := &docker.Container{Mounts: []docker.Mount{{Type: "bind", Source: "/srv/blog/config"}}}
-	if !usesData(c, vols, dirs) {
+	if !spec.UsesData(c, vols, realPaths(dirs)) {
 		t.Error("挂载了项目目录里的子目录，也算在用要写入的数据")
 	}
 }
