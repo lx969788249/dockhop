@@ -17,7 +17,7 @@ import (
 // committed 表示全部提交了：只差删除回滚资料。
 func committed(entries []Entry) bool {
 	for _, e := range entries {
-		if e.Op == opCommit && len(e.Names) == 0 {
+		if e.Op == opCommit {
 			return true
 		}
 	}
@@ -27,7 +27,7 @@ func committed(entries []Entry) bool {
 // partialCommit 返回只提交了一部分时保留下来的组（见 commitPartial）。
 func partialCommit(entries []Entry) ([]string, bool) {
 	for _, e := range entries {
-		if e.Op == opCommit && len(e.Names) > 0 {
+		if e.Op == opPartialCommit {
 			return e.Names, true
 		}
 	}
@@ -97,7 +97,7 @@ func (r *run) commitPartial(ctx context.Context, ok, failed []*group) error {
 	for _, g := range ok {
 		kept = append(kept, g.id)
 	}
-	if err := r.j.add(Entry{Op: opCommit, Names: kept}); err != nil {
+	if err := r.j.add(Entry{Op: opPartialCommit, Names: kept}); err != nil {
 		return s.StepFailed(err.Error(), "", "")
 	}
 	r.j.close()

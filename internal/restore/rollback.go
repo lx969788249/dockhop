@@ -121,8 +121,8 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 					note("Compose 项目 %s 的新容器 %s 没能删除：%v", e.Name, c.Name(), err)
 				}
 			}
-		case opStart, opRename, opOldImages, opVolume, opStage, opBind, opLink, opFile, opMkdir, opNetwork,
-			opImages, opTag, opRebuilt, opCommit:
+		case opStart, opRename, opOldImages, opVolume, opStage, opBind, opContents, opLink, opFile, opMkdir, opNetwork,
+			opImages, opTag, opRebuilt, opCommit, opPartialCommit:
 			// 这一遍不用管：数据在第 2 遍，原来的服务在第 3 遍，opRebuilt 在最前面已经看过
 		default:
 			note("日志里有不认识的记录 %s，没有撤销", e.Op)
@@ -178,13 +178,16 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 			}
 		case opBind:
 			u.undoBind(e, note)
+		case opContents:
+			u.undoContents(e, note)
 		case opVolume:
 			u.undoVolume(ctx, e, note)
 		case opTag:
 			tags = append(tags, e)
 		case opImages:
 			had = e.Names
-		case opStart, opStop, opRename, opComposeOld, opOldImages, opContainer, opCreated, opHelper, opRebuilt, opCommit:
+		case opStart, opStop, opRename, opComposeOld, opOldImages, opContainer, opCreated, opHelper, opRebuilt, opCommit,
+			opPartialCommit:
 			// 这一遍不用管：容器在第 1 遍，原来的服务在第 3 遍
 		default:
 			note("日志里有不认识的记录 %s，没有撤销", e.Op)
@@ -407,10 +410,6 @@ func (u *undo) removeComposeNetworks(ctx context.Context, e Entry, note func(str
 
 func (u *undo) undoBind(e Entry, note func(string, ...any)) {
 	if e.Path == "" || e.Path == "/" {
-		return
-	}
-	if e.inPlace() {
-		u.undoContents(e, note)
 		return
 	}
 	// 下面的做法会整个删除 Path：它是挂载点（单独挂载的磁盘）时绝不能这样做，那样会把整块盘上的
@@ -745,12 +744,16 @@ func (u *undo) cleanupCommitted(ctx context.Context, entries []Entry) []string {
 					left = append(left, fmt.Sprintf("旧目录 %s：%v", e.Backup, err))
 				}
 			}
+		case opContents:
+			if err := os.RemoveAll(e.Backup); err != nil {
+				left = append(left, fmt.Sprintf("目录 %s 里原来的内容 %s：%v", e.Path, e.Backup, err))
+			}
 		case opStage:
 			if err := os.RemoveAll(e.Path); err != nil {
 				left = append(left, fmt.Sprintf("解压用的临时目录 %s：%v", e.Path, err))
 			}
 		case opStart, opStop, opVolume, opLink, opFile, opMkdir, opNetwork, opContainer, opCreated, opImages, opTag,
-			opComposeUp, opRebuilt, opCommit:
+			opComposeUp, opRebuilt, opCommit, opPartialCommit:
 			// 没有要删的回滚资料：数据卷、文件的备份在回滚资料目录里，跟着目录一起删
 		default:
 			left = append(left, fmt.Sprintf("日志里有不认识的记录 %s，没有清理", e.Op))

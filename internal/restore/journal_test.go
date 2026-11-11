@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -104,6 +106,11 @@ func TestJournalChecksEntries(t *testing.T) {
 	}{
 		{"没有 Path", Entry{Op: opBind}},
 		{"原来就有，却没有备份", Entry{Op: opBind, Path: "/srv/data", Existed: true}},
+		{"整个替换，备份却在目录里面", Entry{Op: opBind, Path: "/srv/data", Existed: true, Backup: "/srv/data/.dockhop-old-1"}},
+		{"原地换内容，备份不在目录里面", Entry{Op: opContents, Path: "/srv/data", Backup: "/srv/.data.old", Meta: &FileMeta{}}},
+		{"原地换内容，没记目录本身的属性", Entry{Op: opContents, Path: "/srv/data", Backup: "/srv/data/.dockhop-old-1"}},
+		{"全部提交却带着保留的组", Entry{Op: opCommit, Names: []string{"1"}}},
+		{"部分提交却没有保留的组", Entry{Op: opPartialCommit}},
 		{"没有 ID 和备份的名字", Entry{Op: opRename, Name: "web"}},
 		{"不认识的记录", Entry{Op: "bogus", Name: "x"}},
 	} {
@@ -130,5 +137,38 @@ func TestJournalUnknownOp(t *testing.T) {
 	f.Close()
 	if _, err := readJournal(dir); !errors.Is(err, ErrJournalDamaged) {
 		t.Fatalf("不认识的记录应当作损坏处理：%v", err)
+	}
+}
+
+// 以前的版本把原地换内容也记成 bind（靠备份目录在 Path 里面区分），把只提交了一部分也记成 commit（靠
+// Names 不为空区分）。读日志时换成现在各自单独的记录；这是读旧日志唯一要处理的地方。整个替换的 bind、
+// 全部提交的 commit 原样不动。
+func TestReadJournalUpgradesOldRecords(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "rb")
+	os.MkdirAll(dir, 0o700)
+	lines := []string{
+		`{"op":"start","pid":1}`,
+		`{"op":"bind","path":"/srv/data","existed":true,"backup":"/srv/data/.dockhop-old-1","names":["a"],"meta":{"mode":493,"uid":0,"gid":0,"mtime":1}}`,
+		`{"op":"bind","path":"/srv/web","existed":true,"backup":"/srv/.web.dockhop-old-1"}`,
+		`{"op":"commit","names":["2"]}`,
+		`{"op":"commit"}`,
+	}
+	os.WriteFile(journalPath(dir), []byte(strings.Join(lines, "\n")+"\n"), 0o600)
+	entries, err := readJournal(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ops []string
+	for _, e := range entries {
+		ops = append(ops, string(e.Op))
+	}
+	if got := strings.Join(ops, " "); got != "start contents bind partial_commit commit" {
+		t.Fatalf("读出来的记录：%s", got)
+	}
+	if c := entries[1]; c.Path != "/srv/data" || c.Backup != "/srv/data/.dockhop-old-1" || !slices.Equal(c.Names, []string{"a"}) || c.Meta == nil {
+		t.Errorf("原地换内容的记录读错了：%+v", c)
+	}
+	if p := entries[3]; !slices.Equal(p.Names, []string{"2"}) {
+		t.Errorf("保留下来的组读错了：%+v", p)
 	}
 }

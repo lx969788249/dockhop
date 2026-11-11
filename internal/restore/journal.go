@@ -23,26 +23,28 @@ import (
 type Op string
 
 const (
-	opStart      Op = "start"       // 事务开始：记下进程号和时间
-	opStop       Op = "stop"        // 临时停止了新服务器上已有的容器（Name、ID、State：停之前的状态）
-	opRename     Op = "rename"      // 已有的同名容器改名备份（Name、ID、Backup：备份用的名字、Networks：原来连着的网络）
-	opComposeOld Op = "compose_old" // 已有的同名 Compose 项目，即将停止并删除（Name、Old）
-	opOldImages  Op = "old_images"  // 上一条里的容器已经存成回滚镜像，接下来删除容器（Name、Images）
-	opVolume     Op = "volume"      // 写入数据卷（Name、Existed、Backup）
-	opStage      Op = "stage"       // 新建解压用的临时目录（Path），回滚、提交后都整个删掉
-	opBind       Op = "bind"        // 替换目录（Path、Existed、Backup；Backup 在 Path 里面时是原地换内容：Names 是原来有哪些东西，Meta 是目录本身原来的属性，记在建解压目录之前）
-	opLink       Op = "link"        // 新建软链接（Path）
-	opFile       Op = "file"        // 写入 Compose 项目里的文件（Path、Existed、Backup）
-	opMkdir      Op = "mkdir"       // 新建目录（Path）
-	opNetwork    Op = "network"     // 新建网络（Name）
-	opContainer  Op = "container"   // 要新建容器（Name）：建之前先记下，建好了再记 opCreated
-	opCreated    Op = "created"     // 新建的容器建好了（Name；ID：它的 ID），回滚时按 ID 删
-	opHelper     Op = "helper"      // 新建临时容器（Name），用完就删
-	opImages     Op = "images"      // 加载镜像之前这台服务器上已有的镜像（Names：镜像 ID），回滚时这些一个不删
-	opTag        Op = "tag"         // 镜像名要改为指向迁入的镜像（Name；ID：原来指向的镜像，为空表示原来没有这个名字）
-	opComposeUp  Op = "compose_up"  // 启动 Compose 项目（Name、Names：启动前已有的项目网络）
-	opRebuilt    Op = "rebuilt"     // 回滚时重建了原有的 Compose 容器（Name；ID：重建后的 ID），再回滚时它就是原来的服务
-	opCommit     Op = "commit"      // 已提交：新服务都验证通过，不再撤销（Names：只保留一部分服务时，保留下来的组）
+	opStart         Op = "start"          // 事务开始：记下进程号和时间
+	opStop          Op = "stop"           // 临时停止了新服务器上已有的容器（Name、ID、State：停之前的状态）
+	opRename        Op = "rename"         // 已有的同名容器改名备份（Name、ID、Backup：备份用的名字、Networks：原来连着的网络）
+	opComposeOld    Op = "compose_old"    // 已有的同名 Compose 项目，即将停止并删除（Name、Old）
+	opOldImages     Op = "old_images"     // 上一条里的容器已经存成回滚镜像，接下来删除容器（Name、Images）
+	opVolume        Op = "volume"         // 写入数据卷（Name、Existed、Backup）
+	opStage         Op = "stage"          // 新建解压用的临时目录（Path），回滚、提交后都整个删掉
+	opBind          Op = "bind"           // 整个替换目录（Path、Existed；Backup：同一目录下的备份名，原来的目录改名成它）
+	opContents      Op = "contents"       // 原地换单独挂载的目录里的内容（Path；Backup：里面的备份目录；Names：原来的东西；Meta：目录本身原来的属性，见 recordContents）
+	opLink          Op = "link"           // 新建软链接（Path）
+	opFile          Op = "file"           // 写入 Compose 项目里的文件（Path、Existed、Backup）
+	opMkdir         Op = "mkdir"          // 新建目录（Path）
+	opNetwork       Op = "network"        // 新建网络（Name）
+	opContainer     Op = "container"      // 要新建容器（Name）：建之前先记下，建好了再记 opCreated
+	opCreated       Op = "created"        // 新建的容器建好了（Name；ID：它的 ID），回滚时按 ID 删
+	opHelper        Op = "helper"         // 新建临时容器（Name），用完就删
+	opImages        Op = "images"         // 加载镜像之前这台服务器上已有的镜像（Names：镜像 ID），回滚时这些一个不删
+	opTag           Op = "tag"            // 镜像名要改为指向迁入的镜像（Name；ID：原来指向的镜像，为空表示原来没有这个名字）
+	opComposeUp     Op = "compose_up"     // 启动 Compose 项目（Name、Names：启动前已有的项目网络）
+	opRebuilt       Op = "rebuilt"        // 回滚时重建了原有的 Compose 容器（Name；ID：重建后的 ID），再回滚时它就是原来的服务
+	opCommit        Op = "commit"         // 全部提交：新服务都验证通过，不再撤销
+	opPartialCommit Op = "partial_commit" // 只提交了一部分（Names：保留下来的组），没保留的组接着撤销（见 partial.go）
 )
 
 // partialSide 是只提交了一部分（保留了几组服务）时，一条记录归哪边（见 splitPartial）。
@@ -63,26 +65,28 @@ type opRule struct {
 }
 
 var opRules = map[Op]opRule{
-	opStart:      {func(e Entry) bool { return e.PID > 0 }, alwaysUndo},
-	opStop:       {func(e Entry) bool { return hasNameID(e) && e.State != "" }, byGroup},
-	opRename:     {func(e Entry) bool { return hasNameID(e) && e.Backup != "" }, byGroup},
-	opComposeOld: {hasName, byGroup},
-	opOldImages:  {hasName, byGroup},
-	opVolume:     {func(e Entry) bool { return hasName(e) && backedUp(e) }, byGroup},
-	opStage:      {hasPath, byGroup},
-	opBind:       {bindOK, byGroup},
-	opLink:       {hasPath, byGroup},
-	opFile:       {func(e Entry) bool { return hasPath(e) && backedUp(e) }, byGroup},
-	opMkdir:      {hasPath, byGroup},
-	opNetwork:    {hasName, byGroup},
-	opContainer:  {hasName, byGroup},
-	opCreated:    {hasNameID, byGroup},
-	opHelper:     {hasName, byGroup},
-	opImages:     {always, alwaysUndo},
-	opTag:        {hasName, byGroup},
-	opComposeUp:  {hasName, byGroup},
-	opRebuilt:    {hasNameID, alwaysUndo},
-	opCommit:     {always, noSide},
+	opStart:         {func(e Entry) bool { return e.PID > 0 }, alwaysUndo},
+	opStop:          {func(e Entry) bool { return hasNameID(e) && e.State != "" }, byGroup},
+	opRename:        {func(e Entry) bool { return hasNameID(e) && e.Backup != "" }, byGroup},
+	opComposeOld:    {hasName, byGroup},
+	opOldImages:     {hasName, byGroup},
+	opVolume:        {func(e Entry) bool { return hasName(e) && backedUp(e) }, byGroup},
+	opStage:         {hasPath, byGroup},
+	opBind:          {bindOK, byGroup},
+	opContents:      {contentsOK, byGroup},
+	opLink:          {hasPath, byGroup},
+	opFile:          {func(e Entry) bool { return hasPath(e) && backedUp(e) }, byGroup},
+	opMkdir:         {hasPath, byGroup},
+	opNetwork:       {hasName, byGroup},
+	opContainer:     {hasName, byGroup},
+	opCreated:       {hasNameID, byGroup},
+	opHelper:        {hasName, byGroup},
+	opImages:        {always, alwaysUndo},
+	opTag:           {hasName, byGroup},
+	opComposeUp:     {hasName, byGroup},
+	opRebuilt:       {hasNameID, alwaysUndo},
+	opCommit:        {func(e Entry) bool { return len(e.Names) == 0 }, noSide},
+	opPartialCommit: {func(e Entry) bool { return len(e.Names) > 0 }, noSide},
 }
 
 func hasName(e Entry) bool   { return e.Name != "" }
@@ -93,8 +97,15 @@ func always(Entry) bool      { return true }
 // backedUp：原来就有的（Existed），要记下备份放在哪里。
 func backedUp(e Entry) bool { return !e.Existed || e.Backup != "" }
 
-// bindOK：原地换内容的还要记下目录本身原来的属性（见 recordContents）。
-func bindOK(e Entry) bool { return hasPath(e) && backedUp(e) && (!e.inPlace() || e.Meta != nil) }
+// bindOK：整个替换的备份和目录在同一个地方（改名是原子的）。
+func bindOK(e Entry) bool {
+	return hasPath(e) && backedUp(e) && filepath.Dir(e.Backup) == filepath.Dir(e.Path)
+}
+
+// contentsOK：原地换内容的备份目录在目录里面，还要记下目录本身原来的属性（见 recordContents）。
+func contentsOK(e Entry) bool {
+	return hasPath(e) && filepath.Dir(e.Backup) == e.Path && e.Meta != nil
+}
 
 // Entry 是日志里的一条记录。
 type Entry struct {
@@ -113,12 +124,6 @@ type Entry struct {
 	Names    []string          `json:"names,omitempty"`  // 按记录类型各有含义，见上面每种记录的说明
 	Group    string            `json:"group,omitempty"`  // 属于哪一组服务（见 groups.go）；为空表示整次迁入共用
 	Meta     *FileMeta         `json:"meta,omitempty"`   // 原地换内容时，目录本身原来的属主、权限、修改时间
-}
-
-// inPlace 表示这是原地换内容的记录（见 recordContents）：备份目录在 Path 里面。只有这里判断，
-// 别处都用它：这条记录被当成整个改名的，回滚时就会去整个删除一个挂载点。
-func (e Entry) inPlace() bool {
-	return e.Op == opBind && e.Existed && filepath.Dir(e.Backup) == e.Path
 }
 
 // FileMeta 是一个文件或目录本身的属主、权限和修改时间（纳秒）；Link 表示它是软链接（没有自己的权限）。
@@ -254,12 +259,25 @@ func readJournal(dir string) ([]Entry, error) {
 			// 这个版本不认识的记录（例如更新的版本写的）：撤销时会悄悄跳过它，改动就永远留下了。
 			return nil, fmt.Errorf("%w（第 %d 行是这个版本不认识的记录 %q）", ErrJournalDamaged, n, e.Op)
 		}
-		out = append(out, e)
+		out = append(out, upgrade(e))
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// upgrade 把以前的版本写的记录换成现在的写法。读旧日志只在这里处理：v1.2.7 及以前把原地换内容
+// 也记成 bind（备份目录在 Path 里面），把只提交了一部分也记成 commit（Names 不为空）。现在写的记录
+// 不会是这两种样子（见 bindOK 和 opRules），对它们什么都不做。
+func upgrade(e Entry) Entry {
+	switch {
+	case e.Op == opBind && e.Existed && filepath.Dir(e.Backup) == e.Path:
+		e.Op, e.Existed = opContents, false
+	case e.Op == opCommit && len(e.Names) > 0:
+		e.Op = opPartialCommit
+	}
+	return e
 }
 
 // rewriteJournal 把日志换成 entries（先写临时文件再改名，换到一半断电也不会坏）。

@@ -56,7 +56,7 @@ func (r *run) recordContents(dst string) (Entry, error) {
 	for _, e := range cur {
 		names = append(names, e.Name())
 	}
-	e := Entry{Op: opBind, Path: dst, Existed: true, Backup: innerName(dst, "old"), Names: names, Meta: &orig}
+	e := Entry{Op: opContents, Path: dst, Backup: innerName(dst, "old"), Names: names, Meta: &orig}
 	return e, r.j.add(e)
 }
 

@@ -359,7 +359,7 @@ func TestUndoContentsResumes(t *testing.T) {
 		}
 		u := &undo{screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
 			mountPoint: func(p string) (bool, error) { return p == dst, nil }}
-		e := Entry{Op: opBind, Path: dst, Existed: true, Backup: backup, Names: []string{"a", "same"},
+		e := Entry{Op: opContents, Path: dst, Backup: backup, Names: []string{"a", "same"},
 			Meta: &FileMeta{Mode: 0o750, UID: os.Getuid(), GID: os.Getgid(), MTime: originalTime.UnixNano()}}
 		for i := 1; i <= 2; i++ {
 			if problems := u.rollback(context.Background(), []Entry{e}); len(problems) > 0 {
@@ -385,7 +385,7 @@ func TestUndoContentsResumes(t *testing.T) {
 func TestUndoContentsDiskNotMounted(t *testing.T) {
 	dst := filepath.Join(t.TempDir(), "data")
 	os.MkdirAll(dst, 0o755)
-	e := Entry{Op: opBind, Path: dst, Existed: true, Backup: filepath.Join(dst, ".dockhop-old-x"), Names: []string{"a"},
+	e := Entry{Op: opContents, Path: dst, Backup: filepath.Join(dst, ".dockhop-old-x"), Names: []string{"a"},
 		Meta: &FileMeta{Mode: 0o750, UID: os.Getuid(), GID: os.Getgid()}}
 	for _, mounted := range []bool{true, false} {
 		u := &undo{screen: ui.New(io.Discard, false, nil), logf: t.Logf, fail: func(string) bool { return false },
@@ -1128,8 +1128,8 @@ func TestCleanupRemovesOldAnonymousVolumes(t *testing.T) {
 	}
 }
 
-// 回滚时不管日志里怎么记的，都绝不整个删除一个挂载点（单独挂载的磁盘）：原地换内容的记录要是被
-// 当成整个改名的（例如以后有人改了路径的写法），先删再挪回的做法会把整块盘上的东西删掉。
+// 回滚时不管日志里怎么记的，都绝不整个删除一个挂载点（单独挂载的磁盘）：挂载点要是被记成了整个替换
+// （例如写错了记录），先删再挪回的做法会把整块盘上的东西删掉。
 func TestUndoBindNeverRemovesMountPoint(t *testing.T) {
 	root := t.TempDir()
 	dst, old := filepath.Join(root, "data"), filepath.Join(root, ".data.dockhop-old-x")
@@ -1157,11 +1157,13 @@ func TestEveryOpHandled(t *testing.T) {
 		opStart: {PID: 1}, opStop: {Name: "a", ID: "id-a", State: "running"},
 		opRename: {Name: "b", ID: "id-b", Backup: "b.dockhop-backup-1"}, opComposeOld: {Name: "p"},
 		opOldImages: {Name: "p"}, opVolume: {Name: "v"}, opStage: {Path: filepath.Join(dir, "stage")},
-		opBind: {Path: filepath.Join(dir, "bind")}, opLink: {Path: filepath.Join(dir, "link")},
-		opFile: {Path: filepath.Join(dir, "file")}, opMkdir: {Path: filepath.Join(dir, "mkdir")},
+		opBind:     {Path: filepath.Join(dir, "bind"), Backup: filepath.Join(dir, ".bind.old")},
+		opContents: {Path: filepath.Join(dir, "disk"), Backup: filepath.Join(dir, "disk", ".dockhop-old-x"), Meta: &FileMeta{}},
+		opLink:     {Path: filepath.Join(dir, "link")},
+		opFile:     {Path: filepath.Join(dir, "file")}, opMkdir: {Path: filepath.Join(dir, "mkdir")},
 		opNetwork: {Name: "n"}, opContainer: {Name: "c"}, opCreated: {Name: "c", ID: "id-c"}, opHelper: {Name: "dockhop-helper-x"},
 		opImages: {}, opTag: {Name: "app:1"}, opComposeUp: {Name: "p"}, opRebuilt: {Name: "p-app-1", ID: "id-r"},
-		opCommit: {},
+		opCommit: {}, opPartialCommit: {Names: []string{"1"}},
 	}
 	var entries []Entry
 	for op, rule := range opRules {

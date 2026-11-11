@@ -360,7 +360,7 @@ func TestRecoverPartialCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range append(entries, Entry{Op: opCommit, Names: []string{"g1"}}) {
+	for _, e := range append(entries, Entry{Op: opPartialCommit, Names: []string{"g1"}}) {
 		j.add(e)
 	}
 	j.close()
