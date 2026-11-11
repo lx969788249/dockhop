@@ -35,7 +35,6 @@ import (
 	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/preflight"
-	"github.com/lx969788249/dockhop/internal/spec"
 	"github.com/lx969788249/dockhop/internal/testpoint"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -77,7 +76,6 @@ type run struct {
 	opts    Options
 	started time.Time
 	tool    *compose.Tool
-	info    docker.Info
 
 	workdir    string // 这次迁入的下载和解压目录
 	bundlePath string
@@ -151,13 +149,17 @@ func Run(ctx context.Context, d Deps, o Options) error {
 	return r.report(ctx, end)
 }
 
-// newRun 按 d、o 准备一次迁入，d 里为空的 MountPoint 补上默认的。
+// newRun 按 d、o 准备一次迁入，d 里为空的 MountPoint 补上默认的。撤销用的 undo 开始就有：上次迁入被强制
+// 结束留下的，第 1 步就要撤销。
 func newRun(d Deps, o Options) *run {
 	if d.MountPoint == nil {
 		d.MountPoint = host.IsMountPoint
 	}
-	return &run{Deps: d, opts: o, started: time.Now(), imageAs: map[string]string{}, anonVolumes: map[string]bundle.Volume{},
+	r := &run{Deps: d, opts: o, started: time.Now(), imageAs: map[string]string{}, anonVolumes: map[string]bundle.Volume{},
 		rbDir: filepath.Join(d.Home, "rollback", "current")}
+	r.undo = &undo{dc: d.Docker, screen: d.Screen, logf: d.Log.Printf, fail: r.testFail, mountPoint: d.MountPoint,
+		record: func(e Entry) error { return appendJournal(r.rbDir, e) }}
+	return r
 }
 
 // cleanup 收尾：关掉事务日志，删掉解密出来的数据（成功时连下载的文件一起）、临时容器和
@@ -185,10 +187,6 @@ func (r *run) steps(ctx context.Context) error {
 	if err != nil {
 		return s.StepFailed("读取 Docker 信息失败", err.Error(), "")
 	}
-	r.info = info
-	r.undo = &undo{dc: r.Docker, screen: s, logf: r.Log.Printf, fail: r.testFail, mountPoint: r.MountPoint,
-		record:   func(e Entry) error { return appendJournal(r.rbDir, e) },
-		defaults: spec.SourceDefaults{CgroupVersion: info.CgroupVersion, LoggingDriver: info.LoggingDriver, DefaultRuntime: info.DefaultRuntime}}
 	summary := "Docker " + info.ServerVersion
 	if t, err := compose.Detect(ctx); err == nil {
 		r.tool = t

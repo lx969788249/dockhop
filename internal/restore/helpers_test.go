@@ -16,6 +16,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/preflight"
+	"github.com/lx969788249/dockhop/internal/spec"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -48,7 +49,8 @@ func testUndo(t *testing.T, dc *docker.Client, screen *ui.Screen) *undo {
 	if screen == nil {
 		screen = ui.New(io.Discard, false, nil)
 	}
-	return &undo{dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }, mountPoint: noMounts}
+	return &undo{dc: dc, screen: screen, logf: t.Logf, fail: func(string) bool { return false }, mountPoint: noMounts,
+		defaults: &spec.SourceDefaults{}}
 }
 
 // prepareWith 用要写入目录 shared 的容器 new-app（和一个不用数据的 kept）按迁入的顺序调用

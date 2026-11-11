@@ -26,8 +26,8 @@ type undo struct {
 	record func(Entry) error       // 把回滚自己做的改动追加到事务日志（见 opRebuilt）
 	// mountPoint 判断一个目录本身是不是挂载点（见 Deps.MountPoint）。
 	mountPoint func(path string) (bool, error)
-	// 回滚重建旧容器时用的默认值（就是这台服务器自己的）。
-	defaults spec.SourceDefaults
+	// defaults 是回滚重建旧容器时用的默认值（就是这台服务器自己的），第一次用到时向 Docker 读（见 sourceDefaults）。
+	defaults *spec.SourceDefaults
 }
 
 // rollback 返回没能撤销的地方；为空表示已经全部撤销。
@@ -558,7 +558,7 @@ func (u *undo) undoOldCompose(ctx context.Context, o OldContainer, rebuilt, imag
 		}
 	}
 	built, err := spec.Rebuild{
-		Raw: o.Raw, Image: image, Source: u.defaults, KeepVolumes: o.Volumes,
+		Raw: o.Raw, Image: image, Source: u.sourceDefaults(ctx), KeepVolumes: o.Volumes,
 		NameOf:       nameOf,
 		MultiNetwork: u.dc.AtLeast("1.44"),
 	}.Build()
@@ -587,6 +587,15 @@ func (u *undo) undoOldCompose(ctx context.Context, o OldContainer, rebuilt, imag
 		}
 	}
 	return id
+}
+
+// sourceDefaults 是回滚重建旧容器时用的默认值：这台服务器自己的（见 spec.SourceDefaults），第一次用到时向 Docker 读。
+func (u *undo) sourceDefaults(ctx context.Context) spec.SourceDefaults {
+	if u.defaults == nil {
+		info, _ := u.dc.Info(ctx)
+		u.defaults = &spec.SourceDefaults{CgroupVersion: info.CgroupVersion, LoggingDriver: info.LoggingDriver, DefaultRuntime: info.DefaultRuntime}
+	}
+	return *u.defaults
 }
 
 // restoreState 把容器恢复成原来的状态：运行或暂停；原来停着的不动。
