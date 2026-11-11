@@ -156,6 +156,24 @@ func (r *run) preserve(target string) error {
 	return moveOrCopy(target, backup)
 }
 
+// undoFile 删除这次写入的文件（见 installTree），原来有的（见 preserve）放回去。
+func undoFile(e Entry, note func(string, ...any)) {
+	if e.Existed {
+		if _, err := os.Lstat(e.Backup); err != nil {
+			return // 备份已经放回去了（之前撤销过），或者还没来得及挪走原来的文件
+		}
+	}
+	if err := os.RemoveAll(e.Path); err != nil {
+		note("没能删除 %s：%v", e.Path, err)
+		return
+	}
+	if e.Existed {
+		if err := moveOrCopy(e.Backup, e.Path); err != nil {
+			note("文件 %s 没能放回原来的：%v", e.Path, err)
+		}
+	}
+}
+
 // moveOrCopy 移动文件或目录；不在同一块磁盘上时复制后删除原来的。复制先写到 dst 旁边的
 // 临时名字，完整写完才改名成 dst：回滚只看 dst 在不在，复制到一半失败或被强制结束时，
 // 不能留下一个看起来像完整备份、实际只有一半的 dst，否则回滚会拿它覆盖完整的原件。

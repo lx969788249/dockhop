@@ -33,13 +33,13 @@ type undo struct {
 // rollback 返回没能撤销的地方；为空表示已经全部撤销。
 //
 // 顺序和改动的顺序相反，分三遍：
-//  1. 先停下所有可能在写数据的容器：删除这次新建的容器，再把临时停过、又在运行的已有容器
-//     重新停下（提交之后才出错或被中断，或者上次回滚已经放回、重建了原来的服务时会这样）。
+//  1. 先停下所有可能在写数据的容器（stopWriters）：删除这次新建的容器，再把临时停过、又在运行的
+//     已有容器重新停下（提交之后才出错或被中断，或者上次回滚已经放回、重建了原来的服务时会这样）。
 //     没能做到时停下：它们可能还在写数据，这时放回的数据会被覆盖，回滚资料全部保留，交给
 //     人工处理。
-//  2. 再处理数据：删除这次写入的网络、Compose 文件、目录、数据卷，放回原有的。
-//  3. 最后放回旧服务：旧容器改回原名、重建旧 Compose 容器，再按依赖统一启动原来在运行的
-//     （包括临时停下的）。原有的数据没能全部放回时，旧服务保持停止，以免在不完整的数据上运行。
+//  2. 再处理数据（undoData）：删除这次写入的网络、Compose 文件、目录、数据卷，放回原有的。
+//  3. 最后放回旧服务（bringBackOld）：旧容器改回原名、重建旧 Compose 容器，再按依赖统一启动原来
+//     在运行的（包括临时停下的）。原有的数据没能全部放回时，旧服务保持停止，以免在不完整的数据上运行。
 func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 	var problems []string
 	note := func(format string, args ...any) {
@@ -47,11 +47,32 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		problems = append(problems, msg)
 		u.logf("回滚：%s", msg)
 	}
+	u.stopWriters(ctx, entries, note)
+	if u.fail("rollback-remove") {
+		note("（测试）模拟新容器没能删除")
+	}
+	if len(problems) > 0 {
+		note("有容器没能删除或停下，为了安全没有动数据，回滚资料全部保留")
+		return problems
+	}
+	u.undoData(ctx, entries, note)
+	if u.fail("rollback-data") {
+		note("（测试）模拟数据没能放回")
+	}
+	dataOK := len(problems) == 0
+	if !dataOK {
+		note("原有的数据没能全部放回，原来的服务保持停止，请按回滚资料人工处理")
+	}
+	u.bringBackOld(ctx, entries, dataOK, note)
+	return problems
+}
+
+// stopWriters 是回滚的第 1 遍：删除这次新建的容器，停下临时停过、又被启动了的容器。
+func (u *undo) stopWriters(ctx context.Context, entries []Entry, note func(string, ...any)) {
 	// 原有的容器（临时停下的、改名备份的、随 Compose 项目备份的），包括上次回滚已经重建的原有 Compose
 	// 容器（opRebuilt）：都不能当成这次新建的删掉。
 	oldIDs := map[string]bool{}
-	rebuilt := map[string]string{} // 上次回滚重建过的原有 Compose 容器：名字 → 重建后的 ID
-	created := map[string]bool{}   // 建好了、记下了 ID 的新容器（见 opCreated）
+	created := map[string]bool{} // 建好了、记下了 ID 的新容器（见 opCreated）
 	for _, e := range entries {
 		switch e.Op {
 		case opStop, opRename, opRebuilt:
@@ -62,33 +83,15 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		for _, o := range e.Old {
 			oldIDs[o.ID] = true
 		}
-		if e.Op == opRebuilt {
-			rebuilt[e.Name] = e.ID
-		}
 	}
-
-	// 第 1 遍：删除新建的容器，停下临时停过、又被启动了的容器。
 	u.screen.Note("删除这次新建的容器")
 	for i := len(entries) - 1; i >= 0; i-- {
 		e := entries[i]
 		switch e.Op {
 		case opContainer:
-			// 建好了的按记下的 ID 删（opCreated），不按名字：名字可能被别的容器占着。没记下 ID 的，可能
-			// 没建成（名字被别的容器占着），也可能建好了还没来得及记就被强制结束（或者日志是升级之前的
-			// 版本写的）：只删在这条记录之后才建的同名容器，之前就有的不是这次建的。
-			if created[e.Name] {
-				continue
-			}
-			c, _, err := u.dc.InspectContainer(ctx, e.Name)
-			switch {
-			case docker.IsNotFound(err):
-			case err != nil:
-				note("没法确认本次新建的容器 %s 已经删除：%v", e.Name, err)
-			case oldIDs[c.ID]:
-			case !c.Created.After(e.Time):
-				u.logf("回滚：容器 %s 在迁入要新建它之前就有了，不是这次建的，没有删除", e.Name)
-			default:
-				u.removeCreated(ctx, e.Name, c.ID, note)
+			// 建好了的按记下的 ID 删（opCreated），不按名字：名字可能被别的容器占着。
+			if !created[e.Name] {
+				u.removeUnrecorded(ctx, e, oldIDs, note)
 			}
 		case opCreated:
 			u.removeCreated(ctx, e.Name, e.ID, note)
@@ -97,29 +100,9 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		case opStop:
 			u.restop(ctx, e, note)
 		case opComposeOld:
-			// 原来的 Compose 容器：上次回滚可能已经把它放回去（ID 不变）或者重建了（ID 变了，
-			// 只能按名字找），现在可能在运行。
-			for _, o := range e.Old {
-				ref := o.ID
-				if _, _, err := u.dc.InspectContainer(ctx, ref); docker.IsNotFound(err) {
-					ref = o.Name
-				}
-				u.restop(ctx, Entry{Name: o.Name, ID: ref}, note)
-			}
+			u.restopOldCompose(ctx, e, note)
 		case opComposeUp:
-			list, err := u.dc.ContainersByLabel(ctx, "com.docker.compose.project="+e.Name)
-			if err != nil {
-				note("读不到 Compose 项目 %s 的容器：%v", e.Name, err)
-				continue
-			}
-			for _, c := range list {
-				if oldIDs[c.ID] {
-					continue
-				}
-				if err := u.dc.RemoveContainerAndVolumes(ctx, c.ID); err != nil && !docker.IsNotFound(err) {
-					note("Compose 项目 %s 的新容器 %s 没能删除：%v", e.Name, c.Name(), err)
-				}
-			}
+			u.removeComposeUp(ctx, e, oldIDs, note)
 		case opStart, opRename, opOldImages, opVolume, opStage, opBind, opContents, opLink, opFile, opMkdir, opNetwork,
 			opImages, opTag, opRebuilt, opCommit, opPartialCommit:
 			// 这一遍不用管：数据在第 2 遍，原来的服务在第 3 遍，opRebuilt 在最前面已经看过
@@ -127,15 +110,11 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 			note("日志里有不认识的记录 %s，没有撤销", e.Op)
 		}
 	}
-	if len(problems) > 0 || u.fail("rollback-remove") {
-		if u.fail("rollback-remove") {
-			note("（测试）模拟新容器没能删除")
-		}
-		note("有容器没能删除或停下，为了安全没有动数据，回滚资料全部保留")
-		return problems
-	}
+}
 
-	// 第 2 遍：数据。
+// undoData 是回滚的第 2 遍：删除这次写入的网络、文件、目录和数据卷，放回原有的，最后把改动过的
+// 镜像名改回去。
+func (u *undo) undoData(ctx context.Context, entries []Entry, note func(string, ...any)) {
 	u.screen.Note("删除这次写入的网络、文件、目录和数据卷，放回原有的")
 	var tags []Entry // 改动过的镜像名，最后一起改回去（见 undoTags）
 	var had []string // 加载镜像之前已有的镜像
@@ -149,20 +128,7 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 				note("本次新建的网络 %s 没能删除：%v", e.Name, err)
 			}
 		case opFile:
-			if e.Existed {
-				if _, err := os.Lstat(e.Backup); err != nil {
-					continue // 备份已经放回去了（之前撤销过），或者还没来得及挪走原来的文件
-				}
-			}
-			if err := os.RemoveAll(e.Path); err != nil {
-				note("没能删除 %s：%v", e.Path, err)
-				continue
-			}
-			if e.Existed {
-				if err := moveOrCopy(e.Backup, e.Path); err != nil {
-					note("文件 %s 没能放回原来的：%v", e.Path, err)
-				}
-			}
+			undoFile(e, note)
 		case opMkdir:
 			_ = os.Remove(e.Path) // 只删空目录；里面还有别的东西就留着
 		case opLink:
@@ -193,20 +159,16 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 		}
 	}
 	u.undoTags(ctx, tags, had, note)
-	if u.fail("rollback-data") {
-		note("（测试）模拟数据没能放回")
-	}
-	dataOK := len(problems) == 0
-	if !dataOK {
-		note("原有的数据没能全部放回，原来的服务保持停止，请按回滚资料人工处理")
-	}
+}
 
-	// 第 3 遍：旧服务。先全部放回去：旧容器改回原名，再重建原来的 Compose 容器（改回原名之后，
-	// 按名字引用它们的才找得到）；最后按依赖统一启动原来在运行的，被借用网络等的先启动。依赖可能
-	// 跨项目、跨独立容器（例如一个项目借用另一个项目的容器的网络），按日志一条一条地放回、启动，
-	// 会把用到别人的排在前面，它就启动不了。
+// bringBackOld 是回滚的第 3 遍：放回新服务器上原来的服务。先全部放回去：旧容器改回原名，再重建原来的
+// Compose 容器（改回原名之后，按名字引用它们的才找得到）；start 为真（原有的数据都放回了）时，最后按
+// 依赖统一启动原来在运行的，被借用网络等的先启动。依赖可能跨项目、跨独立容器（例如一个项目借用另一个
+// 项目的容器的网络），按日志一条一条地放回、启动，会把用到别人的排在前面，它就启动不了。
+func (u *undo) bringBackOld(ctx context.Context, entries []Entry, start bool, note func(string, ...any)) {
 	u.screen.Note("放回新服务器上原来的服务")
 	images := map[string]string{}
+	rebuilt := map[string]string{}  // 上次回滚重建过的原有 Compose 容器：名字 → 重建后的 ID
 	oldNames := map[string]string{} // 原来的 Compose 容器：ID → 名字
 	names := map[string]string{}    // 要放回、要启动的全部容器：ID → 名字
 	var olds []OldContainer
@@ -218,8 +180,11 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 			oldNames[o.ID], names[o.ID] = o.Name, o.Name
 			olds = append(olds, o)
 		}
-		if e.Op == opStop || e.Op == opRename {
+		switch e.Op {
+		case opStop, opRename:
 			names[e.ID] = e.Name
+		case opRebuilt:
+			rebuilt[e.Name] = e.ID
 		}
 	}
 	for i := len(entries) - 1; i >= 0; i-- {
@@ -253,15 +218,14 @@ func (u *undo) rollback(ctx context.Context, entries []Entry) []string {
 			revives = append(revives, revive{e.Name, e.ID, e.State, deps})
 		}
 	}
-	if !dataOK {
-		return problems
+	if !start {
+		return
 	}
 	for _, v := range dependencyOrder(revives, func(v revive) string { return v.name }, func(v revive) []string { return v.deps }) {
 		if err := restoreState(ctx, u.dc, v.id, v.state); err != nil {
 			note("原来的容器 %s 没能恢复原来的状态（%s）：%v", v.name, v.state, err)
 		}
 	}
-	return problems
 }
 
 // nameIn 返回按 ids（ID → 名字）把引用的 ID（或它的前缀）换成名字的函数：原来的 Compose 容器
@@ -372,6 +336,18 @@ func (u *undo) restop(ctx context.Context, e Entry, note func(string, ...any)) {
 	}
 }
 
+// restopOldCompose 把原来的 Compose 容器重新停下：上次回滚可能已经把它放回去（ID 不变）或者重建了
+// （ID 变了，只能按名字找），现在可能在运行。
+func (u *undo) restopOldCompose(ctx context.Context, e Entry, note func(string, ...any)) {
+	for _, o := range e.Old {
+		ref := o.ID
+		if _, _, err := u.dc.InspectContainer(ctx, ref); docker.IsNotFound(err) {
+			ref = o.Name
+		}
+		u.restop(ctx, Entry{Name: o.Name, ID: ref}, note)
+	}
+}
+
 // removeCreated 删掉这次新建的容器 id。只有 Docker 明确说没有这个容器，才算已经删掉；其他错误说明
 // 不知道它还在不在写数据。
 func (u *undo) removeCreated(ctx context.Context, name, id string, note func(string, ...any)) {
@@ -380,10 +356,44 @@ func (u *undo) removeCreated(ctx context.Context, name, id string, note func(str
 	}
 }
 
+// removeUnrecorded 删除新建时没记下 ID 的容器（opContainer 之后没有 opCreated）：可能没建成（名字被
+// 别的容器占着），也可能建好了还没来得及记就被强制结束（或者日志是升级之前的版本写的）。只删在这条
+// 记录之后才建的同名容器，之前就有的不是这次建的。
+func (u *undo) removeUnrecorded(ctx context.Context, e Entry, oldIDs map[string]bool, note func(string, ...any)) {
+	c, _, err := u.dc.InspectContainer(ctx, e.Name)
+	switch {
+	case docker.IsNotFound(err):
+	case err != nil:
+		note("没法确认本次新建的容器 %s 已经删除：%v", e.Name, err)
+	case oldIDs[c.ID]:
+	case !c.Created.After(e.Time):
+		u.logf("回滚：容器 %s 在迁入要新建它之前就有了，不是这次建的，没有删除", e.Name)
+	default:
+		u.removeCreated(ctx, e.Name, c.ID, note)
+	}
+}
+
 // removeHelper 删除 DockHop 自己的临时容器（按日志里记下的名字，名字里带着进程号）。
 func (u *undo) removeHelper(ctx context.Context, e Entry, note func(string, ...any)) {
 	if err := u.dc.RemoveContainerAndVolumes(ctx, e.Name); err != nil && !docker.IsNotFound(err) {
 		note("临时容器 %s 没能删除：%v", e.Name, err)
+	}
+}
+
+// removeComposeUp 删除 Compose 项目这次新建的容器；原有的（oldIDs）留着，第 3 遍放回去。
+func (u *undo) removeComposeUp(ctx context.Context, e Entry, oldIDs map[string]bool, note func(string, ...any)) {
+	list, err := u.dc.ContainersByLabel(ctx, "com.docker.compose.project="+e.Name)
+	if err != nil {
+		note("读不到 Compose 项目 %s 的容器：%v", e.Name, err)
+		return
+	}
+	for _, c := range list {
+		if oldIDs[c.ID] {
+			continue
+		}
+		if err := u.dc.RemoveContainerAndVolumes(ctx, c.ID); err != nil && !docker.IsNotFound(err) {
+			note("Compose 项目 %s 的新容器 %s 没能删除：%v", e.Name, c.Name(), err)
+		}
 	}
 }
 
