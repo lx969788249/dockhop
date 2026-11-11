@@ -274,6 +274,13 @@ func upgrade(e Entry) Entry {
 	switch {
 	case e.Op == opBind && e.Existed && filepath.Dir(e.Backup) == e.Path:
 		e.Op, e.Existed = opContents, false
+		// v1.2.5 没记目录本身原来的属性，而是把备份目录建成和它一样的属主和权限：从那里取回。备份目录
+		// 不在时还没开始挪原来的东西，目录本身也还是原来的。
+		if e.Meta == nil {
+			if m, err := readMeta(e.Backup); err == nil {
+				e.Meta = &m
+			}
+		}
 	case e.Op == opCommit && len(e.Names) > 0:
 		e.Op = opPartialCommit
 	}

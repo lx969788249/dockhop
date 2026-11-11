@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -170,5 +171,32 @@ func TestReadJournalUpgradesOldRecords(t *testing.T) {
 	}
 	if p := entries[3]; !slices.Equal(p.Names, []string{"2"}) {
 		t.Errorf("保留下来的组读错了：%+v", p)
+	}
+}
+
+// v1.2.5 原地换内容时没把目录本身原来的属性记进日志，而是把备份目录建成和它一样的属主和权限，回滚时
+// 从备份目录取回。用现在的版本恢复这样的日志时，同样从备份目录取回，不然目录会保持迁移过来的属主和
+// 权限（可能是另一个属主，或者更宽的权限）。备份目录不在时（还没开始挪原来的东西），目录还是原来的。
+func TestReadJournalUpgradeTakesMetaFromBackup(t *testing.T) {
+	root := t.TempDir()
+	dst := filepath.Join(root, "data")
+	backup := filepath.Join(dst, ".dockhop-old-1")
+	os.MkdirAll(backup, 0o700)
+	os.Chmod(backup, 0o751)
+	dir := filepath.Join(root, "rb")
+	os.MkdirAll(dir, 0o700)
+	line := func(b string) string {
+		return `{"op":"bind","path":` + strconv.Quote(dst) + `,"existed":true,"backup":` + strconv.Quote(b) + `,"names":["a"]}`
+	}
+	os.WriteFile(journalPath(dir), []byte(`{"op":"start","pid":1}`+"\n"+line(backup)+"\n"+line(filepath.Join(dst, ".dockhop-old-gone"))+"\n"), 0o600)
+	entries, err := readJournal(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := entries[1].Meta; m == nil || m.Mode.Perm() != 0o751 || m.UID != os.Getuid() {
+		t.Errorf("应从备份目录取回目录原来的属性：%+v", m)
+	}
+	if m := entries[2].Meta; m != nil {
+		t.Errorf("备份目录不在时没有可取的：%+v", m)
 	}
 }
