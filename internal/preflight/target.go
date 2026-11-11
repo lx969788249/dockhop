@@ -36,6 +36,7 @@ type Target struct {
 	Link          func(path string) string            // path 本身是软链接时是它指向的地方，否则为空
 	MountsUnder   func(path string) ([]string, error) // 挂在 path 里面的挂载点（见 host.MountsUnder）
 	Disk          func(path string) (host.Disk, error)
+	VolumeBytes   func(name string) int64 // 已有的数据卷占了多少空间，不知道时为 -1
 	Pullable      func(ref string) bool
 }
 
@@ -80,6 +81,24 @@ func hasContent(path string) bool {
 	return len(names) > 0
 }
 
+// volumeBytes 返回查已有数据卷大小的函数。大小要 Docker 把每个卷统计一遍（docker system df），
+// 可能要一会儿：第一次用到时才统计，只统计一次；统计不了时都当作不知道。
+func volumeBytes(ctx context.Context, dc *docker.Client) func(string) int64 {
+	var sizes map[string]int64
+	return func(name string) int64 {
+		if sizes == nil {
+			var err error
+			if sizes, err = dc.VolumeUsage(ctx); err != nil {
+				sizes = map[string]int64{}
+			}
+		}
+		if n, ok := sizes[name]; ok {
+			return n
+		}
+		return -1
+	}
+}
+
 // Collect 读出新服务器的情况。读不到的部分留空，相应的检查就跳过。
 func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, error) {
 	info, err := dc.Info(ctx)
@@ -97,6 +116,7 @@ func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, e
 		Link:        func(p string) string { dest, _ := os.Readlink(p); return dest },
 		MountsUnder: host.MountsUnder,
 		Disk:        host.DiskOf,
+		VolumeBytes: volumeBytes(ctx, dc),
 	}
 	if t.DockerRoot == "" {
 		t.DockerRoot = "/var/lib/docker"

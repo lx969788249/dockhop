@@ -680,10 +680,14 @@ func diskIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, usedVolum
 		return 0
 	}
 	bundleBytes := plan.Sizes.Bundle + plan.Sizes.ImageFiles // 按镜像全部从旧服务器下载算
-	var keptVolumes int64
+	var keptVolumes, backups int64
 	for _, v := range plan.Volumes {
-		if d.KeepVolume(v.Name) || !usedVolumes[v.Name] {
+		switch {
+		case d.KeepVolume(v.Name) || !usedVolumes[v.Name]:
 			keptVolumes += v.Bytes
+		case t.Volumes[v.Name] != nil && t.VolumeBytes != nil:
+			// 替换已有的数据卷之前，先把原来的数据整份备份到回滚资料里，提交之后才删。
+			backups += max(t.VolumeBytes(v.Name), 0)
 		}
 	}
 	// 解开后的数据：镜像（格式版本 1 在包里）、数据卷、目录、Compose 项目的文件、容器里的改动。
@@ -692,10 +696,26 @@ func diskIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, usedVolum
 	dockerNeed := plan.Sizes.Images + plan.Sizes.Volumes + plan.Sizes.Changes - keptVolumes
 	base, berr := t.Disk(o.BaseDir)
 	root, rerr := t.Disk(t.DockerRoot)
-	need := bundleBytes + extracted
+	// 回滚资料在 DockHop 自己的目录下：和下载目录或者 Docker 的目录在同一块磁盘上时一起算，不然单独看。
+	var baseBackups int64
+	if backups > 0 {
+		switch home, err := t.Disk(o.Home); {
+		case err != nil:
+		case berr == nil && home.Dev == base.Dev:
+			baseBackups = backups
+		case rerr == nil && home.Dev == root.Dev:
+			dockerNeed += backups
+		case int64(home.Free) < backups:
+			addIssue(Issue{Level: Ask, Kind: "disk_rollback",
+				Title: fmt.Sprintf("磁盘空间不够：替换已有的数据卷之前要先把原来的数据备份到回滚资料里，需要约 %s，%s 所在磁盘只剩 %s",
+					ui.HumanBytes(backups), home.Path, ui.HumanBytes(int64(home.Free))),
+				Hint: "清理这块磁盘后重新检查，或者用环境变量 DOCKHOP_HOME 把 DockHop 的目录换到空间更大的磁盘"})
+		}
+	}
+	need := bundleBytes + extracted + baseBackups
 	if berr == nil && rerr == nil && base.Dev == root.Dev {
 		// 同一块磁盘：下载的包、解开的数据和加载进 Docker 的镜像会同时存在（数据用完就删）。
-		need = bundleBytes + extracted + plan.Sizes.Images
+		need = bundleBytes + extracted + plan.Sizes.Images + baseBackups
 		if int64(base.Free) < need {
 			addIssue(Issue{Level: Ask, Kind: "disk_base",
 				Title: fmt.Sprintf("磁盘空间不够：迁入需要约 %s，%s 所在磁盘只剩 %s", ui.HumanBytes(need), base.Path, ui.HumanBytes(int64(base.Free))),

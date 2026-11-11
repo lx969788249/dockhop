@@ -321,6 +321,36 @@ func TestEvaluateDiskAndDigest(t *testing.T) {
 	}
 }
 
+// 替换已有的数据卷之前，要先把原来的数据整份备份到回滚资料里（DockHop 自己的目录下），提交之后才删：
+// 这份空间也要算上（问题表 D15）。和下载目录在同一块磁盘上时一起算，不在时单独看那块磁盘。
+func TestEvaluateDiskCountsVolumeBackups(t *testing.T) {
+	tg := testTarget()
+	tg.Volumes["data"] = &docker.Volume{Name: "data", Driver: "local"}
+	tg.VolumeBytes = func(name string) int64 {
+		if name == "data" {
+			return 3 << 30
+		}
+		return -1
+	}
+	tg.Disk = func(string) (host.Disk, error) { return host.Disk{Path: "/", Free: 2 << 30, Dev: 1}, nil }
+	o := Options{BaseDir: "/work", Home: "/root/.dockhop"}
+	if i := find(Evaluate(testPlan(), tg, &Decisions{}, o), "disk_base"); i == nil || !strings.Contains(i.Title, "3.5GB") {
+		t.Errorf("同一块磁盘：要算上备份原有数据卷的空间：%+v", i)
+	}
+	if i := find(Evaluate(testPlan(), tg, &Decisions{KeepVolumes: []string{"data"}}, o), "disk_base"); i != nil {
+		t.Errorf("保留已有的数据卷时不用备份：%+v", i)
+	}
+	tg.Disk = func(p string) (host.Disk, error) {
+		if p == o.Home {
+			return host.Disk{Path: "/home", Free: 1 << 30, Dev: 2}, nil
+		}
+		return host.Disk{Path: "/", Free: 100 << 30, Dev: 1}, nil
+	}
+	if i := find(Evaluate(testPlan(), tg, &Decisions{}, o), "disk_rollback"); i == nil || i.Level != Ask || !strings.Contains(i.Title, "3GB") {
+		t.Errorf("DockHop 的目录在另一块磁盘上：单独看那块：%+v", i)
+	}
+}
+
 func TestRunnerAuto(t *testing.T) {
 	tg := testTarget()
 	tg.Listeners = []host.Listener{{Proto: "tcp", Addr: "0.0.0.0", Port: 80}}
