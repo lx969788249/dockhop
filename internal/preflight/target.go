@@ -33,6 +33,7 @@ type Target struct {
 	HostIPs       map[string]bool // 本机的地址；为 nil 时不检查
 	Exists        func(path string) bool
 	HasContent    func(path string) bool              // path 上已经有东西：文件、软链接，或者不是空的目录
+	Link          func(path string) string            // path 本身是软链接时是它指向的地方，否则为空
 	MountsUnder   func(path string) ([]string, error) // 挂在 path 里面的挂载点（见 host.MountsUnder）
 	Disk          func(path string) (host.Disk, error)
 	Pullable      func(ref string) bool
@@ -93,6 +94,7 @@ func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, e
 		Volumes:    map[string]*docker.Volume{}, Networks: map[string]TargetNetwork{},
 		Exists:      func(p string) bool { _, err := os.Stat(p); return err == nil },
 		HasContent:  hasContent,
+		Link:        func(p string) string { dest, _ := os.Readlink(p); return dest },
 		MountsUnder: host.MountsUnder,
 		Disk:        host.DiskOf,
 	}

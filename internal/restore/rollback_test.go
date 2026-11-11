@@ -213,38 +213,35 @@ func TestRestoreBindStopsWhenMountUnknown(t *testing.T) {
 	}
 }
 
-// 新服务器上这个路径本身是软链接（例如指向数据盘上的目录）：迁移过来的解到它指向的目录里，软链接
-// 留着（以前软链接被换成了普通目录，数据写到了系统盘上）；回滚后它指向的目录和原来一样。
-func TestRestoreBindThroughTargetLink(t *testing.T) {
+// 新服务器上要写的目录路径本身是软链接时不迁入：不跟着它去整个替换它指向的地方（可能是系统目录或者
+// 一整块盘），也不把它换成普通目录（数据就写到软链接所在的盘上了）。迁入前检查已经停下，这里是动手
+// 之前最后再看一次（检查之后才被换成软链接的情况）：什么都不改，也不记进日志。
+func TestRestoreBindRefusesLink(t *testing.T) {
 	root := t.TempDir()
 	world := filepath.Join(root, "world")
-	real := filepath.Join(world, "disk", "data")
-	os.MkdirAll(real, 0o755)
-	os.WriteFile(filepath.Join(real, "keep.txt"), []byte("old data"), 0o600)
+	disk := filepath.Join(world, "disk")
+	os.MkdirAll(disk, 0o755)
+	os.WriteFile(filepath.Join(disk, "keep.txt"), []byte("old data"), 0o600)
 	dst := filepath.Join(world, "data")
-	os.Symlink(real, dst)
+	os.Symlink(disk, dst)
 	before := snapshotTree(t, world)
 	r := bindRun(t, root, bindStream(t, dst, 0o755, map[string]string{"new.txt": "migrated"}))
-	if err := r.restoreBind(context.Background(), bundle.Bind{ID: "b1", Path: dst, Dir: true, Parts: 1}); err != nil {
-		t.Fatal(err)
+	err := r.restoreBind(context.Background(), bundle.Bind{ID: "b1", Path: dst, Dir: true, Parts: 1})
+	if err == nil || !strings.Contains(err.Error(), "软链接") || !strings.Contains(err.Error(), disk) {
+		t.Fatalf("应拒绝，并说出软链接指向哪里：%v", err)
 	}
-	if st, err := os.Lstat(dst); err != nil || st.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("软链接应留着：%v %v", st, err)
-	}
-	if b, _ := os.ReadFile(filepath.Join(real, "new.txt")); string(b) != "migrated" {
-		t.Fatalf("迁移过来的应解到软链接指向的目录里：%v", dirNames(real))
+	if after := snapshotTree(t, world); after != before {
+		t.Fatalf("不应改动任何东西：\n原来：\n%s\n现在：\n%s", before, after)
 	}
 	r.j.close()
 	entries, err := readJournal(filepath.Join(root, "rb"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	u := &undo{screen: r.Screen, logf: t.Logf, fail: func(string) bool { return false }, mountPoint: noMounts}
-	if problems := u.rollback(context.Background(), entries); len(problems) > 0 {
-		t.Fatal(problems)
-	}
-	if after := snapshotTree(t, world); after != before {
-		t.Fatalf("回滚后和原来不一样：\n原来：\n%s\n现在：\n%s", before, after)
+	for _, e := range entries {
+		if e.Op != opStart {
+			t.Errorf("不应记进日志：%+v", e)
+		}
 	}
 }
 

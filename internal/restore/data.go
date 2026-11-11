@@ -15,6 +15,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/host"
+	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/spec"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -161,37 +162,32 @@ func (r *run) saveVolume(ctx context.Context, name, path string) error {
 }
 
 func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
-	// 新服务器上这个路径本身是软链接时（例如指向数据盘上的目录），解到它指向的地方，软链接留着：
-	// 换掉软链接，数据就写到系统盘上了。
-	dst := b.Path
-	if st, err := os.Lstat(b.Path); err == nil && st.Mode()&os.ModeSymlink != 0 {
-		real, err := filepath.EvalSymlinks(b.Path)
-		if err != nil {
-			return fmt.Errorf("新服务器上的 %s 是软链接，但它指向的地方不在了：%v", b.Path, err)
-		}
-		dst = real
+	// 迁入前检查已经在路径本身是软链接时停下（见 preflight.LinkedBind），这里是动手之前最后再看一次：
+	// 检查之后才被换成软链接的，同样不迁入。
+	if dest, err := os.Readlink(b.Path); err == nil {
+		return errors.New(preflight.LinkedBind(b.Path, dest))
 	}
 	// 单独挂载的目录（例如一块数据盘）不能改名，只能在原地换里面的内容（见 replaceContents），
 	// 解压也解在它里面：和它在同一块盘上。判断不了时不动它：选错了办法，挂载点改名会失败，
 	// 普通目录也不该在里面换。
 	inPlace := false
 	if b.Dir {
-		mp, err := r.MountPoint(dst)
+		mp, err := r.MountPoint(b.Path)
 		if err != nil {
-			return fmt.Errorf("没法判断 %s 是不是单独挂载的目录：%v", dst, err)
+			return fmt.Errorf("没法判断 %s 是不是单独挂载的目录：%v", b.Path, err)
 		}
 		inPlace = mp
 	}
-	parent := filepath.Dir(dst)
+	parent := filepath.Dir(b.Path)
 	if err := r.mkdirAll(parent, 0o755); err != nil {
 		return err
 	}
-	stage := siblingName(dst, "stage")
+	stage := siblingName(b.Path, "stage")
 	var contents Entry // 原地换内容时，日志里记着原来有哪些东西的那一条
 	if inPlace {
-		stage = innerName(dst, "stage")
+		stage = innerName(b.Path, "stage")
 		var err error
-		if contents, err = r.recordContents(dst); err != nil {
+		if contents, err = r.recordContents(b.Path); err != nil {
 			return err
 		}
 	}
@@ -226,7 +222,7 @@ func (r *run) restoreBind(ctx context.Context, b bundle.Bind) error {
 	if inPlace {
 		err = r.replaceContents(contents, stage, staged)
 	} else {
-		err = r.replaceDir(staged, dst)
+		err = r.replaceDir(staged, b.Path)
 	}
 	if err != nil {
 		return err

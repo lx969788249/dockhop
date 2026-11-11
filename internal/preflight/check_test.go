@@ -40,6 +40,7 @@ func testTarget() *Target {
 		ListenersOK: true, Exists: func(string) bool { return true }, HasContent: func(string) bool { return false },
 		Disk:        func(string) (host.Disk, error) { return host.Disk{Path: "/", Free: 100 << 30, Dev: 1}, nil },
 		MountsUnder: func(string) ([]string, error) { return nil, nil },
+		Link:        func(string) string { return "" },
 	}
 }
 
@@ -710,6 +711,34 @@ func TestHasContent(t *testing.T) {
 		if got := hasContent(path); got != want {
 			t.Errorf("hasContent(%s) = %v", filepath.Base(path), got)
 		}
+	}
+}
+
+// 新服务器上要迁入的目录路径本身是软链接时，在下载之前停下：跟着它写，会整个替换掉它指向的地方（可能是
+// 系统目录或者一整块盘）；把它换成普通目录，数据又写到了软链接所在的盘上。这时也不再说“会替换它”。
+func TestEvaluateBindIsLink(t *testing.T) {
+	p := testPlan()
+	p.Containers[0].Binds = []string{"/srv/web"}
+	p.Binds = []bundle.PlanBind{{Path: "/srv/web", Bytes: 1 << 20}}
+	tg := testTarget()
+	tg.HasContent = func(string) bool { return true }
+	tg.Link = func(path string) string {
+		if path == "/srv/web" {
+			return "/etc"
+		}
+		return ""
+	}
+	r := Evaluate(p, tg, &Decisions{}, Options{})
+	i := find(r, "bind_link")
+	if i == nil || i.Level != Stop || !strings.Contains(i.Title, "/srv/web") || !strings.Contains(i.Title, "/etc") {
+		t.Fatalf("应停下，并说出软链接指向哪里：%+v", i)
+	}
+	if i := find(r, "bind_replace"); i != nil {
+		t.Errorf("软链接不会被替换，不应再说会替换：%+v", i)
+	}
+	tg.Link = func(string) string { return "" }
+	if i := find(Evaluate(p, tg, &Decisions{}, Options{}), "bind_link"); i != nil {
+		t.Errorf("不是软链接时不应停下：%+v", i)
 	}
 }
 

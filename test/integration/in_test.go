@@ -281,7 +281,8 @@ func TestInBindWithNestedMount(t *testing.T) {
 	noLeftovers(t, home)
 }
 
-// 新服务器上这个路径本身是软链接（指向数据盘上的目录）：迁移过来的解到它指向的目录里，软链接留着。
+// 新服务器上这个路径本身是软链接（指向数据盘上的目录）：在改动任何东西之前停下，说出它指向哪里。不跟着
+// 它去整个替换它指向的目录（可能是系统目录或者一整块盘），也不把它换成普通目录。
 func TestInBindTargetIsLink(t *testing.T) {
 	p := fmt.Sprintf("dmtest_tl%d", os.Getpid())
 	t.Cleanup(func() { removePrefixed(p) })
@@ -300,22 +301,22 @@ func TestInBindTargetIsLink(t *testing.T) {
 	os.MkdirAll(disk, 0o755)
 	os.WriteFile(filepath.Join(disk, "old.txt"), []byte("old"), 0o644)
 	os.Symlink(disk, data)
+	before := dirFiles(t, disk)
 
-	home := t.TempDir()
-	if out, code := m.in(t, home, nil); code != 0 {
-		t.Fatalf("迁入应成功：%d\n%s", code, out)
+	out, code := m.in(t, t.TempDir(), nil)
+	if code == 0 {
+		t.Fatalf("应停下：\n%s", out)
 	}
-	if st, err := os.Lstat(data); err != nil || st.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("软链接应留着：%v", err)
+	mustContain(t, out, data+" 是软链接", "指向 "+disk)
+	if dest, err := os.Readlink(data); err != nil || dest != disk {
+		t.Errorf("软链接应原样留着：%q %v", dest, err)
 	}
-	if b, _ := os.ReadFile(filepath.Join(disk, "app.txt")); string(b) != "migrated" {
-		t.Errorf("迁移过来的应在软链接指向的目录里：%v", dirFiles(t, disk))
+	if after := dirFiles(t, disk); after != before {
+		t.Errorf("软链接指向的目录不应被改动：\n%s", after)
 	}
-	if v := exec1(t, name, "cat /data/app.txt"); v != "migrated" {
-		t.Errorf("容器看到的数据：%q", v)
+	if exists("container", name) {
+		t.Error("停下时不应创建任何容器")
 	}
-	m.waitOutSuccess(t)
-	noLeftovers(t, home)
 }
 
 // 1Panel 的样子：应用和数据库是两个 Compose 项目，接在同一个外部网络上，应用的启动命令里写着

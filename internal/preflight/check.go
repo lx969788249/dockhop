@@ -528,6 +528,11 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		if !usedBinds[b.Path] {
 			continue
 		}
+		if dest := t.Link(b.Path); dest != "" {
+			addIssue(Issue{Level: Stop, Kind: "bind_link", Title: LinkedBind(b.Path, dest),
+				Hint: "用不着这个软链接就删掉它；想让数据放在它指向的地方，删掉软链接后把那个目录挂载（mount --bind）到 " + b.Path + "。处理好之后重新运行迁入"})
+			continue
+		}
 		if t.HasContent(b.Path) {
 			addIssue(Issue{Level: Info, Kind: "bind_replace",
 				Title: "目录 " + b.Path + " 已存在，迁移过来的内容会替换它（失败时放回原来的）"})
@@ -984,6 +989,13 @@ func shortRef(ref string) string {
 		return name + "@sha256:" + digest[:12] + "…"
 	}
 	return ref
+}
+
+// LinkedBind 说明为什么要迁入的目录在新服务器上是软链接时不迁入：跟着它写，会整个替换掉它指向的地方
+// （可能是系统目录或者一整块盘）；把它换成普通目录，数据又写到了软链接所在的盘上。迁入前检查和真正
+// 写入之前都按它停下。
+func LinkedBind(path, dest string) string {
+	return fmt.Sprintf("新服务器上的 %s 是软链接，指向 %s：迁入不会跟着它去替换它指向的地方，也不会把它换成普通目录", path, dest)
 }
 
 // HomeClash 检查迁入的目录 p 会不会盖住 DockHop 存放迁移文件、回滚资料的目录 home。
