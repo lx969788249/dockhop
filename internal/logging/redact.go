@@ -51,8 +51,9 @@ var patterns = []struct {
 	// 双引号里转义的引号（\"）算在值里
 	{regexp.MustCompile(`"(` + secretName + `)=(?:[^"\\\n]|\\.)*`), `"${1}=` + mask},
 	{regexp.MustCompile(`'(` + secretName + `)=[^'\n]*`), `'${1}=` + mask},
-	// NAME=值（环境变量、命令行参数）：遮到空白、引号或中文标点为止，值里的 & , ; 也遮（宁可多藏）
-	{regexp.MustCompile(`(` + secretName + `)=([^\s"'，。；：、！？）】」』》]+)`), "${1}=" + mask},
+	// NAME=值（环境变量、命令行参数）：遮到空白或引号为止，值里的 & , ; 和中文标点也遮。没加引号时分不出
+	// 值在哪结束，宁可多藏：在中文标点处停下会露出值的后半截（PASSWORD=abc，def）。
+	{regexp.MustCompile(`(` + secretName + `)=([^\s"']+)`), "${1}=" + mask},
 	// "name": "值"（JSON）
 	{regexp.MustCompile(`("` + secretName + `"\s*:\s*)"(?:[^"\\\n]|\\.)*"?`), `${1}"` + mask + `"`},
 	// name: 值（YAML）

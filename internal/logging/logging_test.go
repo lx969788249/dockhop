@@ -31,13 +31,14 @@ func TestRedact(t *testing.T) {
 		"MODE=production":                                                                      "MODE=production",
 	}
 	// 写法隐藏只在一行里：引号没有配对时遮到行末，不能把后面的日志吞掉（失败时最需要日志）；
-	// 值里转义的引号算在值里；值后面紧跟的中文标点和文字不算值。
+	// 值里转义的引号算在值里；没加引号的值遮到空白为止，中文标点也算在值里：分不出值在哪结束时宁可多藏。
 	for _, c := range []struct{ in, want string }{
 		{"-e \"DB_PASSWORD=abc\n后面这行日志要留着\nMODE=prod\"", "-e \"DB_PASSWORD=***\n后面这行日志要留着\nMODE=prod\""},
 		{"'DB_PASSWORD=abc\n后面这行日志要留着'", "'DB_PASSWORD=***\n后面这行日志要留着'"},
 		{`{"Env":["DB_PASSWORD=pa\"ss","MODE=prod"]}`, `{"Env":["DB_PASSWORD=***","MODE=prod"]}`},
 		{"\"Password\": \"abc\n后面这行日志要留着\"", "\"Password\": \"***\"\n后面这行日志要留着\""},
-		{"API_TOKEN=abc，后面是普通文字", "API_TOKEN=***，后面是普通文字"},
+		{"API_TOKEN=abc，def 后面是普通文字", "API_TOKEN=*** 后面是普通文字"},
+		{"PASSWORD=abc，def", "PASSWORD=***"},
 	} {
 		cases[c.in] = c.want
 	}
