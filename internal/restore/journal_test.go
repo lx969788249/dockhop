@@ -1,6 +1,8 @@
 package restore
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -9,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 func TestJournalTornLastLine(t *testing.T) {
@@ -136,8 +140,15 @@ func TestJournalUnknownOp(t *testing.T) {
 	f, _ := os.OpenFile(journalPath(dir), os.O_APPEND|os.O_WRONLY, 0)
 	f.WriteString(`{"op":"from_the_future","name":"x"}` + "\n")
 	f.Close()
-	if _, err := readJournal(dir); !errors.Is(err, ErrJournalDamaged) {
-		t.Fatalf("不认识的记录应当作损坏处理：%v", err)
+	if _, err := readJournal(dir); !errors.Is(err, ErrJournalNewer) {
+		t.Fatalf("不认识的记录多半是更新的版本写的，不能自动撤销：%v", err)
+	}
+	// 迁入开头补救时说明用最新的版本运行（它认得这些记录，会接着处理），而不是让人手动处理、删掉回滚资料。
+	var out bytes.Buffer
+	s := ui.New(&out, false, nil)
+	r := &run{Deps: Deps{Screen: s}, rbDir: dir}
+	if err := r.recoverInterrupted(context.Background()); err == nil || s.Failure() == nil || !strings.Contains(s.Failure().Hint, "最新版本") {
+		t.Errorf("应提示用最新版本运行：%v %+v", err, s.Failure())
 	}
 }
 

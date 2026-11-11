@@ -234,6 +234,10 @@ func (j *Journal) close() {
 // 不能自动撤销，回滚资料要全部保留、交给人工处理。
 var ErrJournalDamaged = errors.New("事务日志中间有一条记录损坏了")
 
+// ErrJournalNewer 表示事务日志里有这个版本不认识的记录，多半是更新版本的 DockHop 写的：撤销时跳过它，
+// 改动就永远留下了，所以这个版本不自动撤销；用认得它的版本运行就能接着处理。
+var ErrJournalNewer = errors.New("事务日志里有这个版本不认识的记录，多半是更新版本的 DockHop 写的")
+
 // readJournal 读出日志里的全部记录。最后一行写了一半（写的时候断电）时忽略那一行：
 // 记录总是在改动之前写的，没写完说明那处改动还没发生。别的行读不懂时返回错误。
 func readJournal(dir string) ([]Entry, error) {
@@ -256,8 +260,7 @@ func readJournal(dir string) ([]Entry, error) {
 			continue
 		}
 		if _, ok := opRules[e.Op]; !ok {
-			// 这个版本不认识的记录（例如更新的版本写的）：撤销时会悄悄跳过它，改动就永远留下了。
-			return nil, fmt.Errorf("%w（第 %d 行是这个版本不认识的记录 %q）", ErrJournalDamaged, n, e.Op)
+			return nil, fmt.Errorf("%w（第 %d 行：%q）", ErrJournalNewer, n, e.Op)
 		}
 		out = append(out, upgrade(e))
 	}

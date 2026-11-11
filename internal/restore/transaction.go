@@ -108,6 +108,10 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
+	if errors.Is(err, ErrJournalNewer) {
+		return s.StepFailed("上次迁入的事务日志是更新版本的 DockHop 写的，这个版本没法接着处理", err.Error(),
+			"用一行命令运行最新版本的 DockHop，它会接着删除上次迁入的内容（回滚资料都保留在 "+r.rbDir+"）")
+	}
 	if err != nil {
 		return s.StepFailed("上次迁入的事务日志读不了，没法自动删除上次迁入的内容", err.Error(),
 			"回滚资料都保留在 "+r.rbDir+"（journal.jsonl 记着每一处改动），请人工处理后删除这个目录再重新运行")
