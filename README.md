@@ -148,7 +148,7 @@ bash <(curl -fsSL https://dockhop.run) out --port 9000
 <details>
 <summary><b>迁移次数是怎么统计的？会上传我的信息吗？</b></summary>
 
-迁入成功后，程序向 `dockhop.run` 发一个空请求，成功次数加 1；迁出、迁入失败时也发一个，失败次数加 1（用来改进稳定性）。统计里只存次数，不存 IP，也不存任何服务器信息（IP 只用来防止有人刷次数），次数和成功率在 https://dockhop.run/stats 能看到。不想统计的话，运行前设置 `DOCKHOP_NO_STATS=1`。
+迁入成功后，程序向 `dockhop.run` 发一个空请求，成功次数加 1；迁出、迁入动手之后失败时也发一个，失败次数加 1（用来改进稳定性；还没改动服务器就停下的不算）。统计里只存次数，不存 IP，也不存任何服务器信息（IP 只用来防止有人刷次数），次数和成功率在 https://dockhop.run/stats 能看到。不想统计的话，运行前设置 `DOCKHOP_NO_STATS=1`。
 
 另外，旧服务器的网卡上没有公网地址时（例如在 NAT 后面），迁出会访问 api.ipify.org 等网站查出自己的公网 IP，写进迁移链接；用 `out --host 公网IP` 指定了就不查。
 </details>

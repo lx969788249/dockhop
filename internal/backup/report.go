@@ -18,7 +18,8 @@ const (
 	endCancelled   ending = iota // 还没改动这台服务器就取消了
 	endSucceeded                 // 正常结束：新服务器迁入成功，或者传输开始之后自己结束了传输
 	endInterrupted               // 改动之后（停机打包时）按 Ctrl+C 中断了
-	endFailed                    // 迁出失败，包括停下的容器没能全部恢复
+	endFailed                    // 停机打包之后失败，包括停下的容器没能全部恢复
+	endStopped                   // 还没改动这台服务器就停下了（检查发现问题、停机前核对发现情况变了）：不算失败
 )
 
 // ending 在收拾完（恢复停下的容器、删除临时文件）之后定下结局，err 是各个步骤返回的错误。
@@ -34,6 +35,8 @@ func (r *run) ending(ctx context.Context, err error) ending {
 		return endSucceeded
 	case interrupted:
 		return endInterrupted
+	case r.toRestore == 0 && r.server == nil:
+		return endStopped
 	default:
 		return endFailed
 	}

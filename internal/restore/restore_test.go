@@ -44,8 +44,9 @@ func TestCancelWhileChecking(t *testing.T) {
 	}
 }
 
-// 迁入失败时调用一次 Failed（统计失败的次数），不调用 Succeeded。
-func TestFailedCounted(t *testing.T) {
+// 还没改动这台服务器就停下了（这里是读取 Docker 信息就失败）：照样显示迁入失败、留着日志，但不算一次失败
+// （问题表 D10）；失败的次数只算动了手之后没成功的（见 TestEnding）。
+func TestStopBeforeChangeNotCounted(t *testing.T) {
 	dc, _ := faultyDocker(t, func(http.ResponseWriter, *http.Request) bool { return false }) // 读取 Docker 信息就失败
 	link, _ := crypto.NewLink("127.0.0.1", 1)
 	var out bytes.Buffer
@@ -54,13 +55,14 @@ func TestFailedCounted(t *testing.T) {
 		Getenv:    func(string) string { return "" },
 		Succeeded: func() { counted = append(counted, "成功") }, Failed: func() { counted = append(counted, "失败") },
 	}, Options{Link: link, Yes: true})
-	if !errors.Is(err, ui.ErrReported) || !strings.Contains(out.String(), "❌ 迁入失败") || strings.Join(counted, "、") != "失败" {
-		t.Fatalf("应失败，算一次失败：%v %v\n%s", err, counted, out.String())
+	if !errors.Is(err, ui.ErrReported) || !strings.Contains(out.String(), "❌ 迁入失败") || len(counted) > 0 {
+		t.Fatalf("应显示失败，不算成功也不算失败：%v %v\n%s", err, counted, out.String())
 	}
 }
 
 // 迁入的结局：结果摘要按它写，迁移次数按它统计。已经提交、只是清理没做完的，服务和数据都已迁入，
-// 算成功；只迁入了一部分算失败；还没改动就取消、改动之后按 Ctrl+C 中断的不算成功也不算失败。
+// 算成功；只迁入了一部分、改动之后失败的算失败；还没改动就取消或者停下、改动之后按 Ctrl+C 中断的
+// 不算成功也不算失败。
 func TestEnding(t *testing.T) {
 	bg := context.Background()
 	stopped, cancel := context.WithCancel(bg)
@@ -75,7 +77,7 @@ func TestEnding(t *testing.T) {
 		{"迁入完成", bg, nil, &run{j: &Journal{}, committed: true}, endSucceeded},
 		{"已经提交，清理没做完", bg, ui.ErrReported, &run{j: &Journal{}, committed: true}, endCommitted},
 		{"只迁入了一部分", bg, errPartial, &run{j: &Journal{}, committed: true, partial: true}, endPartial},
-		{"还没改动就失败", bg, ui.ErrReported, &run{}, endFailed},
+		{"还没改动就停下（检查发现问题、动手前核对发现变了）", bg, ui.ErrReported, &run{}, endStopped},
 		{"改动之后失败", bg, ui.ErrReported, &run{j: &Journal{}}, endFailed},
 		{"还没改动就按了 Ctrl+C", stopped, ui.ErrReported, &run{}, endCancelled},
 		{"回答问题时按了 Ctrl+D", bg, io.EOF, &run{}, endCancelled},

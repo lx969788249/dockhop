@@ -55,8 +55,8 @@ type Deps struct {
 	Home     string
 	Version  string
 	Getenv   func(string) string
-	// Failed 在迁出失败时调用一次，可以为空；还没改动就取消、按 Ctrl+C 中断、传输开始之后自己
-	// 结束传输时都不调用（见 ending）。之后还有收尾：显示结果。
+	// Failed 在停机打包之后迁出失败时调用一次，可以为空；还没改动就取消或者停下、按 Ctrl+C 中断、
+	// 传输开始之后自己结束传输时都不调用（见 ending）。之后还有收尾：显示结果。
 	Failed func()
 }
 

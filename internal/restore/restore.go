@@ -61,8 +61,8 @@ type Deps struct {
 	// MountPoint 判断一个目录本身是不是挂载点：挂载点只能原地换内容。为空时用 host.IsMountPoint，
 	// 按这台机器的实际情况判断；测试时换成假的。
 	MountPoint func(path string) (bool, error)
-	// Succeeded 在迁入成功（已经提交，不会再回滚）时调用一次，Failed 在迁入失败（包括只迁入了
-	// 一部分）时调用一次，都可以为空；还没改动就取消、按 Ctrl+C 中断时都不调用（见 ending）。
+	// Succeeded 在迁入成功（已经提交，不会再回滚）时调用一次，Failed 在改动之后迁入失败（包括只迁入
+	// 了一部分）时调用一次，都可以为空；还没改动就取消或者停下、按 Ctrl+C 中断时都不调用（见 ending）。
 	// 之后还有收尾：回滚、删除临时文件、通知旧服务器、显示结果。
 	Succeeded func()
 	Failed    func()

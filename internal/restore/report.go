@@ -75,7 +75,8 @@ const (
 	endCommitted                 // 服务和数据都已迁入（已经提交），但清理没有完成：算迁入成功
 	endPartial                   // 只迁入了一部分：算迁入失败
 	endInterrupted               // 改动之后按 Ctrl+C 中断了
-	endFailed                    // 迁入失败
+	endFailed                    // 改动之后失败
+	endStopped                   // 还没改动这台服务器就停下了（检查发现问题、动手前核对发现情况变了）：不算失败
 )
 
 // ending 在各个步骤执行完（err 是它们返回的错误）、回滚之前定下结局。按没按 Ctrl+C 看 ctx：
@@ -87,6 +88,8 @@ func (r *run) ending(ctx context.Context, err error) ending {
 		return endCancelled // 回答问题、检查、下载时按了 Ctrl+C
 	case err == nil && !interrupted:
 		return endSucceeded
+	case !r.changed():
+		return endStopped
 	case r.partial:
 		return endPartial
 	case r.committed:

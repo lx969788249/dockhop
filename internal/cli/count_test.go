@@ -63,9 +63,9 @@ func TestCountFailed(t *testing.T) {
 	}
 }
 
-// 迁出、迁入失败时（这里是要迁出的服务不存在、连不上旧服务器）发一次失败的计数，不发成功的；
-// 关了统计时都不发。
-func TestFailureCounted(t *testing.T) {
+// 迁出、迁入在改动之前就停下了（这里是要迁出的服务不存在、连不上旧服务器）：显示失败、退出码 1，但成功
+// 和失败的计数都不发（问题表 D10）。失败的次数只算动了手之后没成功的（见 backup、restore 的 TestEnding）。
+func TestStopBeforeChangeNotCounted(t *testing.T) {
 	var mu sync.Mutex
 	var posts []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -83,9 +83,8 @@ func TestFailureCounted(t *testing.T) {
 		args []string
 		want string
 	}{
-		{"迁出失败", nil, []string{"out", "--include", "nosuch"}, "POST /failed"},
-		{"迁入失败", nil, []string{"in", link.String()}, "POST /failed"},
-		{"关了统计", map[string]string{"DOCKHOP_NO_STATS": "1"}, []string{"out", "--include", "nosuch"}, ""},
+		{"迁出", nil, []string{"out", "--include", "nosuch"}, ""},
+		{"迁入", nil, []string{"in", link.String()}, ""},
 	}
 	for _, c := range cases {
 		mu.Lock()

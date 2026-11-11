@@ -66,8 +66,9 @@ func TestCancelWhileChecking(t *testing.T) {
 	}
 }
 
-// 迁出失败时调用一次 Failed（统计失败的次数）。
-func TestFailedCounted(t *testing.T) {
+// 还没改动这台服务器就停下了（这里是读取 Docker 信息就失败）：照样显示迁出失败、留着日志，但不算一次失败
+// （问题表 D10）；失败的次数只算动了手之后没成功的（见 TestEnding）。
+func TestStopBeforeChangeNotCounted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/version" {
 			w.Write([]byte(`{"Version":"29.0.0","ApiVersion":"1.44"}`))
@@ -84,14 +85,14 @@ func TestFailedCounted(t *testing.T) {
 	failed := 0
 	err = Run(context.Background(), Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: t.TempDir(),
 		Getenv: func(string) string { return "" }, Failed: func() { failed++ }}, Options{})
-	if !errors.Is(err, ui.ErrReported) || !strings.Contains(out.String(), "❌ 迁出失败") || failed != 1 {
-		t.Fatalf("应失败，算一次失败（算了 %d 次）：%v\n%s", failed, err, out.String())
+	if !errors.Is(err, ui.ErrReported) || !strings.Contains(out.String(), "❌ 迁出失败") || failed != 0 {
+		t.Fatalf("应显示失败，不算一次失败（算了 %d 次）：%v\n%s", failed, err, out.String())
 	}
 }
 
 // 迁出的结局：结果摘要按它写，失败的次数按它统计。传输开始之后用户自己结束传输都算正常结束
-// （新服务器迁入失败时，失败算在新服务器那边）；停下的容器没能全部恢复算失败；还没改动就取消、
-// 停机打包时按 Ctrl+C 中断的不算失败。
+// （新服务器迁入失败时，失败算在新服务器那边）；停机打包之后失败、停下的容器没能全部恢复算失败；
+// 还没改动就取消或者停下、停机打包时按 Ctrl+C 中断的不算失败。
 func TestEnding(t *testing.T) {
 	bg := context.Background()
 	stopped, cancel := context.WithCancel(bg)
@@ -107,7 +108,8 @@ func TestEnding(t *testing.T) {
 		{"新服务器迁入成功", bg, nil, &run{server: serving, status: "success"}, endSucceeded},
 		{"新服务器迁入失败后结束传输", bg, nil, &run{server: serving, status: "failed"}, endSucceeded},
 		{"传输时按 Ctrl+C 结束", stopped, nil, &run{server: serving}, endSucceeded},
-		{"迁出失败", bg, ui.ErrReported, &run{}, endFailed},
+		{"还没改动就停下（检查发现问题、停机前核对发现变了）", bg, ui.ErrReported, &run{}, endStopped},
+		{"停机打包之后失败", bg, ui.ErrReported, &run{toRestore: 2, restored: 2}, endFailed},
 		{"停下的容器没能全部恢复", bg, nil, &run{toRestore: 2, restored: 1}, endFailed},
 		{"还没改动就按了 Ctrl+C", stopped, ui.ErrReported, &run{}, endCancelled},
 		{"回答问题时按了 Ctrl+D", bg, io.EOF, &run{}, endCancelled},
