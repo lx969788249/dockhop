@@ -28,7 +28,7 @@ func (r *migrate) newDirSwap(path string, isDir bool) (*dirSwap, error) {
 	}
 	mounted, err := r.MountPoint(path)
 	if err != nil {
-		return nil, fmt.Errorf("没法判断 %s 是不是单独挂载的目录：%v", path, err)
+		return nil, fmt.Errorf("没法判断 %s 是不是单独挂载的目录：%w", path, err)
 	}
 	if !mounted {
 		return d, nil

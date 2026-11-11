@@ -29,7 +29,7 @@ func (r *run) unpack(ctx context.Context, chk *checked, pkg *bundleFiles) (strin
 	}
 	f, err := os.Open(pkg.bundlePath)
 	if err != nil {
-		return "", s.StepFailed("打不开迁移包 "+pkg.bundlePath, err.Error(), "")
+		return "", &ui.Failure{Reason: "打不开迁移包 " + pkg.bundlePath, Err: err}
 	}
 	st, _ := f.Stat()
 	p := s.StartProgress("校验并解开", st.Size(), "")
@@ -43,16 +43,16 @@ func (r *run) unpack(ctx context.Context, chk *checked, pkg *bundleFiles) (strin
 		}
 		switch {
 		case errors.Is(err, crypto.ErrWrongKey):
-			return "", s.StepFailed(err.Error(), "", "")
+			return "", err
 		case errors.Is(err, crypto.ErrCorrupted), errors.Is(err, bundle.ErrUnsafe):
 			return "", r.badBundle(chk, pkg, err)
 		default:
-			return "", s.StepFailed("解开迁移包失败："+err.Error(), "", "执行 df -h 检查磁盘空间")
+			return "", &ui.Failure{Reason: "解开迁移包失败", Err: err, Hint: "执行 df -h 检查磁盘空间"}
 		}
 	}
 	m, err := bundle.ReadManifest(pkg.dataDir)
 	if err != nil {
-		return "", s.StepFailed(err.Error(), "", "")
+		return "", err
 	}
 	pkg.m = m
 	if err := r.scan(pkg); err != nil {
@@ -60,7 +60,7 @@ func (r *run) unpack(ctx context.Context, chk *checked, pkg *bundleFiles) (strin
 	}
 	if is := r.homeClash(pkg); is != nil {
 		pkg.dropDownload()
-		return "", s.StepFailed(is.Title, "", is.Hint)
+		return "", &ui.Failure{Reason: is.Title, Hint: is.Hint}
 	}
 	return fmt.Sprintf("%s · 校验通过", ui.HumanBytes(st.Size())), nil
 }
@@ -68,15 +68,19 @@ func (r *run) unpack(ctx context.Context, chk *checked, pkg *bundleFiles) (strin
 // badBundle 报告迁移包里的内容有问题（解不开，或者有不合规的内容）。下载的文件重新运行也用不上，删掉。
 // 解密时每一段都经过认证：能解开、只是内容不合规的，就是旧服务器打包的内容；解密发现被改坏的，
 // 迁移计划记了 SHA-256 并且核对过，说明旧服务器上的文件本身就坏了。这些重新下载还是一样，只能
-// 在旧服务器重新迁出。只有旧版本的计划没有记 SHA-256 时，被改坏才可能是下载时出的错，先重新下载。
+// 在旧服务器重新迁出。只有旧版本的计划没有记 SHA-256 时，被改坏才可能是下载时出的错，先重新下载
+// （errRedownload）。
 func (r *run) badBundle(chk *checked, pkg *bundleFiles, err error) error {
 	pkg.dropDownload()
-	hint := "在旧服务器重新运行迁出"
 	if pkg.downloaded && errors.Is(err, crypto.ErrCorrupted) && chk.plan.BundleSHA256 == "" {
-		hint = "已删除下载的文件，重新运行即可重新下载；如果再次出现，请在旧服务器重新运行迁出"
+		return &ui.Failure{Kind: errRedownload, Err: err,
+			Hint: "已删除下载的文件，重新运行即可重新下载；如果再次出现，请在旧服务器重新运行迁出"}
 	}
-	return r.Screen.StepFailed(err.Error(), "", hint)
+	return &ui.Failure{Err: err, Hint: "在旧服务器重新运行迁出"}
 }
+
+// errRedownload 表示迁移包解不开可能是下载时出的错，重新运行会重新下载（见 badBundle）。
+var errRedownload = errors.New("下载的迁移包可能坏了")
 
 // homeClash 按迁移包里实际要写的目录，再确认一遍不会盖住 DockHop 自己的目录（和迁入前检查同一条规则）。
 // 这是新服务器上的设置问题；换了 DOCKHOP_HOME，下载的文件也会放到别处，这里下载的同样用不上。
@@ -189,8 +193,8 @@ func (r *run) checkCompose(ctx context.Context, tool *compose.Tool, pkg *bundleF
 		return nil
 	}
 	if tool == nil {
-		return s.StepFailed("新服务器没有安装 Docker Compose，没法启动 Compose 项目（还没有改动新服务器）", "",
-			"安装 Docker Compose（Docker 官方源的 docker-compose-plugin）后重新运行，迁移包已经下载好，不用重新下载")
+		return &ui.Failure{Reason: "新服务器没有安装 Docker Compose，没法启动 Compose 项目（还没有改动新服务器）",
+			Hint: "安装 Docker Compose（Docker 官方源的 docker-compose-plugin）后重新运行，迁移包已经下载好，不用重新下载"}
 	}
 	for _, p := range sc.projects {
 		s.Note("检查 Compose 项目 " + p.Name + " 的配置文件")
@@ -199,7 +203,8 @@ func (r *run) checkCompose(ctx context.Context, tool *compose.Tool, pkg *bundleF
 			if tool.Legacy() {
 				hint = legacyHint(tool)
 			}
-			return s.StepFailed("新服务器上的 docker compose 读不懂 Compose 项目 "+p.Name+" 的配置文件（还没有改动新服务器）", err.Error(), hint)
+			return &ui.Failure{Reason: "新服务器上的 docker compose 读不懂 Compose 项目 " + p.Name + " 的配置文件（还没有改动新服务器）", Err: err,
+				Hint: hint}
 		}
 	}
 	return nil

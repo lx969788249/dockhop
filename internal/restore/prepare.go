@@ -7,6 +7,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/spec"
+	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 // 改动前的准备（事务里的第一批改动）：临时停下和迁入的数据共用的容器，把要替换的同名服务和
@@ -42,7 +43,7 @@ func (r *migrate) prepare(ctx context.Context) error {
 		r.in("c:" + it.m.Name)
 		c, _, err := dc.InspectContainer(ctx, it.m.Name)
 		if err != nil {
-			return s.StepFailed("读取已有容器 "+it.m.Name+" 失败", err.Error(), "")
+			return &ui.Failure{Reason: "读取已有容器 " + it.m.Name + " 失败", Err: err}
 		}
 		if err := r.stopContainer(ctx, Entry{Op: opStop, Name: c.ShortName(), ID: c.ID, State: stateOf(c)}); err != nil {
 			return err
@@ -56,16 +57,16 @@ func (r *migrate) prepare(ctx context.Context) error {
 		_ = json.Unmarshal(raw, &nets)
 		backup := it.m.Name + ".dockhop-backup-" + runID
 		if err := r.j.add(Entry{Op: opRename, Name: it.m.Name, ID: c.ID, Backup: backup, Networks: nets.NetworkSettings.Networks}); err != nil {
-			return s.StepFailed(err.Error(), "", "")
+			return err
 		}
 		if err := dc.RenameContainer(ctx, c.ID, backup); err != nil {
-			return s.StepFailed("没能先备份已有的容器 "+it.m.Name+"（改名失败）", err.Error(), "")
+			return &ui.Failure{Reason: "没能先备份已有的容器 " + it.m.Name + "（改名失败）", Err: err}
 		}
 		mode := c.HostConfig.NetworkMode
 		if mode != "host" && mode != "none" && !strings.HasPrefix(mode, "container:") {
 			for n := range c.NetworkSettings.Networks {
 				if err := dc.DisconnectNetwork(ctx, n, c.ID); err != nil && !docker.IsNotFound(err) {
-					return s.StepFailed("没能释放已有容器 "+it.m.Name+" 占用的网络地址", err.Error(), "")
+					return &ui.Failure{Reason: "没能释放已有容器 " + it.m.Name + " 占用的网络地址", Err: err}
 				}
 			}
 		}
@@ -82,7 +83,7 @@ func (r *migrate) prepare(ctx context.Context) error {
 	}
 	r.in("")
 	if r.testFail("prepare") {
-		return s.StepFailed("（测试）模拟备份已有服务时失败", "", "")
+		return &ui.Failure{Reason: "（测试）模拟备份已有服务时失败"}
 	}
 	if backedUp > 0 {
 		s.Info("已备份 %d 个同名的容器，迁入失败时会放回原来的", backedUp)
@@ -103,15 +104,15 @@ func stateOf(c *docker.Container) string {
 // stopContainer 记下并停止一个容器（暂停的先恢复再停）。
 func (r *migrate) stopContainer(ctx context.Context, e Entry) error {
 	if err := r.j.add(e); err != nil {
-		return r.Screen.StepFailed(err.Error(), "", "")
+		return err
 	}
 	if e.State == "paused" {
 		if err := r.Docker.UnpauseContainer(ctx, e.ID); err != nil {
-			return r.Screen.StepFailed("容器 "+e.Name+" 没能从暂停中恢复，无法停止", err.Error(), "")
+			return &ui.Failure{Reason: "容器 " + e.Name + " 没能从暂停中恢复，无法停止", Err: err}
 		}
 	}
 	if err := r.Docker.StopContainer(ctx, e.ID, nil); err != nil {
-		return r.Screen.StepFailed("没能停止新服务器上的容器 "+e.Name, err.Error(), "")
+		return &ui.Failure{Reason: "没能停止新服务器上的容器 " + e.Name, Err: err}
 	}
 	return nil
 }
@@ -122,7 +123,7 @@ func (r *migrate) backupProject(ctx context.Context, project string, list []dock
 	for _, c := range list {
 		full, raw, err := dc.InspectForRebuild(ctx, c.ID) // 带上用户指定的 MAC 地址：回滚时原样重建
 		if err != nil {
-			return s.StepFailed("读取已有的 Compose 容器 "+c.Name()+" 失败", err.Error(), "")
+			return &ui.Failure{Reason: "读取已有的 Compose 容器 " + c.Name() + " 失败", Err: err}
 		}
 		o := OldContainer{Name: full.ShortName(), ID: full.ID, State: stateOf(full), Raw: raw, Volumes: map[string]string{}}
 		for _, m := range full.Mounts {
@@ -133,7 +134,7 @@ func (r *migrate) backupProject(ctx context.Context, project string, list []dock
 		old = append(old, o)
 	}
 	if err := r.j.add(Entry{Op: opComposeOld, Name: project, Old: old}); err != nil {
-		return s.StepFailed(err.Error(), "", "")
+		return err
 	}
 	s.Detail("备份新服务器上已有的 Compose 项目：%s", project)
 	images := map[string]string{}
@@ -142,16 +143,16 @@ func (r *migrate) backupProject(ctx context.Context, project string, list []dock
 			_ = dc.UnpauseContainer(ctx, o.ID)
 		}
 		if err := dc.StopContainer(ctx, o.ID, nil); err != nil {
-			return s.StepFailed("没能停止已有的 Compose 容器 "+o.Name, err.Error(), "")
+			return &ui.Failure{Reason: "没能停止已有的 Compose 容器 " + o.Name, Err: err}
 		}
 		// 读不到容器里有没有改动时不能当作没有：接下来要删除这个容器，没备份的改动就找不回来了。
 		changes, err := dc.ContainerChanges(ctx, o.ID)
 		if err != nil {
-			return s.StepFailed("读不到已有的 Compose 容器 "+o.Name+" 里有没有改动，为了安全没有删除它", err.Error(), "")
+			return &ui.Failure{Reason: "读不到已有的 Compose 容器 " + o.Name + " 里有没有改动，为了安全没有删除它", Err: err}
 		}
 		full, _, err := dc.InspectContainer(ctx, o.ID)
 		if err != nil {
-			return s.StepFailed("读取已有的 Compose 容器 "+o.Name+" 失败，为了安全没有删除它", err.Error(), "")
+			return &ui.Failure{Reason: "读取已有的 Compose 容器 " + o.Name + " 失败，为了安全没有删除它", Err: err}
 		}
 		var mounts []string
 		for _, m := range full.Mounts {
@@ -162,17 +163,17 @@ func (r *migrate) backupProject(ctx context.Context, project string, list []dock
 		}
 		tag := strings.ToLower(runID + "-" + o.ID[:12])
 		if _, err := dc.Commit(ctx, o.ID, "dockhop-rollback", tag, false); err != nil {
-			return s.StepFailed("没能备份已有的 Compose 容器 "+o.Name, err.Error(), "")
+			return &ui.Failure{Reason: "没能备份已有的 Compose 容器 " + o.Name, Err: err}
 		}
 		images[o.ID] = "dockhop-rollback:" + tag
 	}
 	if err := r.j.add(Entry{Op: opOldImages, Name: project, Images: images}); err != nil {
-		return s.StepFailed(err.Error(), "", "")
+		return err
 	}
 	for _, o := range old {
 		// 不删匿名卷：回滚重建旧容器时还要用。
 		if err := dc.RemoveContainer(ctx, o.ID, true); err != nil && !docker.IsNotFound(err) {
-			return s.StepFailed("没能移开已有的 Compose 容器 "+o.Name, err.Error(), "")
+			return &ui.Failure{Reason: "没能移开已有的 Compose 容器 " + o.Name, Err: err}
 		}
 	}
 	return nil

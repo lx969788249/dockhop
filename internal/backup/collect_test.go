@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -73,8 +74,8 @@ func TestSharedWritersIncludeUnlisted(t *testing.T) {
 		switch {
 		case want == "停止" && (err != nil || len(col.shared) != 1 || col.shared[0].name() != "writer"):
 			t.Errorf("临时容器应一起停止：%v", err)
-		case want == "取消" && (err == nil || s.Failure() == nil || !strings.Contains(s.Failure().Hint, "docker service scale jobs=0")):
-			t.Errorf("Swarm 服务的容器应取消：%v\n%s", err, out.String())
+		case want == "取消" && (!errors.Is(err, errUnstoppable) || !strings.Contains(ui.HintOf(err), "docker service scale jobs=0")):
+			t.Errorf("Swarm 服务的容器应取消，建议里给出缩到 0 的命令：%v（建议：%s）", err, ui.HintOf(err))
 		}
 	}
 }
@@ -240,8 +241,8 @@ func TestRecheckBeforeStop(t *testing.T) {
 			switch {
 			case c.want == "" && err != nil:
 				t.Errorf("没有相关的变化，应能停机：%v\n%s", err, out.String())
-			case c.want != "" && (err == nil || s.Failure() == nil || !strings.Contains(s.Failure().Reason, c.want)):
-				t.Errorf("应停下并说出 %s：%v\n%s", c.want, err, out.String())
+			case c.want != "" && (!errors.Is(err, errChanged) || !strings.Contains(err.Error(), c.want)):
+				t.Errorf("应停下并说出 %s：%v", c.want, err)
 			}
 		})
 	}

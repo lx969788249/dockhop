@@ -33,26 +33,26 @@ func (r *run) fetchPlan(ctx context.Context) (*bundle.Plan, error) {
 	raw, err := r.client().FetchPlan(ctx)
 	if errors.Is(err, transfer.ErrNoPlan) {
 		// 迁移计划是迁入前检查和核对下载文件的依据，没有它不能迁入。
-		return nil, s.StepFailed("旧服务器没有提供迁移计划，没法做迁入前检查（还没有下载或改动任何东西）", "",
-			"在旧服务器上重新运行迁出")
+		return nil, &ui.Failure{Kind: transfer.ErrNoPlan, Reason: "旧服务器没有提供迁移计划，没法做迁入前检查（还没有下载或改动任何东西）",
+			Hint: "在旧服务器上重新运行迁出"}
 	}
 	if err != nil {
 		var ce *transfer.ConnError
 		if errors.As(err, &ce) {
-			return nil, s.StepFailed(ce.Reason, "", ce.Hint)
+			return nil, &ui.Failure{Kind: ce, Reason: ce.Reason, Hint: ce.Hint}
 		}
-		return nil, s.StepFailed("连接旧服务器失败", err.Error(), "")
+		return nil, &ui.Failure{Reason: "连接旧服务器失败", Err: err}
 	}
 	p, err := bundle.DecryptPlan(bytes.NewReader(raw), r.opts.Link)
 	switch {
 	case errors.Is(err, bundle.ErrPlanOlder):
-		return nil, s.StepFailed("这个迁移链接是旧版本的 DockHop 生成的，要在旧服务器上用最新版本重新迁出（还没有下载或改动任何东西）", "",
-			"在旧服务器上按 Ctrl+C 结束现在的迁出，运行 bash <(curl -fsSL https://dockhop.run) 选迁出，再用新的链接迁入")
+		return nil, &ui.Failure{Kind: err, Reason: "这个迁移链接是旧版本的 DockHop 生成的，要在旧服务器上用最新版本重新迁出（还没有下载或改动任何东西）",
+			Hint: "在旧服务器上按 Ctrl+C 结束现在的迁出，运行 bash <(curl -fsSL https://dockhop.run) 选迁出，再用新的链接迁入"}
 	case errors.Is(err, bundle.ErrPlanNewer):
-		return nil, s.StepFailed("这个迁移链接是更新版本的 DockHop 生成的，要用最新版本迁入（还没有下载或改动任何东西）", "",
-			"运行 bash <(curl -fsSL https://dockhop.run)，选迁入")
+		return nil, &ui.Failure{Kind: err, Reason: "这个迁移链接是更新版本的 DockHop 生成的，要用最新版本迁入（还没有下载或改动任何东西）",
+			Hint: "运行 bash <(curl -fsSL https://dockhop.run)，选迁入"}
 	case err != nil:
-		return nil, s.StepFailed("迁移计划解不开："+err.Error(), "", "确认用的是旧服务器这次显示的完整链接")
+		return nil, &ui.Failure{Reason: "迁移计划解不开", Err: err, Hint: "确认用的是旧服务器这次显示的完整链接"}
 	}
 	return p, nil
 }
@@ -70,15 +70,8 @@ func (r *run) check(ctx context.Context, chk *checked, tool *compose.Tool) (stri
 			return preflight.Collect(ctx, r.Docker, v)
 		}}
 	res, err := runner.Run(chk.plan, &chk.d, preflight.Options{Existing: r.opts.Existing, BaseDir: r.workBase(chk), Home: r.Home, LocalWork: localWork})
-	if ui.Canceled(err) {
-		return "", err
-	}
 	if err != nil {
-		var p *preflight.Problem
-		if errors.As(err, &p) {
-			return "", s.StepFailed(p.Reason, "", p.Hint)
-		}
-		return "", s.StepFailed(err.Error(), "", "")
+		return "", err // 取消，或者检查没通过（*ui.Failure）
 	}
 	b, _ := json.Marshal(chk.d)
 	r.Log.Printf("检查时的选择：%s", b)

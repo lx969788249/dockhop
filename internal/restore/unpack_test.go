@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,9 +72,8 @@ func TestBadBundleDropsDownload(t *testing.T) {
 		r := testRun(t, Deps{Screen: ui.New(&out, false, nil), Home: dir}, Options{Link: link})
 		pkg := &bundleFiles{downloaded: true, bundlePath: path, dataDir: filepath.Join(dir, "data")}
 		_, err := r.unpack(context.Background(), &checked{plan: plan}, pkg)
-		got := r.Screen.Failure()
-		if err == nil || got == nil || !strings.Contains(got.Hint, "在旧服务器重新运行迁出") || strings.Contains(got.Hint, "重新下载") != c.redownload {
-			t.Errorf("%s：%v %+v", c.name, err, got)
+		if err == nil || errors.Is(err, errRedownload) != c.redownload {
+			t.Errorf("%s：%v", c.name, err)
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Errorf("%s：下载的迁移包应删掉", c.name)

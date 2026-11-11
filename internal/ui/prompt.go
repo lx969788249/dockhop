@@ -20,8 +20,13 @@ var ErrNotInteractive = errors.New("没有可以输入的终端")
 // 已经显示过了。
 var ErrCancelled = errors.New("已取消")
 
-// Canceled 表示 err 是用户在回答问题时按了 Ctrl+C（程序被结束）或 Ctrl+D（输入结束）。
+// Canceled 表示 err 是用户在回答问题时按了 Ctrl+C（程序被结束）或 Ctrl+D（输入结束）。步骤没能做下去
+// （*Failure）不算，哪怕出错的原因碰巧是 io.EOF（例如文件读到了头）。
 func Canceled(err error) bool {
+	var f *Failure
+	if errors.As(err, &f) {
+		return false
+	}
 	return errors.Is(err, context.Canceled) || errors.Is(err, io.EOF)
 }
 

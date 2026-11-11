@@ -3,6 +3,7 @@ package restore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -40,8 +41,8 @@ func TestBackupProjectStopsWhenChangesFail(t *testing.T) {
 	r := testMigrate(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, Options{})
 	r.j = j
 	err = r.backupProject(context.Background(), "blog", []docker.ContainerSummary{{ID: "abcdef1234567890", Names: []string{"/blog-app-1"}}})
-	if err == nil || !strings.Contains(out.String(), "为了安全没有删除它") {
-		t.Fatalf("应停下：%v\n%s", err, out.String())
+	if err == nil {
+		t.Fatal("读不到有没有改动时应停下")
 	}
 	for _, c := range calls() {
 		if strings.HasPrefix(c, "DELETE") {
@@ -52,7 +53,7 @@ func TestBackupProjectStopsWhenChangesFail(t *testing.T) {
 
 // 选择保留的已有容器（停着的也算）和要迁入的容器共用目录：不能覆盖它的数据，改动之前停下。
 func TestPrepareProtectsKeptData(t *testing.T) {
-	failed, stopped := prepareWith(t, preflight.Decisions{SkipContainers: []string{"kept"}}, func(w http.ResponseWriter, p, shared string) bool {
+	stopped, err := prepareWith(t, preflight.Decisions{SkipContainers: []string{"kept"}}, func(w http.ResponseWriter, p, shared string) bool {
 		switch p {
 		case "/containers/json":
 			io.WriteString(w, `[{"Id":"kept-id","Names":["/kept"],"State":"exited"}]`)
@@ -63,8 +64,8 @@ func TestPrepareProtectsKeptData(t *testing.T) {
 		}
 		return true
 	})
-	if !strings.Contains(failed, "保留的已有容器 kept") || len(stopped) > 0 {
-		t.Fatalf("应在改动之前停下：%q，停过 %v", failed, stopped)
+	if !errors.Is(err, errKeptShares) || !strings.Contains(err.Error(), "kept") || len(stopped) > 0 {
+		t.Fatalf("应在改动之前停下：%v，停过 %v", err, stopped)
 	}
 }
 
@@ -72,7 +73,7 @@ func TestPrepareProtectsKeptData(t *testing.T) {
 // Docker 明确说容器不存在（刚好被删掉）时照常继续。
 func TestPrepareUnreadableContainer(t *testing.T) {
 	for _, code := range []int{500, 404} {
-		failed, _ := prepareWith(t, preflight.Decisions{}, func(w http.ResponseWriter, p, _ string) bool {
+		_, err := prepareWith(t, preflight.Decisions{}, func(w http.ResponseWriter, p, _ string) bool {
 			switch p {
 			case "/containers/json":
 				io.WriteString(w, `[{"Id":"other-id","Names":["/other"],"State":"running"}]`)
@@ -83,8 +84,9 @@ func TestPrepareUnreadableContainer(t *testing.T) {
 			}
 			return true
 		})
-		if strings.Contains(failed, "没法确认它有没有在用") != (code == 500) || code == 404 && failed != "" {
-			t.Errorf("Docker 回答 %d 时：%q", code, failed)
+		var de *docker.Error
+		if (err != nil) != (code == 500) || err != nil && (!errors.As(err, &de) || de.Status != 500) {
+			t.Errorf("Docker 回答 %d 时：%v", code, err)
 		}
 	}
 }
@@ -132,7 +134,7 @@ func TestBackupProjectKeepsFixedMAC(t *testing.T) {
 // 被借用的一停，它们就断了，重新启动后也不会自己接回去（迁出时一样）。先停借用的、再停被借用的，恢复时
 // 倒过来；不相干的不停。
 func TestPrepareStopsBorrowersFirst(t *testing.T) {
-	failed, stopped := prepareWith(t, preflight.Decisions{}, func(w http.ResponseWriter, p, shared string) bool {
+	stopped, err := prepareWith(t, preflight.Decisions{}, func(w http.ResponseWriter, p, shared string) bool {
 		switch p {
 		case "/containers/json":
 			io.WriteString(w, `[{"Id":"db-id","Names":["/db"],"State":"running"},{"Id":"vpn-id","Names":["/vpn"],"State":"running"},`+
@@ -149,8 +151,8 @@ func TestPrepareStopsBorrowersFirst(t *testing.T) {
 		}
 		return true
 	})
-	if failed != "" {
-		t.Fatal(failed)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if got := strings.Join(stopped, " "); got != "/containers/vpn-id/stop /containers/db-id/stop" {
 		t.Errorf("停下的：%s，应先停借用网络的 vpn、再停共用数据的 db，不相干的 lone 不停", got)

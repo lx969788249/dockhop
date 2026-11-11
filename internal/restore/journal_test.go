@@ -178,8 +178,8 @@ func TestJournalUnknownOp(t *testing.T) {
 	s := ui.New(&out, false, nil)
 	r := testRun(t, Deps{Screen: s}, Options{})
 	r.rbDir = dir
-	if err := r.recoverInterrupted(context.Background()); err == nil || s.Failure() == nil || !strings.Contains(s.Failure().Hint, "最新版本") {
-		t.Errorf("应提示用最新版本运行：%v %+v", err, s.Failure())
+	if err := r.recoverInterrupted(context.Background()); !errors.Is(err, ErrJournalNewer) {
+		t.Errorf("应提示用最新版本运行：%v", err)
 	}
 }
 

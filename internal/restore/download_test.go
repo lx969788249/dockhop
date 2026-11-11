@@ -2,6 +2,7 @@ package restore
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,8 +27,8 @@ func TestVerifyDownload(t *testing.T) {
 	if err := r.verifyDownload(path, "", "镜像文件"); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.verifyDownload(path, strings.Repeat("0", 64), "镜像文件"); err == nil || !strings.Contains(out.String(), "对不上") {
-		t.Fatalf("对不上时应失败：%v\n%s", err, out.String())
+	if err := r.verifyDownload(path, strings.Repeat("0", 64), "镜像文件"); !errors.Is(err, errMismatch) {
+		t.Fatalf("对不上时应失败：%v", err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Error("对不上的文件应删掉")
@@ -58,8 +59,8 @@ func TestCheckSums(t *testing.T) {
 			}
 			var out bytes.Buffer
 			r := testRun(t, Deps{Screen: ui.New(&out, false, nil)}, Options{})
-			if err := r.checkSums(&checked{plan: plan, images: c.images}); (err == nil) != c.ok || !c.ok && !strings.Contains(out.String(), "1.1.6 之前的版本") {
-				t.Fatalf("结果：%v\n%s", err, out.String())
+			if err := r.checkSums(&checked{plan: plan, images: c.images}); (err == nil) != c.ok || !c.ok && !errors.Is(err, errNoChecksums) {
+				t.Fatalf("结果：%v", err)
 			}
 		})
 	}

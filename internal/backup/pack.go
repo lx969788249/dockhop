@@ -28,17 +28,17 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 	s.Begin(4, totalSteps, "停机打包数据")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
-		return nil, 0, "", s.StepFailed("无法创建迁移包", err.Error(), "")
+		return nil, 0, "", &ui.Failure{Reason: "无法创建迁移包", Err: err}
 	}
 	defer f.Close()
 	sum := sha256.New()
 	w, err := bundle.NewWriter(io.MultiWriter(f, sum), link)
 	if err != nil {
-		return nil, 0, "", s.StepFailed("无法创建迁移包", err.Error(), "")
+		return nil, 0, "", &ui.Failure{Reason: "无法创建迁移包", Err: err}
 	}
 	m := r.newManifest(ctx)
 	if err := addConfigs(w, m, col); err != nil {
-		return nil, 0, "", s.StepFailed("写入迁移包失败", err.Error(), "")
+		return nil, 0, "", &ui.Failure{Reason: "写入迁移包失败", Err: err}
 	}
 	if err := r.packData(ctx, w, m, col); err != nil {
 		return nil, 0, "", err
@@ -49,17 +49,17 @@ func (r *run) pack(ctx context.Context, col *collected, link crypto.Link, path s
 		return nil, 0, "", err
 	}
 	if err := w.AddJSON("manifest.json", m); err != nil {
-		return nil, 0, "", s.StepFailed("写入迁移包失败", err.Error(), "")
+		return nil, 0, "", &ui.Failure{Reason: "写入迁移包失败", Err: err}
 	}
 	if err := w.Close(); err != nil {
-		return nil, 0, "", s.StepFailed("写入迁移包失败", err.Error(), "执行 df -h 检查磁盘空间")
+		return nil, 0, "", &ui.Failure{Reason: "写入迁移包失败", Err: err, Hint: "执行 df -h 检查磁盘空间"}
 	}
 	if err := f.Close(); err != nil {
-		return nil, 0, "", s.StepFailed("写入迁移包失败", err.Error(), "执行 df -h 检查磁盘空间")
+		return nil, 0, "", &ui.Failure{Reason: "写入迁移包失败", Err: err, Hint: "执行 df -h 检查磁盘空间"}
 	}
 	st, err := os.Stat(path)
 	if err != nil {
-		return nil, 0, "", s.StepFailed("写入迁移包失败", err.Error(), "")
+		return nil, 0, "", &ui.Failure{Reason: "写入迁移包失败", Err: err}
 	}
 	r.summary = append(r.summary, fmt.Sprintf("迁移的服务：%s · 迁移包 %s", r.chosen, ui.HumanBytes(st.Size()+imageFileBytes(m.ImageFiles))))
 	return m, st.Size(), hex.EncodeToString(sum.Sum(nil)), nil
@@ -154,11 +154,11 @@ func (r *run) stopSources(ctx context.Context, col *collected) error {
 		return nil
 	}
 	if err := writeStopped(r.Home, stopList); err != nil {
-		return s.StepFailed("无法写入停机记录，为了安全没有停止任何容器", err.Error(), "检查 "+r.Home+" 是否可写")
+		return &ui.Failure{Reason: "无法写入停机记录，为了安全没有停止任何容器", Err: err, Hint: "检查 " + r.Home + " 是否可写"}
 	}
 	r.stopped, r.toRestore = stopList, len(stopList)
 	if err := stopContainers(ctx, r.Docker, waves, s); err != nil {
-		return s.StepFailed(err.Error(), "执行 docker ps 检查容器状态", "")
+		return &ui.Failure{Reason: err.Error() + "：执行 docker ps 检查容器状态"}
 	}
 	r.testPause(ctx, "after-stop")
 	return nil
@@ -173,8 +173,8 @@ func (r *run) resumeSources(ctx context.Context, downStart time.Time) error {
 	var failed []string
 	r.Screen.Finish(ctx, func(ctx context.Context) { failed = restoreStates(ctx, r.Docker, r.stopped, r.Screen) })
 	if len(failed) > 0 {
-		return r.Screen.StepFailed(fmt.Sprintf("有 %d 个源容器没能恢复原来的状态：%s", len(failed), strings.Join(failed, "、")),
-			"立即执行 docker ps -a 检查，并用 docker start 容器名 手动启动", "")
+		return &ui.Failure{Reason: fmt.Sprintf("有 %d 个源容器没能恢复原来的状态：%s", len(failed), strings.Join(failed, "、")) +
+			"：立即执行 docker ps -a 检查，并用 docker start 容器名 手动启动"}
 	}
 	r.restored = len(r.stopped)
 	r.stopped = nil
@@ -191,7 +191,7 @@ func (r *run) packContainers(ctx context.Context, w *bundle.Writer, m *bundle.Ma
 		s.Count("检查容器里的改动", i+1, len(col.sel.items), it.name())
 		moved, keep, deleted, err := layerState(ctx, dc, it)
 		if err != nil {
-			return 0, s.StepFailed("检查容器 "+it.name()+" 的改动失败", err.Error(), "")
+			return 0, &ui.Failure{Reason: "检查容器 " + it.name() + " 的改动失败", Err: err}
 		}
 		mc := bundle.Container{Name: it.name(), ID: it.c.ID, Image: it.c.Config.Image, ImageID: it.c.Image,
 			Project: projectOf(col, it), Service: it.c.Config.Labels[labelService],
@@ -199,7 +199,7 @@ func (r *run) packContainers(ctx context.Context, w *bundle.Writer, m *bundle.Ma
 		if moved != "" {
 			tag := strings.ToLower(it.c.ID[:12])
 			if err := dc.TagImage(ctx, it.c.Image, "dockhop-image", tag); err != nil {
-				return 0, s.StepFailed("容器 "+it.name()+" 的镜像没法导出", err.Error(), "")
+				return 0, &ui.Failure{Reason: "容器 " + it.name() + " 的镜像没法导出", Err: err}
 			}
 			r.tempTags = append(r.tempTags, "dockhop-image:"+tag)
 			mc.OldImage = "dockhop-image:" + tag
@@ -211,7 +211,7 @@ func (r *run) packContainers(ctx context.Context, w *bundle.Writer, m *bundle.Ma
 			parts, n, err := r.addStream(w, "changes/"+it.name(), "容器 "+it.name()+" 里的改动", rc, col.layerBytes[it])
 			rc.Close()
 			if err != nil {
-				return 0, s.StepFailed("打包容器 "+it.name()+" 里的改动失败", err.Error(), "")
+				return 0, &ui.Failure{Reason: "打包容器 " + it.name() + " 里的改动失败", Err: err}
 			}
 			packed += n
 			mc.Changes = &bundle.Changes{Paths: keep, Deleted: deleted, Bytes: n, Parts: parts}
@@ -227,12 +227,12 @@ func (r *run) packVolumes(ctx context.Context, w *bundle.Writer, m *bundle.Manif
 	for i, v := range col.volumes {
 		rc, err := openVolume(ctx, r.Docker, v, fmt.Sprintf("dockhop-helper-%s-%d", r.rid, i+1), lockPath(r.Home))
 		if err != nil {
-			return 0, r.Screen.StepFailed(err.Error(), "", "")
+			return 0, &ui.Failure{Err: err}
 		}
 		parts, n, err := r.addStream(w, "volumes/"+v.name, "卷 "+displayVolume(v), rc, max(v.bytes, 0))
 		rc.Close()
 		if err != nil {
-			return 0, r.Screen.StepFailed("打包数据卷 "+displayVolume(v)+" 失败", err.Error(), "")
+			return 0, &ui.Failure{Reason: "打包数据卷 " + displayVolume(v) + " 失败", Err: err}
 		}
 		packed += n
 		m.Volumes = append(m.Volumes, bundle.Volume{Name: v.name, Driver: v.driver, Anonymous: v.anonymous, Bytes: n, Parts: parts})
@@ -251,7 +251,7 @@ func (r *run) packHost(ctx context.Context, w *bundle.Writer, m *bundle.Manifest
 		n, size, err := r.addStream(w, root.stream, root.label, rc, root.bytes)
 		rc.Close()
 		if err != nil {
-			return 0, r.Screen.StepFailed(root.fail, err.Error(), "")
+			return 0, &ui.Failure{Reason: root.fail, Err: err}
 		}
 		parts[root.stream] = n
 		packed += size
@@ -284,7 +284,7 @@ func (r *run) packImages(ctx context.Context, link crypto.Link, m *bundle.Manife
 	m.Images.Refs = refSet
 	files, n, err := r.exportImages(ctx, link, refSet, col.imageBytes)
 	if err != nil {
-		return r.Screen.StepFailed("导出镜像失败", err.Error(), "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
+		return &ui.Failure{Reason: "导出镜像失败", Err: err, Hint: "执行 df -h 检查磁盘空间，并确认 Docker 运行正常"}
 	}
 	m.Images.Bytes, m.ImageFiles = n, files
 	r.removeTempTags()

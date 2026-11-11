@@ -265,7 +265,7 @@ func (r *migrate) confirmReady(ctx context.Context) error {
 				}
 			}
 			if fail != nil {
-				r.groupFailed(g, fail.Error(), groupHint(fail))
+				r.groupFailed(g, fail)
 			}
 		}
 	}
@@ -314,7 +314,7 @@ func phaseOf(c *docker.Container) phase {
 func (r *run) notReady(ctx context.Context, it *citem, reason, hint string) error {
 	logs := r.Redactor.Redact(r.Docker.ContainerLogs(ctx, it.newID, 100))
 	if logs == "" {
-		return &startError{reason, hint}
+		return &ui.Failure{Reason: reason, Hint: hint}
 	}
 	r.Log.Printf("容器 %s 最后的输出：\n%s", it.m.Name, logs)
 	if l := keyLine(logs); l != "" {
@@ -323,7 +323,7 @@ func (r *run) notReady(ctx context.Context, it *citem, reason, hint string) erro
 	if hint == "" {
 		hint = unresolvedHint(it.m.Name, logs)
 	}
-	return &startError{reason, hint}
+	return &ui.Failure{Reason: reason, Hint: hint}
 }
 
 // exitedHint 是原来在运行的容器迁过来之后自己退出了时的建议：退出码是 0 的，多半是做完就退出的一次性任务。

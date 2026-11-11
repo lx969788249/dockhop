@@ -398,25 +398,70 @@ func TestBanner(t *testing.T) {
 	}
 }
 
-// 按了 Ctrl+C 之后，被打断的那一步失败只写日志：不显示、不算失败原因。没按时和 Error 一样。
-func TestStepFailedWhenInterrupted(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+// 步骤没能做下去时，逻辑返回 *Failure（不自己显示），步骤那一层用 StepFailed 显示：原因后面接着出错的细节，
+// 建议写进结果摘要，只记第一条。取消和已经显示过的不显示；按了 Ctrl+C 之后，被打断的那一步失败只写日志，
+// 不显示、不算失败原因。
+func TestStepFailed(t *testing.T) {
 	var out bytes.Buffer
-	s := New(&out, false, nil).WithContext(ctx)
-	err := s.StepFailed("读取 Docker 信息失败", "permission denied", "")
-	if !errors.Is(err, ErrReported) || s.Failure() == nil || !strings.Contains(out.String(), "✗ 读取 Docker 信息失败：permission denied") {
-		t.Fatalf("没打断时应显示失败：%v %q", err, out.String())
+	s := New(&out, false, nil)
+	s.StepFailed(&Failure{Reason: "数据卷 mysql_data 写入失败", Err: errors.New("磁盘空间不足"), Hint: "执行 df -h 查看剩余空间"})
+	s.StepFailed(errors.New("第二条不进结果摘要"))
+	if out.String() != "✗ 数据卷 mysql_data 写入失败：磁盘空间不足\n✗ 第二条不进结果摘要\n" {
+		t.Errorf("显示：%q", out.String())
 	}
+	if f := s.Failure(); f == nil || f.Reason != "数据卷 mysql_data 写入失败：磁盘空间不足" || f.Hint != "执行 df -h 查看剩余空间" {
+		t.Errorf("结果摘要里的原因和建议：%+v", f)
+	}
+	// 外层只说明这是步骤没能做下去（把别的错误包成 *Failure），建议用它包着的那个的。
+	out.Reset()
+	s = New(&out, false, nil)
+	s.StepFailed(&Failure{Err: &Failure{Reason: "Compose 项目 blog 的配置和运行中的容器不一致", Hint: "处理好之后重新运行"}})
+	if f := s.Failure(); out.String() != "✗ Compose 项目 blog 的配置和运行中的容器不一致\n" || f == nil || f.Hint != "处理好之后重新运行" {
+		t.Errorf("包着的失败：%q %+v", out.String(), f)
+	}
+	for _, err := range []error{nil, context.Canceled, io.EOF, ErrReported, fmt.Errorf("只迁入了一部分：%w", ErrReported)} {
+		out.Reset()
+		quiet := New(&out, false, nil)
+		quiet.StepFailed(err)
+		if out.Len() != 0 || quiet.Failure() != nil {
+			t.Errorf("%v 不应显示：%q", err, out.String())
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 	out.Reset()
 	s = New(&out, false, nil).WithContext(ctx)
-	cancel()
-	err = s.StepFailed("读取 Docker 信息失败", "context canceled", "")
-	if !errors.Is(err, ErrReported) || s.Failure() != nil || out.Len() != 0 {
-		t.Fatalf("被打断时不应显示失败：%v %q", err, out.String())
+	s.StepFailed(&Failure{Reason: "读取 Docker 信息失败", Err: context.Canceled})
+	if s.Failure() != nil || out.Len() != 0 {
+		t.Errorf("被打断时不应显示失败：%q", out.String())
 	}
 	var none *Screen
-	if err := none.StepFailed("x", "", ""); !errors.Is(err, ErrReported) {
-		t.Fatalf("没有屏幕时也应返回 ErrReported：%v", err)
+	none.StepFailed(errors.New("没有屏幕时什么都不做"))
+}
+
+// Failure 是逻辑返回的错误：显示的是原因，细节不一样时接在后面；errors.Is 认得出它的类别和出错的原因。
+// 它不是取消：出错的原因碰巧是 io.EOF（文件读到头）也不算用户按了 Ctrl+D。
+func TestFailureIsError(t *testing.T) {
+	kind, cause := errors.New("类别"), errors.New("permission denied")
+	for _, c := range []struct {
+		f    *Failure
+		want string
+	}{
+		{&Failure{Reason: "读取 Docker 信息失败"}, "读取 Docker 信息失败"},
+		{&Failure{Reason: "读取 Docker 信息失败", Err: cause}, "读取 Docker 信息失败：permission denied"},
+		{&Failure{Reason: "permission denied", Err: cause}, "permission denied"},
+		{&Failure{Err: cause, Hint: "用 sudo 运行"}, "permission denied"},
+	} {
+		if got := c.f.Error(); got != c.want {
+			t.Errorf("%+v：%q，应为 %q", c.f, got, c.want)
+		}
+	}
+	var err error = &Failure{Kind: kind, Reason: "读取 Docker 信息失败", Err: cause}
+	if !errors.Is(err, kind) || !errors.Is(err, cause) || errors.Is(err, ErrReported) {
+		t.Errorf("类别和原因要认得出：%v", err)
+	}
+	if Canceled(&Failure{Reason: "迁移包不完整", Err: io.EOF}) || !Canceled(fmt.Errorf("回答问题时：%w", io.EOF)) {
+		t.Error("失败不是取消")
 	}
 }
 

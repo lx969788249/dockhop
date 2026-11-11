@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 // 只保留一部分服务：有的组没能启动、其他的已经正常运行时，问用户怎么处理（decidePartial）；选了只保留
@@ -86,19 +88,19 @@ func (r *migrate) commitPartial(ctx context.Context, ok, failed []*group) error 
 			continue
 		}
 		if err := restoreState(ctx, r.Docker, e.ID, e.State); err != nil {
-			return s.StepFailed("新服务已验证，但临时停下的容器 "+e.Name+" 没能恢复", err.Error(), "")
+			return &ui.Failure{Reason: "新服务已验证，但临时停下的容器 " + e.Name + " 没能恢复", Err: err}
 		}
 	}
 	entries, err := readJournal(r.rbDir)
 	if err != nil {
-		return s.StepFailed("事务日志读不了", err.Error(), "")
+		return &ui.Failure{Reason: "事务日志读不了", Err: err}
 	}
 	var kept []string
 	for _, g := range ok {
 		kept = append(kept, g.id)
 	}
 	if err := r.j.add(Entry{Op: opPartialCommit, Names: kept}); err != nil {
-		return s.StepFailed(err.Error(), "", "")
+		return err
 	}
 	r.j.close()
 	r.out.committed, r.out.partial = true, true
@@ -163,8 +165,9 @@ func splitPartial(entries []Entry, kept []string) (drop, keep []Entry) {
 	return drop, keep
 }
 
-// errPartial 表示只迁入了一部分（用户选择保留已经正常运行的服务）。
-var errPartial = fmt.Errorf("只迁入了一部分")
+// errPartial 表示只迁入了一部分（用户选择保留已经正常运行的服务）。结果已经显示过了：这一步结束时写了保留、
+// 删除了哪些。
+var errPartial = fmt.Errorf("只迁入了一部分：%w", ui.ErrReported)
 
 // resumePartial 接着做完上次只提交了一部分的迁入（见 finishPartial）：用户已经选了只保留正常运行的服务，
 // 删除没启动的服务时程序被结束了，接着做完，不再问。
@@ -180,7 +183,7 @@ func (r *run) resumePartial(ctx context.Context, entries []Entry, kept []string)
 		s.Warn("上次迁入保留下来的服务有些回滚资料没能删除：%s", strings.Join(left, "；"))
 	}
 	if len(issues) > 0 {
-		return s.StepFailed("上次迁入时没启动的服务没能全部删除", "", "")
+		return &ui.Failure{Reason: "上次迁入时没启动的服务没能全部删除"}
 	}
 	s.Info("已删除上次迁入时没启动的服务")
 	return nil

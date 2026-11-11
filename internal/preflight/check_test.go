@@ -447,7 +447,7 @@ func TestRunnerAuto(t *testing.T) {
 	// 不能提问、也没有 --yes：列出问题后停下。
 	r = &Runner{Screen: ui.New(&out, false, nil), Prompt: ui.NewPrompter(nil, &out), Collect: func() (*Target, error) { return tg, nil }}
 	_, err := r.Run(testPlan(), &Decisions{}, Options{})
-	if p, ok := err.(*Problem); !ok || !strings.Contains(p.Hint, "--yes") {
+	if f, ok := err.(*ui.Failure); !ok || !strings.Contains(f.Hint, "--yes") {
 		t.Errorf("应提示 --yes：%v", err)
 	}
 }

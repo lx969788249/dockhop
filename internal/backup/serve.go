@@ -41,7 +41,7 @@ func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bund
 	srv, err := transfer.NewServer(ln, link, bundlePath, planPath, notify, r.Log.Printf)
 	if err != nil {
 		ln.Close()
-		return s.StepFailed("启动下载服务失败", err.Error(), "")
+		return &ui.Failure{Reason: "启动下载服务失败", Err: err}
 	}
 	files := map[string]string{}
 	for _, f := range images {
@@ -101,7 +101,7 @@ func (r *run) serve(ctx context.Context, ln net.Listener, link crypto.Link, bund
 			live.wait("等待新服务器重新迁入")
 		case err := <-serveErr:
 			if err != nil {
-				return s.StepFailed("下载服务意外停止", err.Error(), "重新运行迁出")
+				return &ui.Failure{Reason: "下载服务意外停止", Err: err, Hint: "重新运行迁出"}
 			}
 			return nil
 		}

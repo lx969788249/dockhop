@@ -128,7 +128,7 @@ func (r *run) fetch(ctx context.Context, label string, parts []fetchPart) error 
 	for _, part := range parts {
 		if err := os.MkdirAll(filepath.Dir(part.path), 0o700); err != nil {
 			p.Done(err)
-			return s.StepFailed("无法创建下载目录", err.Error(), "")
+			return &ui.Failure{Reason: "无法创建下载目录", Err: err}
 		}
 		err := r.client().Download(ctx, transfer.Part{URL: part.url, Size: part.size, Before: before, Total: total}, part.path,
 			func(done, all int64) {
@@ -141,12 +141,12 @@ func (r *run) fetch(ctx context.Context, label string, parts []fetchPart) error 
 			p.Done(err)
 			var ce *transfer.ConnError
 			if errors.As(err, &ce) {
-				return s.StepFailed(ce.Reason, "", ce.Hint)
+				return &ui.Failure{Reason: ce.Reason, Hint: ce.Hint}
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			return s.StepFailed(label+"失败："+err.Error(), "", "检查两台服务器之间的网络后重新运行，会从断点继续")
+			return &ui.Failure{Reason: label + "失败", Err: err, Hint: "检查两台服务器之间的网络后重新运行，会从断点继续"}
 		}
 		if st, err := os.Stat(part.path); err == nil {
 			before += st.Size()
@@ -253,12 +253,12 @@ func (r *migrate) loadImageFile(ctx context.Context, label string, f bundle.Imag
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return s.StepFailed("打不开下载的镜像文件 "+path, err.Error(), "")
+		return &ui.Failure{Reason: "打不开下载的镜像文件 " + path, Err: err}
 	}
 	defer file.Close()
 	rc, err := bundle.OpenImageFile(file, r.opts.Link)
 	if err != nil {
-		return s.StepFailed("镜像文件解不开："+err.Error(), "", "在旧服务器重新运行迁出")
+		return &ui.Failure{Reason: "镜像文件解不开", Err: err, Hint: "在旧服务器重新运行迁出"}
 	}
 	p := s.StartProgress(label, f.Size, "镜像较大时需要几分钟")
 	err = r.Docker.LoadImages(ctx, io.TeeReader(rc, p))
@@ -267,9 +267,9 @@ func (r *migrate) loadImageFile(ctx context.Context, label string, f bundle.Imag
 	if err != nil {
 		if errors.Is(err, crypto.ErrCorrupted) {
 			_ = os.Remove(path)
-			return s.StepFailed("下载的镜像文件不完整或被改动过，已删除", "", "重新运行迁入，会重新下载")
+			return &ui.Failure{Reason: "下载的镜像文件不完整或被改动过，已删除", Hint: "重新运行迁入，会重新下载"}
 		}
-		return s.StepFailed("加载镜像失败："+err.Error(), "", "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
+		return &ui.Failure{Reason: "加载镜像失败", Err: err, Hint: "执行 df -h 检查磁盘空间，并确认 Docker 运行正常"}
 	}
 	_ = os.Remove(path) // 用完就删，省磁盘
 	return nil
@@ -318,10 +318,10 @@ func (r *migrate) noteTag(ctx context.Context, name string) error {
 	case err == nil:
 		id = img.ID
 	case !docker.IsNotFound(err):
-		return r.Screen.StepFailed("读不到新服务器上的镜像 "+name, err.Error(), "确认 Docker 运行正常后重新运行")
+		return &ui.Failure{Reason: "读不到新服务器上的镜像 " + name, Err: err, Hint: "确认 Docker 运行正常后重新运行"}
 	}
 	if err := r.j.add(Entry{Op: opTag, Name: name, ID: id}); err != nil {
-		return r.Screen.StepFailed(err.Error(), "", "")
+		return err
 	}
 	r.noted[fullTag(name)] = true
 	return nil
@@ -336,7 +336,7 @@ func (r *run) tagRefs(ctx context.Context, id string, f bundle.ImageFile) error 
 		}
 		repo, tag := splitTag(ref)
 		if err := r.Docker.TagImage(ctx, id, repo, tag); err != nil {
-			return r.Screen.StepFailed("给镜像 "+ref+" 加名字失败", err.Error(), "")
+			return &ui.Failure{Reason: "给镜像 " + ref + " 加名字失败", Err: err}
 		}
 	}
 	return nil
@@ -347,14 +347,14 @@ func (r *migrate) loadImages(ctx context.Context) error {
 	// 先记下这台服务器上已有哪些镜像：回滚时只删这次迁入带来的，原有的一个不删（见 removeImages）。
 	have, err := r.Docker.Images(ctx)
 	if err != nil {
-		return s.StepFailed("读取镜像列表失败", err.Error(), "确认 Docker 运行正常后重新运行")
+		return &ui.Failure{Reason: "读取镜像列表失败", Err: err, Hint: "确认 Docker 运行正常后重新运行"}
 	}
 	ids := make([]string, 0, len(have))
 	for _, img := range have {
 		ids = append(ids, img.ID)
 	}
 	if err := r.j.add(Entry{Op: opImages, Names: ids}); err != nil {
-		return s.StepFailed(err.Error(), "", "")
+		return err
 	}
 	defer r.in("")
 	if r.pkg.m.Images.Parts > 0 {
@@ -376,7 +376,7 @@ func (r *migrate) loadImages(ctx context.Context) error {
 		rc.Close()
 		p.Done(err)
 		if err != nil {
-			return s.StepFailed("加载镜像失败："+err.Error(), "", "执行 df -h 检查磁盘空间，并确认 Docker 运行正常")
+			return &ui.Failure{Reason: "加载镜像失败", Err: err, Hint: "执行 df -h 检查磁盘空间，并确认 Docker 运行正常"}
 		}
 		_ = os.RemoveAll(filepath.Join(r.pkg.dataDir, "images")) // 用完就删，省磁盘
 	} else if err := r.loadImageFiles(ctx); err != nil {
@@ -402,7 +402,7 @@ func (r *migrate) resolveImage(ctx context.Context, ref string) error {
 	s := r.Screen
 	if !strings.Contains(ref, "@sha256:") {
 		if _, err := r.Docker.InspectImage(ctx, ref); err != nil {
-			return s.StepFailed("镜像 "+ref+" 没有加载成功", err.Error(), "")
+			return &ui.Failure{Reason: "镜像 " + ref + " 没有加载成功", Err: err}
 		}
 		return nil
 	}
@@ -431,7 +431,7 @@ func (r *migrate) resolveImage(ctx context.Context, ref string) error {
 		}
 	}
 	if id == "" {
-		return s.StepFailed("镜像 "+ref+" 没有加载成功", "", "")
+		return &ui.Failure{Reason: "镜像 " + ref + " 没有加载成功"}
 	}
 	// 用 ref 的容器会改用名字 as 创建，名字跟着它们走。
 	as := preflight.StripDigest(ref)
@@ -441,7 +441,7 @@ func (r *migrate) resolveImage(ctx context.Context, ref string) error {
 	}
 	repo, tag := splitTag(as)
 	if err := r.Docker.TagImage(ctx, id, repo, tag); err != nil {
-		return s.StepFailed("给镜像 "+ref+" 加名字失败", err.Error(), "")
+		return &ui.Failure{Reason: "给镜像 " + ref + " 加名字失败", Err: err}
 	}
 	r.imageAs[ref] = as
 	return nil

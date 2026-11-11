@@ -3,6 +3,7 @@ package restore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,7 +43,7 @@ func TestDecideRefusesUnstoppableWriters(t *testing.T) {
 		{"Swarm", `"HostConfig":{},"Config":{"Labels":{"com.docker.swarm.service.id":"x","com.docker.swarm.service.name":"web"}}`,
 			"属于 Swarm 服务 web"},
 	} {
-		failed, stopped := prepareWith(t, preflight.Decisions{}, func(w http.ResponseWriter, p, shared string) bool {
+		stopped, err := prepareWith(t, preflight.Decisions{}, func(w http.ResponseWriter, p, shared string) bool {
 			switch p {
 			case "/containers/json":
 				io.WriteString(w, `[{"Id":"other-id","Names":["/other"],"State":"running"}]`)
@@ -54,8 +55,8 @@ func TestDecideRefusesUnstoppableWriters(t *testing.T) {
 			}
 			return true
 		})
-		if !strings.Contains(failed, c.want) || !strings.Contains(failed, "还没有改动任何东西") || len(stopped) > 0 {
-			t.Errorf("%s：应在改动之前停下：%q，停过 %v", c.name, failed, stopped)
+		if !errors.Is(err, errUnstoppable) || len(stopped) > 0 {
+			t.Errorf("%s：应在改动之前停下：%v，停过 %v", c.name, err, stopped)
 		}
 	}
 }
@@ -65,7 +66,7 @@ func TestDecideRefusesUnstoppableWriters(t *testing.T) {
 // 发现，停下。
 func TestRecheckBeforePrepare(t *testing.T) {
 	lists := 0
-	failed, stopped := prepareWith(t, preflight.Decisions{}, func(w http.ResponseWriter, p, shared string) bool {
+	stopped, err := prepareWith(t, preflight.Decisions{}, func(w http.ResponseWriter, p, shared string) bool {
 		switch p {
 		case "/containers/json":
 			if lists++; lists == 1 {
@@ -80,8 +81,8 @@ func TestRecheckBeforePrepare(t *testing.T) {
 		}
 		return true
 	})
-	if !strings.Contains(failed, "late 在检查之后有了变化") || len(stopped) > 0 {
-		t.Fatalf("应在动已有的服务之前停下（停过 %v）：\n%s", stopped, failed)
+	if !errors.Is(err, errChanged) || !strings.Contains(err.Error(), "late") || len(stopped) > 0 {
+		t.Fatalf("应在动已有的服务之前停下，说出 late（停过 %v）：%v", stopped, err)
 	}
 }
 
@@ -180,34 +181,35 @@ func TestReplaceNamedFollowsProject(t *testing.T) {
 	bundled := [][2]string{{"nginx", "site"}, {"site-app-1", "site"}, {"other", ""}}
 	for _, owner := range []string{"", "proxy"} {
 		for _, c := range []struct {
-			name, policy      string
-			d                 preflight.Decisions
-			touched           []string
-			items, ops, fails string
+			name, policy string
+			d            preflight.Decisions
+			touched      []string
+			items, ops   string
+			fails        error
 		}{
 			{name: "替换", touched: []string{"POST /containers/target-nginx/stop", "POST /containers/target-nginx/rename"},
 				items: "nginx,site-app-1,other", ops: "start,stop,rename"},
 			{name: "保留", d: preflight.Decisions{SkipProjects: []string{"site"}}, items: "other", ops: "start"},
 			{name: "--existing skip", policy: "skip", items: "other", ops: "start"},
-			{name: "--existing fail", policy: "fail", fails: "--existing fail 不允许替换"},
+			{name: "--existing fail", policy: "fail", fails: errExistingFail},
 		} {
 			t.Run(fmt.Sprintf("所属项目%q/%s", owner, c.name), func(t *testing.T) {
-				r, failed, touched, ops := decideAndPrepare(t, bundled, [][2]string{{"nginx", owner}}, c.d, c.policy)
-				if c.fails != "" {
-					if !strings.Contains(failed, c.fails) || len(touched) > 0 {
-						t.Errorf("应在改动之前停下（动过 %v）：%q", touched, failed)
+				r, touched, ops, err := decideAndPrepare(t, bundled, [][2]string{{"nginx", owner}}, c.d, c.policy)
+				if c.fails != nil {
+					if !errors.Is(err, c.fails) || len(touched) > 0 {
+						t.Errorf("应在改动之前停下（动过 %v）：%v", touched, err)
 					}
 					return
 				}
 				if r == nil {
-					t.Fatalf("不应在改动之前停下：%s", failed)
+					t.Fatalf("不应在改动之前停下：%v", err)
 				}
 				var items []string
 				for _, it := range r.sc.items {
 					items = append(items, it.m.Name)
 				}
-				if failed != "" || !slices.Equal(touched, c.touched) || strings.Join(items, ",") != c.items || strings.Join(ops, ",") != c.ops {
-					t.Errorf("已有的 nginx：%v，迁入：%v，日志：%v\n%s", touched, items, ops, failed)
+				if err != nil || !slices.Equal(touched, c.touched) || strings.Join(items, ",") != c.items || strings.Join(ops, ",") != c.ops {
+					t.Errorf("已有的 nginx：%v，迁入：%v，日志：%v（%v）", touched, items, ops, err)
 				}
 				if c.policy == "skip" && (len(r.chk.d.Skipped) != 1 || r.chk.d.Skipped[0].Project != "site" || !strings.Contains(r.chk.d.Skipped[0].Reason, "nginx")) {
 					t.Errorf("site 不迁入，要说明原因：%+v", r.chk.d.Skipped)
@@ -223,32 +225,32 @@ func TestReplaceNamedFollowsProject(t *testing.T) {
 func TestNameHeldByKeptProject(t *testing.T) {
 	bundled := [][2]string{{"nginx", "site"}, {"proxy-app-1", "proxy"}, {"other", ""}}
 	existing := [][2]string{{"nginx", "proxy"}}
-	r, failed, touched, _ := decideAndPrepare(t, bundled, existing, preflight.Decisions{SkipProjects: []string{"proxy"}}, "")
+	r, touched, _, err := decideAndPrepare(t, bundled, existing, preflight.Decisions{SkipProjects: []string{"proxy"}}, "")
 	if r == nil {
-		t.Fatalf("保留 proxy 时不应停下：%s", failed)
+		t.Fatalf("保留 proxy 时不应停下：%v", err)
 	}
-	if failed != "" || len(touched) > 0 || len(r.sc.items) != 1 || r.sc.items[0].m.Name != "other" || len(r.chk.d.Skipped) != 1 ||
+	if err != nil || len(touched) > 0 || len(r.sc.items) != 1 || r.sc.items[0].m.Name != "other" || len(r.chk.d.Skipped) != 1 ||
 		r.chk.d.Skipped[0].Project != "site" || !strings.Contains(r.chk.d.Skipped[0].Reason, "nginx 属于保留的 Compose 项目 proxy") {
-		t.Errorf("保留 proxy 时 site 不迁入：动过 %v，跳过 %+v\n%s", touched, r.chk.d.Skipped, failed)
+		t.Errorf("保留 proxy 时 site 不迁入：动过 %v，跳过 %+v（%v）", touched, r.chk.d.Skipped, err)
 	}
 	if err := r.checkCompose(context.Background(), nil, r.pkg, r.sc); err != nil {
 		t.Errorf("不迁入的项目不用检查配置文件（新服务器没装 Compose 也没关系）：%v", err)
 	}
-	r, failed, touched, _ = decideAndPrepare(t, bundled, existing, preflight.Decisions{}, "")
+	r, touched, _, err = decideAndPrepare(t, bundled, existing, preflight.Decisions{}, "")
 	if r == nil {
-		t.Fatalf("替换 proxy 时不应停下：%s", failed)
+		t.Fatalf("替换 proxy 时不应停下：%v", err)
 	}
 	want := []string{"POST /containers/target-nginx/stop", "DELETE /containers/target-nginx"}
-	if failed != "" || !slices.Equal(touched, want) || len(r.sc.items) != 3 || r.sc.groupOf["p:site"] != r.sc.groupOf["p:proxy"] {
-		t.Errorf("替换 proxy 时 nginx 随它备份、删除，site 和它在同一组：%v %v\n%s", touched, r.sc.groupOf, failed)
+	if err != nil || !slices.Equal(touched, want) || len(r.sc.items) != 3 || r.sc.groupOf["p:site"] != r.sc.groupOf["p:proxy"] {
+		t.Errorf("替换 proxy 时 nginx 随它备份、删除，site 和它在同一组：%v %v（%v）", touched, r.sc.groupOf, err)
 	}
 }
 
 // decideAndPrepare 按迁入的顺序调用 decide、begin、prepare。bundled 是迁移包里的容器（名字和所属的 Compose
 // 项目，单独迁入的为空），existing 是新服务器上已有的容器（同样；都在运行，ID 是 target-名字），policy 是
-// --existing。返回开始改动之后的 migrate（改动之前就停下时为空）、出错时屏幕上的输出、对已有容器的改动（GET
-// 以外的请求）和事务日志里的操作。
-func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.Decisions, policy string) (mg *migrate, failed string, touched, ops []string) {
+// --existing。返回开始改动之后的 migrate（改动之前就停下时为空）、对已有容器的改动（GET 以外的请求）、事务日志里
+// 的操作和出的错。
+func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.Decisions, policy string) (mg *migrate, touched, ops []string, err error) {
 	t.Helper()
 	var list []string
 	inspect := map[string]string{}
@@ -291,13 +293,8 @@ func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.D
 			m.Projects = append(m.Projects, bundle.Project{Name: c[1], WorkingDir: filepath.Join(home, c[1])})
 		}
 	}
-	var out bytes.Buffer
-	screen := ui.New(&out, false, nil)
-	r := testRun(t, Deps{Docker: dc, Home: home, Screen: screen}, Options{Existing: policy})
-	mg, err := decideThenPrepare(r, &checked{d: d, plan: &bundle.Plan{Containers: plan}}, &bundleFiles{m: m, dataDir: data})
-	if err != nil {
-		failed = out.String()
-	}
+	r := testRun(t, Deps{Docker: dc, Home: home}, Options{Existing: policy})
+	mg, err = decideThenPrepare(r, &checked{d: d, plan: &bundle.Plan{Containers: plan}}, &bundleFiles{m: m, dataDir: data})
 	for _, c := range calls() {
 		if !strings.HasPrefix(c, "GET") {
 			touched = append(touched, c)
@@ -307,5 +304,5 @@ func decideAndPrepare(t *testing.T, bundled, existing [][2]string, d preflight.D
 	for _, e := range entries {
 		ops = append(ops, string(e.Op))
 	}
-	return mg, failed, touched, ops
+	return mg, touched, ops, err
 }

@@ -3,6 +3,7 @@ package restore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -45,15 +46,15 @@ func TestRefusesWithoutPlan(t *testing.T) {
 	defer log.Finish(logging.Failed, true)
 	var out bytes.Buffer
 	r := testRun(t, Deps{Screen: ui.New(&out, false, nil), Log: log}, Options{Link: link})
-	if plan, err := r.fetchPlan(context.Background()); err == nil || plan != nil || !strings.Contains(out.String(), "没有提供迁移计划") {
-		t.Fatalf("没有迁移计划时应拒绝迁入：%v\n%s", err, out.String())
+	if plan, err := r.fetchPlan(context.Background()); !errors.Is(err, transfer.ErrNoPlan) || plan != nil {
+		t.Fatalf("没有迁移计划时应拒绝迁入：%v", err)
 	}
 }
 
 // 版本不一样的迁移计划不能用（见 bundle.PlanVersion），在下载和改动之前停下：旧版本迁出的，说明要在旧服务器
 // 上用新版本重新迁出；更新版本迁出的，说明要用新版本迁入。
 func TestRefusesOtherPlanVersions(t *testing.T) {
-	for v, want := range map[int]string{bundle.PlanVersion - 1: "重新迁出", bundle.PlanVersion + 1: "更新版本的 DockHop"} {
+	for v, want := range map[int]error{bundle.PlanVersion - 1: bundle.ErrPlanOlder, bundle.PlanVersion + 1: bundle.ErrPlanNewer} {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -73,8 +74,8 @@ func TestRefusesOtherPlanVersions(t *testing.T) {
 		go srv.Serve()
 		var out bytes.Buffer
 		r := testRun(t, Deps{Screen: ui.New(&out, false, nil), Log: &logging.Logger{}}, Options{Link: link})
-		if plan, err := r.fetchPlan(context.Background()); err == nil || plan != nil || !strings.Contains(out.String(), want) {
-			t.Errorf("迁移计划的版本是 %d 时应拒绝，说明%s：%v\n%s", v, want, err, out.String())
+		if plan, err := r.fetchPlan(context.Background()); !errors.Is(err, want) || plan != nil {
+			t.Errorf("迁移计划的版本是 %d 时应拒绝（%v）：%v", v, want, err)
 		}
 		srv.Shutdown(context.Background())
 	}

@@ -32,7 +32,7 @@ func (r *migrate) startServices(ctx context.Context) error {
 		r.in("n:" + n)
 		raw, err := os.ReadFile(filepath.Join(r.pkg.dataDir, "networks", n+".json"))
 		if err != nil {
-			r.groupFailed(g, "迁移包里缺少网络 "+n+" 的配置："+err.Error(), "")
+			r.groupFailed(g, &ui.Failure{Reason: "迁移包里缺少网络 " + n + " 的配置", Err: err})
 			continue
 		}
 		if byCompose[n] != "" {
@@ -42,7 +42,7 @@ func (r *migrate) startServices(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			r.groupFailed(g, err.Error(), "检查是否和新服务器上已有网络的网段冲突")
+			r.groupFailed(g, &ui.Failure{Err: err, Hint: "检查是否和新服务器上已有网络的网段冲突"})
 		}
 	}
 
@@ -61,7 +61,7 @@ func (r *migrate) startServices(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			r.groupFailed(g, err.Error(), groupHint(err))
+			r.groupFailed(g, err)
 		}
 	}
 	r.in("")
@@ -167,16 +167,16 @@ func (r *migrate) createUnit(ctx context.Context, u *unit) error {
 	return r.applyChanges(ctx, it)
 }
 
-// unitError 写明是哪个 Compose 项目没能启动，带上建议。
+// unitError 写明是哪个 Compose 项目没能启动；err 没有建议、新服务器的 Compose 又是老版本时，建议换新版本。
 func (r *migrate) unitError(u *unit, err error) error {
-	reason, hint := err.Error(), groupHint(err)
 	if u.project == nil {
-		return &startError{reason, hint}
+		return &ui.Failure{Err: err}
 	}
-	if hint == "" && r.tool != nil && r.tool.Legacy() {
-		hint = legacyHint(r.tool)
+	f := &ui.Failure{Reason: "Compose 项目 " + u.project.Name + " 启动失败", Err: err}
+	if ui.HintOf(err) == "" && r.tool != nil && r.tool.Legacy() {
+		f.Hint = legacyHint(r.tool)
 	}
-	return &startError{"Compose 项目 " + u.project.Name + " 启动失败：" + reason, hint}
+	return f
 }
 
 // startUnit 启动一个单位里原来在运行的容器，不等它们就绪。
@@ -220,7 +220,7 @@ func (r *migrate) waitUnit(ctx context.Context, u *unit) error {
 		return r.unitError(u, errors.New("（测试）模拟项目失败"))
 	}
 	if u.project == nil && r.testFail("container:"+u.items[0].m.Name) {
-		return &startError{"（测试）模拟容器 " + u.items[0].m.Name + " 失败", ""}
+		return &ui.Failure{Reason: "（测试）模拟容器 " + u.items[0].m.Name + " 失败"}
 	}
 	return nil
 }
@@ -286,24 +286,11 @@ func (r *migrate) startProject(ctx context.Context, u *unit) error {
 	return nil
 }
 
-// startError 是一组服务没能启动的原因和建议。
-type startError struct{ reason, hint string }
-
-func (e *startError) Error() string { return e.reason }
-
-func groupHint(err error) string {
-	var se *startError
-	if errors.As(err, &se) {
-		return se.hint
-	}
-	return ""
-}
-
-// groupFailed 记下一组没能启动，并显示原因。
-func (r *migrate) groupFailed(g *group, reason, hint string) {
-	g.reason = reason
+// groupFailed 记下一组没能启动（原因是 err），当场显示：这一步不结束，接着启动其他组。
+func (r *migrate) groupFailed(g *group, err error) {
+	g.reason = err.Error()
 	if len(r.sc.groups) > 1 {
 		r.Log.Printf("这一组没能启动：%s", g.label())
 	}
-	_ = r.Screen.StepFailed(reason, "", hint)
+	r.Screen.StepFailed(&ui.Failure{Err: err})
 }

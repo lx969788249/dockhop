@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/lx969788249/dockhop/internal/spec"
+	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 // 停机之前的确认：Compose 项目的文件和运行中的容器不一致、要连带停下没选中但共用数据的容器、
@@ -31,7 +32,7 @@ func (r *run) confirmDrift(col *collected) error {
 			return err
 		}
 		if n == 1 {
-			return r.Screen.StepFailed("已取消：Compose 项目 "+p.u.project+" 的配置和运行中的容器不一致", "", "处理好之后重新运行迁出")
+			return &ui.Failure{Reason: "已取消：Compose 项目 " + p.u.project + " 的配置和运行中的容器不一致", Hint: "处理好之后重新运行迁出"}
 		}
 		r.Screen.Warn("%s；迁入后会按现在的文件启动", msg)
 	}
@@ -52,8 +53,8 @@ func (r *run) confirmShared(col *collected) error {
 		return nil
 	}
 	if !r.Prompt.Interactive() {
-		return r.Screen.StepFailed("没有选中的容器 "+list+" 和选中的容器共用数据或网络", "",
-			"加上 --stop-shared，允许打包时临时停止它们（打包完自动恢复）")
+		return &ui.Failure{Reason: "没有选中的容器 " + list + " 和选中的容器共用数据或网络",
+			Hint: "加上 --stop-shared，允许打包时临时停止它们（打包完自动恢复）"}
 	}
 	r.Screen.Hold()
 	ok, err := r.Prompt.Confirm("没有选中的容器 "+list+" 和选中的容器共用数据或网络。打包时临时停止它们吗？打包完会自动恢复", true)
@@ -61,7 +62,7 @@ func (r *run) confirmShared(col *collected) error {
 		return err
 	}
 	if !ok {
-		return r.Screen.StepFailed("已取消：和选中的容器共用数据的容器不能停止，数据无法保证一致", "", "")
+		return &ui.Failure{Reason: "已取消：和选中的容器共用数据的容器不能停止，数据无法保证一致"}
 	}
 	return nil
 }
@@ -79,7 +80,6 @@ func (r *run) checkAutoRemove(col *collected) error {
 		return nil
 	}
 	list := strings.Join(names, "、")
-	return r.Screen.StepFailed("容器 "+list+" 是用 --rm 启动的：停机打包时一停止，Docker 就会把它连同匿名卷和容器里的改动一起删掉，"+
-		"没法打包，也没法恢复，已取消（什么都没有改动）", "",
-		"先把它重新创建成不带 --rm 的容器再迁出")
+	return &ui.Failure{Kind: errUnstoppable, Reason: "容器 " + list + " 是用 --rm 启动的：停机打包时一停止，Docker 就会把它连同匿名卷和容器里的改动一起删掉，" +
+		"没法打包，也没法恢复，已取消（什么都没有改动）", Hint: "先把它重新创建成不带 --rm 的容器再迁出"}
 }

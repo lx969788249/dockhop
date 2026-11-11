@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -23,6 +24,12 @@ import (
 // 项目目录里单个超过这个大小的文件不随项目迁移（通常是日志、备份、下载的安装包），
 // 会提示用户。真正的数据应该在卷或挂载目录里，那些照常迁移。
 const bigFileLimit = 100 << 20
+
+// 停机之前停下的几种情况（ui.Failure 的 Kind）。
+var (
+	errUnstoppable = errors.New("要停下的容器停下之后放不回来")
+	errChanged     = errors.New("容器在读取配置之后有了变化")
+)
 
 type volumeInfo struct {
 	name      string
@@ -376,8 +383,8 @@ func mergeBinds(ctx context.Context, paths []*bindInfo, screen *ui.Screen) ([]*b
 func collectProject(ctx context.Context, tool *compose.Tool, u *unit, binds []*bindInfo, screen *ui.Screen) (*projectInfo, error) {
 	p := &projectInfo{u: u}
 	stop := func(err error) error {
-		return screen.StepFailed("Compose 项目 "+u.project+" 没法迁移："+err.Error(), "",
-			"把它改成普通的目录或文件（或者让它指向一个单独的地方）后重新运行，或者不迁移这个项目")
+		return &ui.Failure{Reason: "Compose 项目 " + u.project + " 没法迁移", Err: err,
+			Hint: "把它改成普通的目录或文件（或者让它指向一个单独的地方）后重新运行，或者不迁移这个项目"}
 	}
 	// 挂载目录记的是真实路径，项目目录本身是软链接时也按它的真实路径比较。
 	dir, _, err := approveRoot(projectRoot, u.workingDir, "")
@@ -453,8 +460,9 @@ func sharers(inv *inventory, sel []*item, vols map[string]bool, paths []string, 
 	share := func(it *item) error {
 		if spec.StopRiskOf(it.c) == spec.StopReplaced {
 			svc := it.c.Config.Labels[labelSwarmService]
-			return screen.StepFailed(fmt.Sprintf("容器 %s 属于 Swarm 服务 %s，和选中的容器共用数据，但它一停就会被 Swarm 重新启动，打包的数据没法保证一致，已取消（什么都没有改动）", it.name(), svc),
-				"", "先执行 docker service scale "+svc+"=0，迁出后再改回原来的个数")
+			return &ui.Failure{Kind: errUnstoppable,
+				Reason: fmt.Sprintf("容器 %s 属于 Swarm 服务 %s，和选中的容器共用数据，但它一停就会被 Swarm 重新启动，打包的数据没法保证一致，已取消（什么都没有改动）", it.name(), svc),
+				Hint:   "先执行 docker service scale " + svc + "=0，迁出后再改回原来的个数"}
 		}
 		out = append(out, it)
 		stopping[it] = true
@@ -497,7 +505,7 @@ func (r *run) recheck(ctx context.Context, col *collected) error {
 	s := r.Screen
 	list, err := r.Docker.Containers(ctx, true)
 	if err != nil {
-		return s.StepFailed("读取容器列表失败，为了安全没有停止任何容器", err.Error(), "")
+		return &ui.Failure{Reason: "读取容器列表失败，为了安全没有停止任何容器", Err: err}
 	}
 	// 读过的容器照旧用读的时候的配置（配置变了，ID 也会变），名字和状态按现在的；新出现的读一下。
 	now := &inventory{byName: map[string]*item{}, byID: map[string]*item{}}
@@ -509,7 +517,7 @@ func (r *run) recheck(ctx context.Context, col *collected) error {
 				continue // 刚好被删掉了
 			}
 			if err != nil {
-				return s.StepFailed("读取容器 "+sum.Name()+" 失败，为了安全没有停止任何容器", err.Error(), "")
+				return &ui.Failure{Reason: "读取容器 " + sum.Name() + " 失败，为了安全没有停止任何容器", Err: err}
 			}
 			it = &item{c: c, raw: raw}
 		}
@@ -543,8 +551,9 @@ func (r *run) recheck(ctx context.Context, col *collected) error {
 	}
 	if len(changed) > 0 {
 		slices.Sort(changed)
-		return s.StepFailed("容器 "+strings.Join(slices.Compact(changed), "、")+" 在读取配置之后有了变化（启动、停下、暂停、改名或者被重建了），为了安全没有停止任何容器", "",
-			"重新运行迁出，会按现在的样子重新读取")
+		return &ui.Failure{Kind: errChanged,
+			Reason: "容器 " + strings.Join(slices.Compact(changed), "、") + " 在读取配置之后有了变化（启动、停下、暂停、改名或者被重建了），为了安全没有停止任何容器",
+			Hint:   "重新运行迁出，会按现在的样子重新读取"}
 	}
 	return nil
 }

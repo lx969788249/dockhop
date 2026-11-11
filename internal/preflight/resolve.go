@@ -11,14 +11,6 @@ import (
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
-// Problem 是检查没能通过的原因，调用方把它显示成失败原因和建议。
-type Problem struct {
-	Reason string
-	Hint   string
-}
-
-func (p *Problem) Error() string { return p.Reason }
-
 // Runner 反复检查、让用户处理问题，直到没有需要处理的问题。
 type Runner struct {
 	Screen  *ui.Screen
@@ -62,7 +54,7 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 			return nil, err
 		}
 		if err != nil {
-			return nil, &Problem{Reason: "读取新服务器的情况失败：" + err.Error()}
+			return nil, &ui.Failure{Reason: "读取新服务器的情况失败", Err: err}
 		}
 		res := Evaluate(plan, t, d, o)
 		var asks, stops []Issue
@@ -95,7 +87,7 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 					}
 				}
 			}
-			return res, &Problem{Reason: stops[0].Title, Hint: stops[0].Hint}
+			return res, &ui.Failure{Reason: stops[0].Title, Hint: stops[0].Hint}
 		}
 		if len(asks) == 0 {
 			return res, nil
@@ -105,7 +97,7 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 		// 每轮处理完都会再检查一次，最后一轮处理好了也算数。
 		if auto && round > autoRounds {
 			if !r.Prompt.Interactive() {
-				return res, &Problem{Reason: "自动处理之后仍有问题没有解决：" + asks[0].Title, Hint: "查看上面的问题，处理后重新运行"}
+				return res, &ui.Failure{Reason: "自动处理之后仍有问题没有解决：" + asks[0].Title, Hint: "查看上面的问题，处理后重新运行"}
 			}
 			auto = false
 		}
@@ -118,7 +110,7 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 					r.Screen.Println("    建议：" + a.Hint)
 				}
 			}
-			return res, &Problem{Reason: asks[0].Title,
+			return res, &ui.Failure{Reason: asks[0].Title,
 				Hint: "处理后重新运行；或者加上 --yes，自动采用推荐的做法（例如自动换一个空闲端口）"}
 		}
 		if !auto {
@@ -135,12 +127,12 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 				if auto {
 					hint = "这个问题没法自动处理，请处理后重新运行"
 				}
-				var p *Problem
+				var p *ui.Failure
 				if errors.As(err, &p) {
 					return res, p
 				}
 				if errors.Is(err, errCancel) {
-					return res, &Problem{Reason: "已取消：" + a.Title, Hint: hint}
+					return res, &ui.Failure{Reason: "已取消：" + a.Title, Hint: hint}
 				}
 				return res, err
 			}

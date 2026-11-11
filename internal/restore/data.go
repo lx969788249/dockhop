@@ -23,6 +23,9 @@ import (
 // 恢复数据：数据卷、目录（连同软链接）、Compose 项目文件。写之前先把原来的备份好、记进事务日志，
 // 文件操作见 files.go，读写数据卷见 volumes.go。
 
+// errLinked 表示要写的地方在新服务器上是软链接，不迁入（ui.Failure 的 Kind，见 preflight.LinkedBind）。
+var errLinked = errors.New("要写的地方是软链接")
+
 func (r *migrate) restoreData(ctx context.Context) error {
 	s, dc := r.Screen, r.Docker
 	vols, binds := dataTargets(r.sc.writes(r.chk))
@@ -46,27 +49,27 @@ func (r *migrate) restoreData(ctx context.Context) error {
 		cur, err := dc.InspectVolume(ctx, v.Name)
 		existed := err == nil
 		if err != nil && !docker.IsNotFound(err) {
-			return s.StepFailed("读取数据卷 "+v.Name+" 失败", err.Error(), "")
+			return &ui.Failure{Reason: "读取数据卷 " + v.Name + " 失败", Err: err}
 		}
 		entry := Entry{Op: opVolume, Name: v.Name, Existed: existed}
 		if existed {
 			if volumeDriver(cur.Driver) != volumeDriver(meta.Driver) || !maps.Equal(cur.Options, meta.Options) {
-				return s.StepFailed("新服务器上已有同名、但存储方式不同的数据卷 "+v.Name+"，拒绝覆盖", "",
-					"确认新服务器上的这个卷可以删除后，执行 docker volume rm "+v.Name+" 再重试")
+				return &ui.Failure{Reason: "新服务器上已有同名、但存储方式不同的数据卷 " + v.Name + "，拒绝覆盖",
+					Hint: "确认新服务器上的这个卷可以删除后，执行 docker volume rm " + v.Name + " 再重试"}
 			}
 			// 先把新服务器上原有的数据备份到回滚资料里。
 			entry.Backup = r.j.file("volume")
 			s.Note("备份新服务器上原有的数据卷 · " + v.Name)
 			if err := r.saveVolume(ctx, v.Name, entry.Backup); err != nil {
-				return s.StepFailed("没能先备份新服务器上原有的数据卷 "+v.Name, err.Error(), "执行 df -h 检查磁盘空间")
+				return &ui.Failure{Reason: "没能先备份新服务器上原有的数据卷 " + v.Name, Err: err, Hint: "执行 df -h 检查磁盘空间"}
 			}
 		}
 		if err := r.j.add(entry); err != nil {
-			return s.StepFailed(err.Error(), "", "")
+			return err
 		}
 		if !existed {
 			if err := dc.CreateVolume(ctx, v.Name, meta.Driver, meta.Options, meta.Labels); err != nil {
-				return s.StepFailed("数据卷 "+v.Name+" 创建失败", err.Error(), "不是 local 驱动的卷，需要先在新服务器安装对应的卷插件")
+				return &ui.Failure{Reason: "数据卷 " + v.Name + " 创建失败", Err: err, Hint: "不是 local 驱动的卷，需要先在新服务器安装对应的卷插件"}
 			}
 		}
 		rc := bundle.OpenStream(r.pkg.dataDir, "volumes/"+v.Name, v.Parts)
@@ -83,7 +86,7 @@ func (r *migrate) restoreData(ctx context.Context) error {
 			werr = errors.New("（测试）模拟写入失败")
 		}
 		if werr != nil {
-			return s.StepFailed("数据卷 "+v.Name+" 写入失败", werr.Error(), "执行 df -h 检查磁盘空间")
+			return &ui.Failure{Reason: "数据卷 " + v.Name + " 写入失败", Err: werr, Hint: "执行 df -h 检查磁盘空间"}
 		}
 		_ = os.RemoveAll(filepath.Join(r.pkg.dataDir, "volumes", v.Name))
 		nv++
@@ -98,19 +101,19 @@ func (r *migrate) restoreData(ctx context.Context) error {
 		}
 		r.in("b:" + b.Path)
 		if err := r.restoreBind(ctx, b); err != nil {
-			return s.StepFailed("目录 "+b.Path+" 恢复失败", err.Error(), "")
+			return &ui.Failure{Reason: "目录 " + b.Path + " 恢复失败", Err: err}
 		}
 		nb++
 	}
 	for _, p := range r.sc.projects {
 		r.in("p:" + p.Name)
 		if err := r.installProject(p); err != nil {
-			return s.StepFailed("Compose 项目 "+p.Name+" 的文件没能放回原来的位置", err.Error(), "")
+			return &ui.Failure{Reason: "Compose 项目 " + p.Name + " 的文件没能放回原来的位置", Err: err}
 		}
 	}
 	r.in("")
 	if r.testFail("after-data") {
-		return s.StepFailed("（测试）模拟恢复数据之后失败", "", "")
+		return &ui.Failure{Reason: "（测试）模拟恢复数据之后失败"}
 	}
 	r.testPause(ctx, "after-data")
 	if ctx.Err() != nil {
@@ -165,7 +168,7 @@ func (r *migrate) restoreBind(ctx context.Context, b bundle.Bind) error {
 	// 迁入前检查已经在路径本身是软链接时停下（见 preflight.LinkedBind），这里是动手之前最后再看一次：
 	// 检查之后才被换成软链接的，同样不迁入。
 	if dest, err := os.Readlink(b.Path); err == nil {
-		return errors.New(preflight.LinkedBind(b.Path, dest))
+		return &ui.Failure{Kind: errLinked, Reason: preflight.LinkedBind(b.Path, dest)}
 	}
 	// 整个替换，还是原地换内容（单独挂载的目录不能改名），见 dirs.go。
 	swap, err := r.newDirSwap(b.Path, b.Dir)
@@ -253,7 +256,7 @@ func (r *migrate) installProject(p bundle.Project) error {
 	}
 	for _, path := range paths {
 		if dest, err := os.Readlink(path); err == nil {
-			return errors.New(preflight.LinkedProject(p.Name, path, dest))
+			return &ui.Failure{Kind: errLinked, Reason: preflight.LinkedProject(p.Name, path, dest)}
 		}
 	}
 	skip := func(path string) bool { return spec.Within(path, r.Home) || spec.Within(path, r.pkg.workdir) }

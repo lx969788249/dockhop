@@ -205,9 +205,10 @@ func TestRestoreBindStopsWhenMountUnknown(t *testing.T) {
 	os.MkdirAll(dst, 0o755)
 	os.WriteFile(filepath.Join(dst, "keep.txt"), []byte("old"), 0o600)
 	r := bindRun(t, root, bindStream(t, dst, 0o755, map[string]string{"new.txt": "migrated"}))
-	r.MountPoint = func(string) (bool, error) { return false, errors.New("读不到挂载信息") }
+	unknown := errors.New("读不到挂载信息")
+	r.MountPoint = func(string) (bool, error) { return false, unknown }
 	err := r.restoreBind(context.Background(), bundle.Bind{ID: "b1", Path: dst, Dir: true, Parts: 1})
-	if err == nil || !strings.Contains(err.Error(), "读不到挂载信息") {
+	if !errors.Is(err, unknown) {
 		t.Fatalf("应停下说明：%v", err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(dst, "keep.txt")); string(b) != "old" || len(dirNames(filepath.Dir(dst))) != 1 {
@@ -229,7 +230,7 @@ func TestRestoreBindRefusesLink(t *testing.T) {
 	before := snapshotTree(t, world)
 	r := bindRun(t, root, bindStream(t, dst, 0o755, map[string]string{"new.txt": "migrated"}))
 	err := r.restoreBind(context.Background(), bundle.Bind{ID: "b1", Path: dst, Dir: true, Parts: 1})
-	if err == nil || !strings.Contains(err.Error(), "软链接") || !strings.Contains(err.Error(), disk) {
+	if !errors.Is(err, errLinked) || !strings.Contains(err.Error(), disk) {
 		t.Fatalf("应拒绝，并说出软链接指向哪里：%v", err)
 	}
 	if after := snapshotTree(t, world); after != before {
@@ -265,7 +266,7 @@ func TestInstallProjectRefusesLink(t *testing.T) {
 		{Name: "site", WorkingDir: dst, DirParts: 1},
 		{Name: "site", WorkingDir: filepath.Join(world, "plain"), Outside: []string{dst}, OutParts: 1},
 	} {
-		if err := r.installProject(p); err == nil || !strings.Contains(err.Error(), "软链接") || !strings.Contains(err.Error(), disk) {
+		if err := r.installProject(p); !errors.Is(err, errLinked) || !strings.Contains(err.Error(), disk) {
 			t.Errorf("应拒绝，并说出软链接指向哪里：%+v %v", p, err)
 		}
 	}

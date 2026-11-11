@@ -26,10 +26,41 @@ type nopLogger struct{}
 
 func (nopLogger) Printf(string, ...any) {}
 
-// Failure 是本次任务的失败原因和建议；只保留第一条，它通常就是根因。
+// Failure 是一步没能做下去的原因。迁入、迁出的逻辑出错时返回它，不自己显示，由步骤那一层用 StepFailed 显示：
+//   - Reason 是给用户看的一句话；Err 是出错的细节（Docker、文件……的错误），显示时接在 Reason 后面，
+//     没有 Reason 时只显示它（它本身就是给用户看的话）；
+//   - Hint 是建议，写在结果摘要里；
+//   - Kind 是哪一种情况，不显示：要分情况处理的地方和测试按它判断（errors.Is）。
+//
+// 结果摘要里写本次任务的第一条失败（见 Screen.Failure），它通常就是根因。
 type Failure struct {
+	Kind   error
 	Reason string
+	Err    error
 	Hint   string
+}
+
+// Error 是显示出来的原因：Reason，出错的细节和它不一样时接在后面。
+func (f *Failure) Error() string {
+	switch {
+	case f.Err == nil || f.Err.Error() == f.Reason:
+		return f.Reason
+	case f.Reason == "":
+		return f.Err.Error()
+	default:
+		return f.Reason + "：" + f.Err.Error()
+	}
+}
+
+// Unwrap 让 errors.Is、errors.As 认得出类别和出错的原因。
+func (f *Failure) Unwrap() []error {
+	var out []error
+	for _, e := range []error{f.Kind, f.Err} {
+		if e != nil {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // Timing 记录每个步骤的耗时，任务结束时写进日志。
@@ -320,23 +351,32 @@ func (s *Screen) Error(reason, hint string) {
 // ErrReported 表示失败原因已经显示过（当场一行，结果摘要里再写一遍），调用方只需返回失败的退出码。
 var ErrReported = errors.New("已显示")
 
-// StepFailed 报告当前步骤失败（detail 是出错的细节，和 reason 不同时接在后面），返回 ErrReported：
-// 步骤里出错时 return s.StepFailed(…)。和 Error 一样显示，只是用户已经按了 Ctrl+C（WithContext
-// 给的 context 已取消）时，这一步是被打断的，失败只是结果：只写进日志，不显示、不算失败原因，
-// 结果里会说已取消或已中断。被打断以后还得让用户知道的问题（例如停下的容器没能恢复）用 Error。
-// 没有屏幕（s 为 nil）时只返回 ErrReported。
-func (s *Screen) StepFailed(reason, detail, hint string) error {
-	if detail != "" && detail != reason {
-		reason += "：" + detail
+// StepFailed 显示步骤没能做下去的原因 err（是 *Failure 时连同建议），和 Error 一样只把第一条写进结果摘要。
+// 由步骤那一层调用：逻辑里出错时返回 *Failure，不自己显示。取消（Canceled）和已经显示过的（ErrReported）
+// 不显示；用户已经按了 Ctrl+C（WithContext 给的 context 已取消）时，这一步是被打断的，失败只是结果：只写进
+// 日志，结果里会说已取消或已中断。被打断以后还得让用户知道的问题（例如停下的容器没能恢复）用 Error。
+// 没有屏幕（s 为 nil）时什么都不做。
+func (s *Screen) StepFailed(err error) {
+	if s == nil || err == nil || Canceled(err) || errors.Is(err, ErrReported) {
+		return
 	}
-	switch {
-	case s == nil:
-	case s.ctx != nil && s.ctx.Err() != nil:
-		s.log.Printf("被打断：%s", reason)
-	default:
-		s.Error(reason, hint)
+	if s.ctx != nil && s.ctx.Err() != nil {
+		s.log.Printf("被打断：%s", err)
+		return
 	}
-	return ErrReported
+	s.Error(err.Error(), HintOf(err))
+}
+
+// HintOf 是 err 里的建议：第一个有建议的 *Failure 的（外层只把别的错误包成 *Failure、没给建议时，用它包着的）。
+func HintOf(err error) string {
+	var f *Failure
+	for errors.As(err, &f) {
+		if f.Hint != "" {
+			return f.Hint
+		}
+		err = f.Err
+	}
+	return ""
 }
 
 // Problem 显示一个没法继续的问题和建议，用在不会再有结果摘要的地方

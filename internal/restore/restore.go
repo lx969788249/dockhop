@@ -164,6 +164,7 @@ func Run(ctx context.Context, d Deps, o Options) error {
 	r.dropStale()
 
 	err = r.steps(ctx)
+	r.Screen.StepFailed(err)
 	end := r.ending(ctx, err)
 	switch {
 	case (end == endSucceeded || end == endCommitted) && d.Succeeded != nil:
@@ -217,7 +218,7 @@ func (r *run) steps(ctx context.Context) error {
 	s.Begin(1, totalSteps, "检查环境")
 	info, err := r.Docker.Info(ctx)
 	if err != nil {
-		return s.StepFailed("读取 Docker 信息失败", err.Error(), "")
+		return &ui.Failure{Reason: "读取 Docker 信息失败", Err: err}
 	}
 	summary := "Docker " + info.ServerVersion
 	var tool *compose.Tool

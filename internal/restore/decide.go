@@ -3,6 +3,7 @@ package restore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,21 +15,29 @@ import (
 	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/spec"
+	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 // 改动之前的决定：按新服务器现在的样子，决定替换、保留哪些已有服务，找出要临时停下的、和迁入
 // 的数据（数据卷、目录、Compose 项目文件）共用的容器，并确认它们都能停下再恢复。判断都在这里
 // 做完，事务开始之后只照着做。
 
+// 改动之前停下的几种情况（ui.Failure 的 Kind）。
+var (
+	errExistingFail = errors.New("新服务器上已有同名的服务，--existing fail 不允许替换")
+	errKeptShares   = errors.New("保留的已有容器和要迁入的容器共用数据")
+	errUnstoppable  = errors.New("要停下的已有容器停下之后放不回来")
+	errChanged      = errors.New("新服务器上的容器在检查之后有了变化")
+)
+
 // decide 是改动新服务器之前的最后一道检查，只读不改：按新服务器现在的样子决定替换、保留哪些
 // 已有服务，找出要临时停下的、和迁入的数据共用的容器，并确认要停下的容器都能停下、之后再
 // 原样恢复。之后的改动（加载镜像、备份已有服务、写入数据……）都在事务里，失败时全部撤销。
 func (r *run) decide(ctx context.Context, chk *checked, pkg *bundleFiles) (*scope, error) {
-	s := r.Screen
 	dc := r.Docker
 	existing, err := dc.Containers(ctx, true)
 	if err != nil {
-		return nil, s.StepFailed("读取容器列表失败", err.Error(), "")
+		return nil, &ui.Failure{Reason: "读取容器列表失败", Err: err}
 	}
 	byName := map[string]docker.ContainerSummary{}
 	projects := map[string][]docker.ContainerSummary{}
@@ -74,7 +83,8 @@ func (r *run) decide(ctx context.Context, chk *checked, pkg *bundleFiles) (*scop
 				chk.d.Skipped = append(chk.d.Skipped, preflight.Skip{Project: p.Name, Reason: "新服务器上已有" + what + "，按 --existing skip 保留"})
 				continue
 			case "fail":
-				return nil, s.StepFailed("新服务器上已经有"+what+"（--existing fail 不允许替换），没有改动任何东西", "", "删除或改名新服务器上的这些容器，或者去掉 --existing fail")
+				return nil, &ui.Failure{Kind: errExistingFail, Reason: "新服务器上已经有" + what + "（--existing fail 不允许替换），没有改动任何东西",
+					Hint: "删除或改名新服务器上的这些容器，或者去掉 --existing fail"}
 			}
 		}
 		if len(projects[p.Name]) > 0 {
@@ -88,11 +98,11 @@ func (r *run) decide(ctx context.Context, chk *checked, pkg *bundleFiles) (*scop
 		}
 		raw, err := os.ReadFile(filepath.Join(pkg.dataDir, "containers", mc.Name+".json"))
 		if err != nil {
-			return nil, s.StepFailed("迁移包里缺少容器 "+mc.Name+" 的配置", err.Error(), "在旧服务器重新运行迁出")
+			return nil, &ui.Failure{Reason: "迁移包里缺少容器 " + mc.Name + " 的配置", Err: err, Hint: "在旧服务器重新运行迁出"}
 		}
 		var c docker.Container
 		if err := json.Unmarshal(raw, &c); err != nil {
-			return nil, s.StepFailed("容器 "+mc.Name+" 的配置读不懂", err.Error(), "")
+			return nil, &ui.Failure{Reason: "容器 " + mc.Name + " 的配置读不懂", Err: err}
 		}
 		// 容器启动失败时的输出可能带着这些值（例如连接串），日志和报错里都要隐藏。
 		for _, v := range logging.EnvSecrets(c.Config.Env) {
@@ -114,7 +124,8 @@ func (r *run) decide(ctx context.Context, chk *checked, pkg *bundleFiles) (*scop
 				chk.d.Skipped = append(chk.d.Skipped, preflight.Skip{Container: mc.Name, Reason: "新服务器上已有同名容器，按 --existing skip 保留"})
 				continue
 			case policy == "fail":
-				return nil, s.StepFailed("新服务器上已经有同名容器 "+mc.Name+"（--existing fail 不允许替换），没有改动任何东西", "", "删除这个容器，或者去掉 --existing fail")
+				return nil, &ui.Failure{Kind: errExistingFail, Reason: "新服务器上已经有同名容器 " + mc.Name + "（--existing fail 不允许替换），没有改动任何东西",
+					Hint: "删除这个容器，或者去掉 --existing fail"}
 			default:
 				// 它跟着这个容器（单独迁入的），或者这个容器所在的 Compose 项目：停下、改名备份，名字空出来。
 				sc.targets[mc.Name] = true
@@ -128,7 +139,7 @@ func (r *run) decide(ctx context.Context, chk *checked, pkg *bundleFiles) (*scop
 		}
 	}
 	if len(sc.items) == 0 {
-		return nil, s.StepFailed("按检查时的选择，没有要迁入的容器了", "", "")
+		return nil, &ui.Failure{Reason: "按检查时的选择，没有要迁入的容器了"}
 	}
 	writers, err := r.findWriters(ctx, chk, sc, existing)
 	if err != nil {
@@ -157,7 +168,6 @@ func (r *run) counterparts(chk *checked, existing []docker.ContainerSummary) pre
 //
 // 读不到某个容器的配置时，没法确认它有没有在用这些数据，不能当作没有。
 func (r *run) findWriters(ctx context.Context, chk *checked, sc *scope, existing []docker.ContainerSummary) ([]writer, error) {
-	s := r.Screen
 	match := r.counterparts(chk, existing)
 	volumes, dirs := writeSet(sc.writes(chk))
 	paths := realPaths(dirs)
@@ -181,13 +191,14 @@ func (r *run) findWriters(ctx context.Context, chk *checked, sc *scope, existing
 		case docker.IsNotFound(err):
 			continue // 刚好被删掉了
 		case err != nil:
-			return nil, s.StepFailed("读不到新服务器上的容器 "+name+"，没法确认它有没有在用要写入的数据（还没有改动已有的服务和数据）", err.Error(), "确认 Docker 运行正常后重新运行")
+			return nil, &ui.Failure{Reason: "读不到新服务器上的容器 " + name + "，没法确认它有没有在用要写入的数据（还没有改动已有的服务和数据）", Err: err,
+				Hint: "确认 Docker 运行正常后重新运行"}
 		case !spec.UsesData(full, volumes, paths):
 			others = append(others, writer{summary: c, full: full})
 			continue
 		case kept:
-			return nil, s.StepFailed("保留的已有容器 "+name+" 和要迁入的容器共用数据，迁入会覆盖它正在用的数据（还没有改动已有的服务和数据）", "",
-				"重新运行迁入，检查时把共用数据的容器一起跳过，或者替换这个已有的容器")
+			return nil, &ui.Failure{Kind: errKeptShares, Reason: "保留的已有容器 " + name + " 和要迁入的容器共用数据，迁入会覆盖它正在用的数据（还没有改动已有的服务和数据）",
+				Hint: "重新运行迁入，检查时把共用数据的容器一起跳过，或者替换这个已有的容器"}
 		}
 		writers = append(writers, writer{summary: c, full: full})
 	}
@@ -253,10 +264,9 @@ func (r *run) scene(chk *checked, existing []docker.ContainerSummary, writers []
 // decide 时的样子停容器、备份就不对了：新启动的共用数据的容器没停下，数据写进去时它还在用。
 // 有变化就停下，重新运行会按新服务器现在的样子重新检查。
 func (r *migrate) recheck(ctx context.Context) error {
-	s := r.Screen
 	existing, err := r.Docker.Containers(ctx, true)
 	if err != nil {
-		return s.StepFailed("读取容器列表失败", err.Error(), "")
+		return &ui.Failure{Reason: "读取容器列表失败", Err: err}
 	}
 	writers, err := r.findWriters(ctx, r.chk, r.sc, existing)
 	if err != nil {
@@ -271,8 +281,8 @@ func (r *migrate) recheck(ctx context.Context) error {
 	}
 	if len(changed) > 0 {
 		slices.Sort(changed)
-		return s.StepFailed("新服务器上的容器 "+strings.Join(slices.Compact(changed), "、")+" 在检查之后有了变化，为了安全没有动已有的服务和数据", "",
-			"重新运行迁入，会按新服务器现在的样子重新检查")
+		return &ui.Failure{Kind: errChanged, Reason: "新服务器上的容器 " + strings.Join(slices.Compact(changed), "、") + " 在检查之后有了变化，为了安全没有动已有的服务和数据",
+			Hint: "重新运行迁入，会按新服务器现在的样子重新检查"}
 	}
 	return nil
 }
@@ -302,7 +312,8 @@ func (r *run) checkStoppable(ctx context.Context, sc *scope) error {
 	for _, id := range ids {
 		c, _, err := r.Docker.InspectContainer(ctx, id)
 		if err != nil {
-			return r.Screen.StepFailed("读不到新服务器上要替换的容器 "+id+"（还没有改动任何东西）", err.Error(), "确认 Docker 运行正常后重新运行")
+			return &ui.Failure{Reason: "读不到新服务器上要替换的容器 " + id + "（还没有改动任何东西）", Err: err,
+				Hint: "确认 Docker 运行正常后重新运行"}
 		}
 		list = append(list, stopping{c, "要被迁入的同名服务替换"})
 	}
@@ -310,14 +321,14 @@ func (r *run) checkStoppable(ctx context.Context, sc *scope) error {
 		name := x.c.ShortName()
 		switch spec.StopRiskOf(x.c) {
 		case spec.StopRemoves:
-			return r.Screen.StepFailed("新服务器上的容器 "+name+" 是用 --rm 启动的：迁入时要先停下它（"+x.why+
-				"），可 Docker 一停止就会把它连同匿名卷和容器里的改动一起删掉，迁入失败时也放不回来（还没有改动任何东西）", "",
-				"先把它重新创建成不带 --rm 的容器，再重新运行迁入")
+			return &ui.Failure{Kind: errUnstoppable, Reason: "新服务器上的容器 " + name + " 是用 --rm 启动的：迁入时要先停下它（" + x.why +
+				"），可 Docker 一停止就会把它连同匿名卷和容器里的改动一起删掉，迁入失败时也放不回来（还没有改动任何东西）",
+				Hint: "先把它重新创建成不带 --rm 的容器，再重新运行迁入"}
 		case spec.StopReplaced:
 			svc := x.c.Config.Labels["com.docker.swarm.service.name"]
-			return r.Screen.StepFailed("新服务器上的容器 "+name+" 属于 Swarm 服务 "+svc+"：迁入时要先停下它（"+x.why+
-				"），可它一停就会被 Swarm 换成新的，新的照样在用这些数据（还没有改动任何东西）", "",
-				"先执行 docker service scale "+svc+"=0，迁入完成后再改回原来的个数")
+			return &ui.Failure{Kind: errUnstoppable, Reason: "新服务器上的容器 " + name + " 属于 Swarm 服务 " + svc + "：迁入时要先停下它（" + x.why +
+				"），可它一停就会被 Swarm 换成新的，新的照样在用这些数据（还没有改动任何东西）",
+				Hint: "先执行 docker service scale " + svc + "=0，迁入完成后再改回原来的个数"}
 		}
 	}
 	return nil

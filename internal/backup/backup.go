@@ -18,7 +18,6 @@ package backup
 import (
 	"context"
 	"crypto/rand"
-	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -96,6 +95,7 @@ func Run(ctx context.Context, d Deps, o Options) error {
 	dropStale(d.Home)
 
 	err = r.steps(ctx)
+	r.Screen.StepFailed(err)
 	r.cleanup()
 	end := r.ending(ctx, err)
 	if end == endFailed && d.Failed != nil {
@@ -125,7 +125,7 @@ func (r *run) steps(ctx context.Context) error {
 	s.Begin(1, totalSteps, "检查环境")
 	info, err := dc.Info(ctx)
 	if err != nil {
-		return s.StepFailed("读取 Docker 信息失败", err.Error(), "")
+		return &ui.Failure{Reason: "读取 Docker 信息失败", Err: err}
 	}
 	tool, terr := compose.Detect(ctx)
 	envSummary := "Docker " + info.ServerVersion
@@ -141,18 +141,18 @@ func (r *run) steps(ctx context.Context) error {
 	s.Begin(2, totalSteps, "选择要迁移的服务")
 	inv, err := buildInventory(ctx, dc, s)
 	if err != nil {
-		return s.StepFailed(err.Error(), "", "")
+		return &ui.Failure{Err: err}
 	}
 	chosen, err := chooseUnits(inv, r.opts.Include, s, r.Prompt)
 	if ui.Canceled(err) {
 		return err
 	}
 	if err != nil {
-		return s.StepFailed(err.Error(), "", "")
+		return &ui.Failure{Err: err}
 	}
 	sel, err := withDependencies(inv, chosen, s)
 	if err != nil {
-		return s.StepFailed(err.Error(), "", "")
+		return &ui.Failure{Err: err}
 	}
 	if tool == nil && sel.projectCount() > 0 {
 		s.Warn("这台服务器上找不到 docker compose 命令，无法核对 Compose 配置，将直接迁移项目目录")
@@ -162,18 +162,15 @@ func (r *run) steps(ctx context.Context) error {
 
 	s.Begin(3, totalSteps, "读取配置")
 	col, err := collect(ctx, dc, tool, inv, sel, s, r.ignored())
-	if errors.Is(err, ui.ErrReported) {
-		return err
-	}
 	if err != nil {
-		return s.StepFailed(err.Error(), "", "")
+		return &ui.Failure{Err: err}
 	}
 	for _, v := range col.secrets {
 		r.Redactor.AddSecret(v)
 	}
 	if !dc.Local() && (len(col.binds) > 0 || len(col.projects) > 0) {
-		return s.StepFailed("Docker 不在这台服务器上（DOCKER_HOST 指向了别的机器），没法读取容器挂载的目录和 Compose 项目文件", "",
-			"请在 Docker 所在的服务器上直接运行 DockHop")
+		return &ui.Failure{Reason: "Docker 不在这台服务器上（DOCKER_HOST 指向了别的机器），没法读取容器挂载的目录和 Compose 项目文件",
+			Hint: "请在 Docker 所在的服务器上直接运行 DockHop"}
 	}
 	for _, p := range col.systemOnly {
 		s.Detail("宿主机系统路径只在新服务器重建挂载、不迁移内容：%s", p)
@@ -203,16 +200,16 @@ func (r *run) steps(ctx context.Context) error {
 	need := col.dataBytes() + col.imageBytes
 	disk, err := host.DiskOf(r.workdir)
 	if err == nil && disk.Free < uint64(need) {
-		return s.StepFailed(fmt.Sprintf("磁盘空间可能不够：迁移包最多需要约 %s（压缩前），%s 所在磁盘只剩 %s",
-			ui.HumanBytes(need), disk.Path, ui.HumanBytes(int64(disk.Free))),
-			"清理磁盘，或在命令前面加上 DOCKHOP_HOME=空间更大的目录 再运行", "")
+		return &ui.Failure{Reason: fmt.Sprintf("磁盘空间可能不够：迁移包最多需要约 %s（压缩前），%s 所在磁盘只剩 %s",
+			ui.HumanBytes(need), disk.Path, ui.HumanBytes(int64(disk.Free))) +
+			"：清理磁盘，或在命令前面加上 DOCKHOP_HOME=空间更大的目录 再运行"}
 	}
 	if err := os.MkdirAll(r.workdir, 0o700); err != nil {
-		return s.StepFailed("无法创建工作目录 "+r.workdir, err.Error(), "")
+		return &ui.Failure{Reason: "无法创建工作目录 " + r.workdir, Err: err}
 	}
 	ln, port, err := transfer.Listen(r.opts.Port)
 	if err != nil {
-		return s.StepFailed(err.Error(), "用 --port 换一个端口", "")
+		return &ui.Failure{Reason: err.Error() + "：用 --port 换一个端口"}
 	}
 	addr := transfer.Address{Host: r.opts.Host}
 	if addr.Host == "" {
@@ -224,7 +221,7 @@ func (r *run) steps(ctx context.Context) error {
 	link, err := crypto.NewLink(addr.Host, port)
 	if err != nil {
 		ln.Close()
-		return s.StepFailed("生成迁移链接失败", err.Error(), "")
+		return &ui.Failure{Reason: "生成迁移链接失败", Err: err}
 	}
 	r.Redactor.AddSecret(link.Secret())
 	free := "剩余空间未知"
@@ -245,7 +242,7 @@ func (r *run) steps(ctx context.Context) error {
 	// 迁移计划是新服务器做迁入前检查、核对下载的文件的依据，没有它不能迁入。
 	if err := writePlan(planPath, link, buildPlan(m, col, size, sum)); err != nil {
 		ln.Close()
-		return s.StepFailed("生成迁移计划失败", err.Error(), "执行 df -h 检查磁盘空间后重新运行")
+		return &ui.Failure{Reason: "生成迁移计划失败", Err: err, Hint: "执行 df -h 检查磁盘空间后重新运行"}
 	}
 	s.End(fmt.Sprintf("%d 个镜像 · 迁移包共 %s", images, ui.HumanBytes(size+imageFileBytes(m.ImageFiles))))
 

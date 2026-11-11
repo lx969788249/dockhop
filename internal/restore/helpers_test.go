@@ -64,8 +64,8 @@ func testUndo(t *testing.T, dc *docker.Client, screen *ui.Screen) *undo {
 
 // prepareWith 用要写入目录 shared 的容器 new-app（和一个不用数据的 kept）按迁入的顺序调用
 // decide、begin、prepare（见 decideThenPrepare）。新服务器上的已有容器由 handle 回答（shared 是那个目录的完整路径）。
-// 返回屏幕上的输出（失败时有原因）和停过的容器。
-func prepareWith(t *testing.T, d preflight.Decisions, handle func(w http.ResponseWriter, p, shared string) bool) (string, []string) {
+// 返回停过的容器和出的错。
+func prepareWith(t *testing.T, d preflight.Decisions, handle func(w http.ResponseWriter, p, shared string) bool) ([]string, error) {
 	t.Helper()
 	home := t.TempDir()
 	shared := filepath.Join(home, "shared")
@@ -85,17 +85,13 @@ func prepareWith(t *testing.T, d preflight.Decisions, handle func(w http.Respons
 	os.WriteFile(filepath.Join(data, "containers", "new-app.json"),
 		[]byte(`{"Id":"source","Name":"/new-app","Config":{"Image":"alpine"},"Mounts":[{"Type":"bind","Source":"`+shared+`","Destination":"/data"}]}`), 0o600)
 	os.WriteFile(filepath.Join(data, "containers", "kept.json"), []byte(`{"Id":"source-kept","Name":"/kept","Config":{"Image":"alpine"}}`), 0o600)
-	var out bytes.Buffer
-	screen := ui.New(&out, false, nil)
-	r := testRun(t, Deps{Docker: dc, Home: home, Screen: screen}, Options{})
+	r := testRun(t, Deps{Docker: dc, Home: home}, Options{})
 	chk := &checked{d: d, plan: &bundle.Plan{Containers: []bundle.PlanContainer{{Name: "kept"}, {Name: "new-app", Binds: []string{shared}}},
 		Binds: []bundle.PlanBind{{Path: shared}}}}
 	pkg := &bundleFiles{dataDir: data,
 		m: &bundle.Manifest{Containers: []bundle.Container{{Name: "kept"}, {Name: "new-app"}}, Binds: []bundle.Bind{{Path: shared}}}}
-	if _, err := decideThenPrepare(r, chk, pkg); err != nil {
-		return out.String(), stopped
-	}
-	return "", stopped
+	_, err := decideThenPrepare(r, chk, pkg)
+	return stopped, err
 }
 
 // decideThenPrepare 按迁入的顺序调用 decide、begin、prepare，最后关掉事务日志。返回开始改动之后的 migrate

@@ -89,7 +89,7 @@ func TestWaitReadyExitedExplains(t *testing.T) {
 	if err.Error() != want {
 		t.Errorf("报错：%s\n应为：%s", err, want)
 	}
-	if hint := groupHint(err); !strings.Contains(hint, "按名字找不到它要连的 postgresql") {
+	if hint := ui.HintOf(err); !strings.Contains(hint, "按名字找不到它要连的 postgresql") {
 		t.Errorf("建议应说出找不到的名字：%s", hint)
 	}
 	if text := logText(t, r); !strings.Contains(text, "Failed to resolve 'postgresql'") {
@@ -229,8 +229,8 @@ func TestConfirmReadyRetriesInspect(t *testing.T) {
 func TestWaitReadyExitZeroFails(t *testing.T) {
 	_, _, r := fakeContainer(t, "", `{"Id":"new-app","Name":"/app","State":{"Status":"exited","ExitCode":0}}`)
 	err := r.waitReady(context.Background(), &citem{m: bundle.Container{Name: "app"}, newID: "new-app", startedAt: time.Now()})
-	if err == nil || !strings.Contains(err.Error(), "退出码 0") || !strings.Contains(groupHint(err), "一次性任务") {
-		t.Fatalf("原来在运行的容器自己退出了应算失败，并说明一次性任务怎么办：%v %q", err, groupHint(err))
+	if err == nil || !strings.Contains(err.Error(), "退出码 0") || !strings.Contains(ui.HintOf(err), "一次性任务") {
+		t.Fatalf("原来在运行的容器自己退出了应算失败，并说明一次性任务怎么办：%v %q", err, ui.HintOf(err))
 	}
 }
 

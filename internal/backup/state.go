@@ -83,7 +83,7 @@ func RecoverInterrupted(ctx context.Context, dc *docker.Client, home string, scr
 	var rec stoppedRecord
 	if err := json.Unmarshal(b, &rec); err != nil {
 		// 不能当作没有：删掉记录，可能还停着的容器就没人管了。
-		return fmt.Errorf("上次迁出的停机记录 %s 读不懂（%v），上次停下的容器可能还停着。请执行 docker ps -a 检查，"+
+		return fmt.Errorf("上次迁出的停机记录 %s 读不懂（%w），上次停下的容器可能还停着。请执行 docker ps -a 检查，"+
 			"把需要的容器启动起来，然后删除这个文件再重新运行", statePath(home), err)
 	}
 	var still []StoppedContainer
@@ -94,7 +94,7 @@ func RecoverInterrupted(ctx context.Context, dc *docker.Client, home string, scr
 		}
 		if err != nil {
 			// 不能当作容器已经没了：删掉记录，之后就没法自动恢复了。
-			return fmt.Errorf("读不到上次迁出停下的容器 %s 的状态（%v），停机记录保留，处理好 Docker 的问题后重新运行迁出会接着恢复", c.Name, err)
+			return fmt.Errorf("读不到上次迁出停下的容器 %s 的状态（%w），停机记录保留，处理好 Docker 的问题后重新运行迁出会接着恢复", c.Name, err)
 		}
 		if !restored(c, ct) {
 			still = append(still, c)

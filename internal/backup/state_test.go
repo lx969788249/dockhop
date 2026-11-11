@@ -3,6 +3,8 @@ package backup
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -104,8 +106,9 @@ func TestRecoverInterruptedKeepsRecordOnDockerError(t *testing.T) {
 	dc := fake.Client()
 	var out bytes.Buffer
 	err := RecoverInterrupted(context.Background(), dc, home, ui.New(&out, false, nil), ui.NewPrompter(nil, &out))
-	if err == nil || !strings.Contains(err.Error(), "停机记录保留") {
-		t.Fatalf("应报错：%v", err)
+	var de *docker.Error
+	if !errors.As(err, &de) || de.Status != http.StatusInternalServerError {
+		t.Fatalf("应报出 Docker 的错误：%v", err)
 	}
 	if _, err := os.Stat(statePath(home)); err != nil {
 		t.Fatal("停机记录应保留")
@@ -220,8 +223,9 @@ func TestRecoverInterruptedKeepsBrokenRecord(t *testing.T) {
 	dc, started := stoppedDocker(t)
 	var out bytes.Buffer
 	err := RecoverInterrupted(context.Background(), dc, home, ui.New(&out, false, nil), ui.NewPrompter(nil, &out))
-	if err == nil || !strings.Contains(err.Error(), "docker ps -a") {
-		t.Fatalf("应停下并说明怎么处理：%v", err)
+	var se *json.SyntaxError
+	if !errors.As(err, &se) {
+		t.Fatalf("记录读不懂时应停下：%v", err)
 	}
 	if _, serr := os.Stat(statePath(home)); serr != nil {
 		t.Error("读不懂的停机记录应保留")

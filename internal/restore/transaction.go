@@ -19,11 +19,11 @@ import (
 // 都在返回的 migrate 上。
 func (r *run) begin(tool *compose.Tool, chk *checked, pkg *bundleFiles, sc *scope) (*migrate, error) {
 	if err := os.RemoveAll(r.rbDir); err != nil {
-		return nil, r.Screen.StepFailed("无法清理回滚资料目录 "+r.rbDir, err.Error(), "")
+		return nil, &ui.Failure{Reason: "无法清理回滚资料目录 " + r.rbDir, Err: err}
 	}
 	j, err := openJournal(r.rbDir)
 	if err != nil {
-		return nil, r.Screen.StepFailed("无法创建事务日志，为了安全没有改动任何东西", err.Error(), "检查 "+r.Home+" 是否可写")
+		return nil, &ui.Failure{Reason: "无法创建事务日志，为了安全没有改动任何东西", Err: err, Hint: "检查 " + r.Home + " 是否可写"}
 	}
 	return &migrate{run: r, tool: tool, chk: chk, pkg: pkg, sc: sc, j: j,
 		imageAs: map[string]string{}, noted: map[string]bool{}}, nil
@@ -38,12 +38,12 @@ func (r *migrate) commit(ctx context.Context) error {
 	for i := len(r.shared) - 1; i >= 0; i-- {
 		e := r.shared[i]
 		if err := restoreState(ctx, r.Docker, e.ID, e.State); err != nil {
-			return s.StepFailed("新服务已验证，但临时停下的容器 "+e.Name+" 没能恢复", err.Error(), "")
+			return &ui.Failure{Reason: "新服务已验证，但临时停下的容器 " + e.Name + " 没能恢复", Err: err}
 		}
 	}
 	// 这是不可逆的提交点：之后不再删除。
 	if err := r.j.add(Entry{Op: opCommit}); err != nil {
-		return s.StepFailed(err.Error(), "", "")
+		return err
 	}
 	r.out.committed = true
 	entries, err := readJournal(r.rbDir)
@@ -111,12 +111,12 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 		return nil
 	}
 	if errors.Is(err, ErrJournalNewer) {
-		return s.StepFailed("上次迁入的事务日志是更新版本的 DockHop 写的，这个版本没法接着处理", err.Error(),
-			"用一行命令运行最新版本的 DockHop，它会接着删除上次迁入的内容（回滚资料都保留在 "+r.rbDir+"）")
+		return &ui.Failure{Reason: "上次迁入的事务日志是更新版本的 DockHop 写的，这个版本没法接着处理", Err: err,
+			Hint: "用一行命令运行最新版本的 DockHop，它会接着删除上次迁入的内容（回滚资料都保留在 " + r.rbDir + "）"}
 	}
 	if err != nil {
-		return s.StepFailed("上次迁入的事务日志读不了，没法自动删除上次迁入的内容", err.Error(),
-			"回滚资料都保留在 "+r.rbDir+"（journal.jsonl 记着每一处改动），请人工处理后删除这个目录再重新运行")
+		return &ui.Failure{Reason: "上次迁入的事务日志读不了，没法自动删除上次迁入的内容", Err: err,
+			Hint: "回滚资料都保留在 " + r.rbDir + "（journal.jsonl 记着每一处改动），请人工处理后删除这个目录再重新运行"}
 	}
 	r.undo.vio, _ = r.newVolumeIO(ctx)
 	if kept, ok := partialCommit(entries); ok {
@@ -154,7 +154,7 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 			s.Warn("保留了上次迁入到一半的样子，没有删除")
 			return os.RemoveAll(r.rbDir)
 		case 3:
-			return s.StepFailed("上次迁入留下的改动还没处理", "", "回滚资料在 "+r.rbDir+"；处理好之后重新运行")
+			return &ui.Failure{Reason: "上次迁入留下的改动还没处理", Hint: "回滚资料在 " + r.rbDir + "；处理好之后重新运行"}
 		}
 	} else {
 		s.Println("没有可以输入的终端，直接删除上次迁入的内容。")
@@ -164,7 +164,7 @@ func (r *run) recoverInterrupted(ctx context.Context) error {
 	s.Finish(ctx, func(ctx context.Context) { r.out.rollbackIssues = r.undo.rollback(ctx, entries) })
 	r.out.rollbackDone = true
 	if len(r.out.rollbackIssues) > 0 {
-		return s.StepFailed("上次迁入的内容没能全部删除", "", "")
+		return &ui.Failure{Reason: "上次迁入的内容没能全部删除"}
 	}
 	s.Info("已删除上次迁入的内容，回到了上次迁入之前的样子")
 	r.cleanHelpers(context.WithoutCancel(ctx))

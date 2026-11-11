@@ -4,14 +4,23 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/lx969788249/dockhop/internal/ui"
 )
 
 // 下载迁移包和要从旧服务器拿的镜像文件，用之前按迁移计划核对。下载的文件放在这次迁入的
 // 工作目录里：失败时保留，用同一个链接重新迁入不用重新下载；换了新链接，旧的就删掉。
+
+// 核对下载的文件时停下的两种情况（ui.Failure 的 Kind）。
+var (
+	errNoChecksums = errors.New("迁移计划里没有镜像文件的校验值")
+	errMismatch    = errors.New("下载的文件和迁移计划里记的校验值对不上")
+)
 
 // dropStale 删掉以前的链接留下的下载和记录。失败时保留它们，是为了用同一个链接重新迁入时
 // 不用重新下载、跳过已经迁入的；一个链接对应旧服务器上的一次迁出，换了新链接，旧的就用不上了。
@@ -40,11 +49,11 @@ func (r *run) prepareWorkdir(chk *checked, pkg *bundleFiles) error {
 	pkg.workdir = filepath.Join(r.workBase(chk), "in-"+r.opts.Link.Token)
 	pkg.dataDir = filepath.Join(pkg.workdir, "data")
 	if err := os.MkdirAll(pkg.workdir, 0o700); err != nil {
-		return r.Screen.StepFailed("无法创建工作目录 "+pkg.workdir, err.Error(), "")
+		return &ui.Failure{Reason: "无法创建工作目录 " + pkg.workdir, Err: err}
 	}
 	// 上次失败留下的解密数据先删掉，重新解开（加密的下载文件保留，不用重新下载）。
 	if err := os.RemoveAll(pkg.dataDir); err != nil {
-		return r.Screen.StepFailed("无法清理上次留下的文件 "+pkg.dataDir, err.Error(), "")
+		return &ui.Failure{Reason: "无法清理上次留下的文件 " + pkg.dataDir, Err: err}
 	}
 	return nil
 }
@@ -83,9 +92,9 @@ func (pkg *bundleFiles) dropDownload() {
 func (r *run) checkSums(chk *checked) error {
 	for _, f := range chk.plan.Images {
 		if chk.images[f.File].local == "" && f.SHA256 == "" {
-			return r.Screen.StepFailed("旧服务器上的 DockHop 是 1.1.6 之前的版本，迁移计划里没有镜像文件的校验值，"+
-				"没法确认下载的镜像没有被调换（还没有下载或改动任何东西）", "",
-				"在旧服务器上结束这次迁出，重新运行一行命令迁出（会用最新版），再用新的链接迁入")
+			return &ui.Failure{Kind: errNoChecksums, Reason: "旧服务器上的 DockHop 是 1.1.6 之前的版本，迁移计划里没有镜像文件的校验值，" +
+				"没法确认下载的镜像没有被调换（还没有下载或改动任何东西）",
+				Hint: "在旧服务器上结束这次迁出，重新运行一行命令迁出（会用最新版），再用新的链接迁入"}
 		}
 	}
 	return nil
@@ -100,12 +109,12 @@ func (r *run) verifyDownload(path, want, what string) error {
 	}
 	got, err := fileSHA256(path)
 	if err != nil {
-		return r.Screen.StepFailed("读不了下载的"+what+" "+path, err.Error(), "")
+		return &ui.Failure{Reason: "读不了下载的" + what + " " + path, Err: err}
 	}
 	if got != want {
 		_ = os.Remove(path)
-		return r.Screen.StepFailed("下载的"+what+"和旧服务器上的对不上（可能在网络上被改动过），已删除", "",
-			"重新运行迁入，会重新下载；如果再次出现，检查两台服务器之间的网络")
+		return &ui.Failure{Kind: errMismatch, Reason: "下载的" + what + "和旧服务器上的对不上（可能在网络上被改动过），已删除",
+			Hint: "重新运行迁入，会重新下载；如果再次出现，检查两台服务器之间的网络"}
 	}
 	return nil
 }
