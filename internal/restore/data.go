@@ -25,7 +25,7 @@ import (
 
 func (r *run) restoreData(ctx context.Context) error {
 	s, dc := r.Screen, r.Docker
-	vols, binds := r.dataTargets()
+	vols, binds := dataTargets(r.writes())
 	nv, nb := 0, 0
 	for _, v := range r.m.Volumes {
 		if !vols[v.Name] {
@@ -242,7 +242,7 @@ func (r *run) restoreLink(link, target string) error {
 // installProject 把 Compose 项目目录和它引用的目录外文件放回原来的位置。逐个文件
 // 安装（合并），不删除新服务器上这个目录里原有的其他文件；DockHop 自己的目录不动。
 func (r *run) installProject(p bundle.Project) error {
-	skip := func(path string) bool { return within(path, r.Home) || within(path, r.workdir) }
+	skip := func(path string) bool { return spec.Within(path, r.Home) || spec.Within(path, r.workdir) }
 	if p.DirParts > 0 {
 		if err := r.extractAndInstall("compose/"+p.Name+"/dir", p.DirParts, p.WorkingDir, skip); err != nil {
 			return err

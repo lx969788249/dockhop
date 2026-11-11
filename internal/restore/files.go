@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -277,12 +276,6 @@ func copyEntry(src, dst string, info fs.FileInfo) error {
 		return nil // 设备文件、socket 不复制
 	}
 	return applyMeta(dst, metaOf(info))
-}
-
-// within 表示 p 是否就是 dir 或在 dir 里面。
-func within(p, dir string) bool {
-	p, dir = filepath.Clean(p), filepath.Clean(dir)
-	return p == dir || strings.HasPrefix(p, dir+string(filepath.Separator))
 }
 
 // clearDir 删除目录里的全部内容（保留目录本身）。在临时容器里运行，用来清空数据卷。

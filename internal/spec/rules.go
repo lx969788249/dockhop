@@ -89,6 +89,12 @@ func IsDockerSocket(p string) bool {
 	return base == "docker.sock" || base == "podman.sock" || base == "containerd.sock"
 }
 
+// Within 表示 p 是否就是 dir 或在 dir 里面（按路径层级，不按字符串前缀）。
+func Within(p, dir string) bool {
+	p, dir = path.Clean(p), path.Clean(dir)
+	return dir == "/" || p == dir || strings.HasPrefix(p, dir+"/")
+}
+
 // PathsOverlap 表示两个路径是否相同或一个在另一个里面（按路径层级，不按字符串前缀）。
 func PathsOverlap(a, b string) bool {
 	a, b = path.Clean(a), path.Clean(b)

@@ -293,11 +293,52 @@ type Options struct {
 	LocalWork func(w Writes, t *Target) []string
 }
 
-// Writes 是按眼下的选择，这次迁入要写到新服务器上的东西：跳过的容器独占的、保留已有的不算。
+// Writes 是按眼下的选择，这次迁入要写到新服务器上的东西（见 WritesOf）。
 type Writes struct {
-	Binds    []string // 宿主机上的目录和文件（真实路径）
-	Projects []string // Compose 项目
-	Volumes  []string // 数据卷，包括匿名卷
+	Binds    []string             // 宿主机上的目录和文件（迁移计划里记的真实路径）
+	Projects []bundle.PlanProject // 要放文件的 Compose 项目：项目目录和项目目录外的文件
+	Volumes  []string             // 数据卷，包括匿名卷；检查时选了保留已有的不算
+}
+
+// WritesOf 是按迁移计划，要迁入的容器（migrating）会写到新服务器上的东西：它们挂载的目录和数据卷，
+// 它们所在的 Compose 项目，以及装着项目目录的挂载目录（项目文件放在它里面，随它一起放回去）。跳过的
+// 容器独占的不算。迁入前检查和迁入都按它，不各算各的。
+func WritesOf(plan *bundle.Plan, d *Decisions, migrating []bundle.PlanContainer) Writes {
+	usedV, usedB, projects := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for _, c := range migrating {
+		for _, v := range c.Volumes {
+			usedV[v] = true
+		}
+		for _, b := range c.Binds {
+			usedB[b] = true
+		}
+		if c.Project != "" {
+			projects[c.Project] = true
+		}
+	}
+	var w Writes
+	for _, p := range plan.Projects {
+		if !projects[p.Name] {
+			continue
+		}
+		w.Projects = append(w.Projects, p)
+		for _, b := range plan.Binds {
+			if spec.Within(p.WorkingDir, b.Path) {
+				usedB[b.Path] = true
+			}
+		}
+	}
+	for _, b := range plan.Binds {
+		if usedB[b.Path] {
+			w.Binds = append(w.Binds, b.Path)
+		}
+	}
+	for _, v := range plan.Volumes {
+		if usedV[v.Name] && !d.KeepVolume(v.Name) {
+			w.Volumes = append(w.Volumes, v.Name)
+		}
+	}
+	return w
 }
 
 var archAlias = map[string]string{"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64",
@@ -328,20 +369,18 @@ func Evaluate(plan *bundle.Plan, t *Target, d *Decisions, o Options) *Result {
 		}
 	}
 	res.Containers = len(containers)
-	usedVolumes := map[string]bool{}
-	usedBinds := map[string]bool{}
-	for _, c := range containers {
-		for _, v := range c.Volumes {
-			usedVolumes[v] = true
-		}
-		for _, b := range c.Binds {
-			usedBinds[b] = true
-		}
+	w := WritesOf(plan, d, containers)
+	usedVolumes, usedBinds := map[string]bool{}, map[string]bool{}
+	for _, v := range w.Volumes {
+		usedVolumes[v] = true
+	}
+	for _, b := range w.Binds {
+		usedBinds[b] = true
 	}
 
 	dockerIssues(plan, t, containers, addIssue)
 	if !t.Local && o.LocalWork != nil {
-		if what := o.LocalWork(planWrites(plan, d, containers, usedVolumes, usedBinds), t); len(what) > 0 {
+		if what := o.LocalWork(w, t); len(what) > 0 {
 			addIssue(Issue{Level: Stop, Kind: "remote_docker",
 				Title: "Docker 不在这台服务器上（DOCKER_HOST 指向了别的机器），没法在 Docker 所在的服务器上" + strings.Join(what, "、"),
 				Hint:  "请在 Docker 所在的服务器上直接运行 DockHop"})
@@ -383,28 +422,6 @@ func dockerIssues(plan *bundle.Plan, t *Target, containers []bundle.PlanContaine
 			Title: fmt.Sprintf("新服务器的 docker-compose 是老版本 %s，旧服务器用的是 Compose %s；有些写法老版本读不懂，迁入时可能失败（失败会自动删除迁入的内容）。"+
 				"建议先在新服务器安装新版 Docker Compose", t.Compose, plan.Source.Compose)})
 	}
-}
-
-// planWrites 按迁移计划和眼下的选择，算出这次迁入要写到新服务器上的东西（见 Writes）：要迁入的容器
-// （containers）用到的目录、Compose 项目和数据卷，保留已有的数据卷不算。
-func planWrites(plan *bundle.Plan, d *Decisions, containers []bundle.PlanContainer, usedVolumes, usedBinds map[string]bool) Writes {
-	var w Writes
-	for _, b := range plan.Binds {
-		if usedBinds[b.Path] {
-			w.Binds = append(w.Binds, b.Path)
-		}
-	}
-	for _, c := range containers {
-		if c.Project != "" && !slices.Contains(w.Projects, c.Project) {
-			w.Projects = append(w.Projects, c.Project)
-		}
-	}
-	for _, v := range plan.Volumes {
-		if usedVolumes[v.Name] && !d.KeepVolume(v.Name) {
-			w.Volumes = append(w.Volumes, v.Name)
-		}
-	}
-	return w
 }
 
 // hardwareIssues 检查要迁入的容器要用的运行环境、显卡、设备和卷插件新服务器上有没有，内存够不够。

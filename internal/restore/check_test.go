@@ -121,7 +121,7 @@ func TestLocalWork(t *testing.T) {
 		{"替换已有的卷", preflight.Writes{Volumes: []string{"data"}}, "替换已有的数据卷"},
 		{"写进匿名卷", preflight.Writes{Volumes: []string{anon}}, "替换已有的数据卷"},
 		{"新建的卷", preflight.Writes{Volumes: []string{"fresh"}}, ""},
-		{"目录和项目", preflight.Writes{Binds: []string{"/srv/web"}, Projects: []string{"site"}, Volumes: []string{"fresh"}}, "放目录 放 Compose 项目文件"},
+		{"目录和项目", preflight.Writes{Binds: []string{"/srv/web"}, Projects: []bundle.PlanProject{{Name: "site"}}, Volumes: []string{"fresh"}}, "放目录 放 Compose 项目文件"},
 	} {
 		if got := strings.Join(localWork(c.w, tg), " "); got != c.want {
 			t.Errorf("%s：%q，应为 %q", c.name, got, c.want)

@@ -13,6 +13,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/crypto"
 	"github.com/lx969788249/dockhop/internal/preflight"
+	"github.com/lx969788249/dockhop/internal/spec"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -147,7 +148,7 @@ func (r *run) scan() error {
 			return err
 		}
 		for _, l := range b.AllLinks() {
-			if !filepath.IsAbs(l.Link) || filepath.Clean(l.Link) != l.Link || l.Link == "/" || !within(l.Target, b.Path) {
+			if !filepath.IsAbs(l.Link) || filepath.Clean(l.Link) != l.Link || l.Link == "/" || !spec.Within(l.Target, b.Path) {
 				return fmt.Errorf("迁移包里目录 %s 的软链接不对：%q → %q", b.Path, l.Link, l.Target)
 			}
 		}
@@ -237,14 +238,14 @@ func (r *run) checkProject(ctx context.Context, p bundle.Project) error {
 	var args []string
 	for _, f := range files {
 		if filepath.IsAbs(f) {
-			if !within(f, p.WorkingDir) {
+			if !spec.Within(f, p.WorkingDir) {
 				r.Log.Printf("Compose 项目 %s 的配置文件 %s 不在项目目录里，跳过检查", p.Name, f)
 				return nil
 			}
 			f, _ = filepath.Rel(p.WorkingDir, f)
 		}
 		f = filepath.Join(stage, f)
-		if !within(f, stage) {
+		if !spec.Within(f, stage) {
 			r.Log.Printf("Compose 项目 %s 的配置文件 %s 不在项目目录里，跳过检查", p.Name, f)
 			return nil
 		}

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/logging"
@@ -158,7 +159,7 @@ func (r *run) counterparts(existing []docker.ContainerSummary) preflight.Counter
 func (r *run) findWriters(ctx context.Context, existing []docker.ContainerSummary) ([]writer, error) {
 	s := r.Screen
 	match := r.counterparts(existing)
-	volumes, dirs := r.writeSet()
+	volumes, dirs := writeSet(r.writes())
 	paths := realPaths(dirs)
 	self, _ := os.Hostname()
 	ignore := map[string]bool{}
@@ -322,19 +323,34 @@ func (r *run) checkStoppable(ctx context.Context) error {
 	return nil
 }
 
-// dataTargets 是这次要写入的数据卷和目录。
-func (r *run) dataTargets() (map[string]bool, []string) {
-	vols := map[string]bool{}
-	var binds []string
-	usedV, usedB := r.usedData()
-	for _, v := range r.m.Volumes {
-		if !v.Anonymous && usedV[v.Name] && !r.d.KeepVolume(v.Name) {
-			vols[v.Name] = true
+// writes 是这次迁入要写到新服务器上的东西，和迁入前检查按同一份迁移计划算（见 preflight.WritesOf）。
+func (r *run) writes() preflight.Writes {
+	names := map[string]bool{}
+	for _, it := range r.items {
+		names[it.m.Name] = true
+	}
+	var migrating []bundle.PlanContainer
+	for _, c := range r.plan.Containers {
+		if names[c.Name] {
+			migrating = append(migrating, c)
 		}
 	}
-	for _, b := range r.m.Binds {
-		if usedB[b.Path] && !spec.IsSystemPath(b.Path) {
-			binds = append(binds, b.Path)
+	return preflight.WritesOf(r.plan, &r.d, migrating)
+}
+
+// dataTargets 是 w 里要写入数据的有名字的数据卷（匿名卷随容器新建）和目录（系统路径只重建挂载、
+// 不覆盖，见 restoreData）。
+func dataTargets(w preflight.Writes) (map[string]bool, []string) {
+	vols := map[string]bool{}
+	for _, v := range w.Volumes {
+		if !spec.IsAnonymousVolume(v) {
+			vols[v] = true
+		}
+	}
+	var binds []string
+	for _, b := range w.Binds {
+		if !spec.IsSystemPath(b) {
+			binds = append(binds, b)
 		}
 	}
 	return vols, binds
@@ -344,16 +360,16 @@ func (r *run) dataTargets() (map[string]bool, []string) {
 // Compose 项目的目录和项目目录外的文件是 p:项目名。
 type writeTarget struct{ key, path string }
 
-// writeSet 是迁入要写入的全部地方：数据卷，以及宿主机上的挂载目录、Compose 项目目录和
-// 项目目录外的文件。新服务器上和它们共用数据的已有容器要先停下（保留的服务则不能迁入），
-// 分组时也和写入它们的服务放在一组。
-func (r *run) writeSet() (map[string]bool, []writeTarget) {
-	vols, binds := r.dataTargets()
+// writeSet 是 w 里要写入的全部地方：数据卷，以及宿主机上的挂载目录、Compose 项目目录和项目目录外的
+// 文件。新服务器上和它们共用数据的已有容器要先停下（保留的服务则不能迁入），分组时也和写入它们的服务
+// 放在一组。
+func writeSet(w preflight.Writes) (map[string]bool, []writeTarget) {
+	vols, binds := dataTargets(w)
 	var dirs []writeTarget
 	for _, b := range binds {
 		dirs = append(dirs, writeTarget{"b:" + b, b})
 	}
-	for _, p := range r.projects {
+	for _, p := range w.Projects {
 		for _, path := range append([]string{p.WorkingDir}, p.Outside...) {
 			if !spec.IsSystemPath(path) {
 				dirs = append(dirs, writeTarget{"p:" + p.Name, path})
@@ -361,40 +377,6 @@ func (r *run) writeSet() (map[string]bool, []writeTarget) {
 		}
 	}
 	return vols, dirs
-}
-
-// usedData 是要迁入的容器用到的卷和目录（被跳过的容器独占的数据不写入）。
-func (r *run) usedData() (map[string]bool, map[string]bool) {
-	vols, binds := map[string]bool{}, map[string]bool{}
-	bindOf := map[string]string{}
-	for _, b := range r.m.Binds {
-		bindOf[b.Path] = b.Path
-		for _, l := range b.AllLinks() {
-			bindOf[l.Link] = b.Path
-		}
-	}
-	for _, it := range r.items {
-		for _, m := range it.c.Mounts {
-			switch m.Type {
-			case "volume":
-				vols[m.Name] = true
-			case "bind":
-				for src, real := range bindOf {
-					if m.Source == src || strings.HasPrefix(m.Source, src+"/") {
-						binds[real] = true
-					}
-				}
-			}
-		}
-	}
-	for _, p := range r.projects {
-		for _, b := range r.m.Binds {
-			if within(p.WorkingDir, b.Path) {
-				binds[b.Path] = true // 项目目录在这个挂载目录里面
-			}
-		}
-	}
-	return vols, binds
 }
 
 // realPaths 是这些要写的地方的实际位置（解析软链接之后），和容器挂载的路径比较用（见 spec.UsesData）。

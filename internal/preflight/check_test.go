@@ -292,9 +292,9 @@ func TestEvaluateRemoteDocker(t *testing.T) {
 	if i == nil || i.Level != Stop || !strings.Contains(i.Title, "放目录、放 Compose 项目文件") {
 		t.Fatalf("应停下并说明要做的事：%+v", i)
 	}
-	want := Writes{Binds: []string{"/srv/web"}, Projects: []string{"site"}}
-	if len(got) != 1 || !slices.Equal(got[0].Binds, want.Binds) || !slices.Equal(got[0].Projects, want.Projects) || len(got[0].Volumes) != 0 {
-		t.Errorf("交给迁入的：%+v，应为 %+v", got, want)
+	if len(got) != 1 || !slices.Equal(got[0].Binds, []string{"/srv/web"}) || len(got[0].Projects) != 1 || got[0].Projects[0].Name != "site" ||
+		len(got[0].Volumes) != 0 {
+		t.Errorf("交给迁入的：%+v，应为目录 /srv/web、项目 site、没有卷", got)
 	}
 	o.LocalWork = func(Writes, *Target) []string { return nil }
 	if i := find(Evaluate(p, tg, d, o), "remote_docker"); i != nil {
@@ -348,6 +348,46 @@ func TestEvaluateDiskCountsVolumeBackups(t *testing.T) {
 	}
 	if i := find(Evaluate(testPlan(), tg, &Decisions{}, o), "disk_rollback"); i == nil || i.Level != Ask || !strings.Contains(i.Title, "3GB") {
 		t.Errorf("DockHop 的目录在另一块磁盘上：单独看那块：%+v", i)
+	}
+}
+
+// 项目目录在迁移的挂载目录里面时，项目文件随这个目录一起放回去：没有容器直接挂载它，也是要写的目录，
+// 要一样检查（迁入前检查和迁入按同一份清单，见 WritesOf）。以前迁入前检查只看容器挂载的，漏查它。
+func TestEvaluateBindHoldingProject(t *testing.T) {
+	p := &bundle.Plan{
+		Containers: []bundle.PlanContainer{{Name: "site-web-1", Project: "site", NetworkMode: "bridge"}},
+		Projects:   []bundle.PlanProject{{Name: "site", Services: []string{"web"}, WorkingDir: "/srv/app/compose"}},
+		Binds:      []bundle.PlanBind{{Path: "/srv/app"}},
+	}
+	tg := testTarget()
+	tg.Link = func(path string) string {
+		if path == "/srv/app" {
+			return "/mnt/disk"
+		}
+		return ""
+	}
+	if i := find(Evaluate(p, tg, &Decisions{}, Options{}), "bind_link"); i == nil || i.Level != Stop {
+		t.Errorf("装着项目目录的挂载目录也要检查：%+v", i)
+	}
+}
+
+// WritesOf 是迁入要写到新服务器上的东西：要迁入的容器挂载的目录和数据卷（检查时选了保留已有的数据卷
+// 不算）、它们的 Compose 项目，以及装着项目目录的挂载目录。跳过的容器独占的不算。
+func TestWritesOf(t *testing.T) {
+	plan := &bundle.Plan{
+		Containers: []bundle.PlanContainer{
+			{Name: "solo", Volumes: []string{"data", "kept"}, Binds: []string{"/srv/solo"}},
+			{Name: "site-web-1", Project: "site", Volumes: []string{"site_db"}},
+			{Name: "skipped", Volumes: []string{"other"}, Binds: []string{"/srv/other"}},
+		},
+		Projects: []bundle.PlanProject{{Name: "site", WorkingDir: "/srv/apps/site", Outside: []string{"/etc/site.env"}}},
+		Volumes:  []bundle.PlanVolume{{Name: "data"}, {Name: "kept"}, {Name: "site_db"}, {Name: "other"}},
+		Binds:    []bundle.PlanBind{{Path: "/srv/apps"}, {Path: "/srv/solo"}, {Path: "/srv/other"}},
+	}
+	w := WritesOf(plan, &Decisions{KeepVolumes: []string{"kept"}}, plan.Containers[:2])
+	if !slices.Equal(w.Binds, []string{"/srv/apps", "/srv/solo"}) || !slices.Equal(w.Volumes, []string{"data", "site_db"}) ||
+		len(w.Projects) != 1 || w.Projects[0].Name != "site" {
+		t.Errorf("要写的：%+v", w)
 	}
 }
 

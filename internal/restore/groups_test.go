@@ -36,6 +36,18 @@ func TestBuildGroups(t *testing.T) {
 		Projects: []bundle.Project{{Name: "blog", WorkingDir: "/srv/blog/app"}},
 	}}
 	r.projects = r.m.Projects
+	// 迁移计划里记的和迁移包里的一致（见 preflight.WritesOf）。
+	r.plan = &bundle.Plan{
+		Containers: []bundle.PlanContainer{
+			{Name: "web", Binds: []string{"/srv/shared"}}, {Name: "nginx", Binds: []string{"/srv/shared", "/var/run/docker.sock"}},
+			{Name: "blog-app-1", Project: "blog"}, {Name: "blog-db-1", Project: "blog", Volumes: []string{"dbdata"}},
+			{Name: "files", Binds: []string{"/srv/blog"}}, {Name: "redis", Volumes: []string{"cache"}}, {Name: "exporter"},
+			{Name: "alone", Binds: []string{"/var/run/docker.sock"}},
+		},
+		Projects: []bundle.PlanProject{{Name: "blog", WorkingDir: "/srv/blog/app"}},
+		Volumes:  []bundle.PlanVolume{{Name: "dbdata"}, {Name: "cache"}},
+		Binds:    []bundle.PlanBind{{Path: "/srv/shared"}, {Path: "/srv/blog"}, {Path: "/var/run/docker.sock"}},
+	}
 	r.items = []*citem{
 		mk("web", "", `{"Mounts":[{"Type":"bind","Source":"/srv/shared/html"}],"NetworkSettings":{"Networks":{"bridge":{}}}}`),
 		mk("nginx", "", `{"Mounts":[{"Type":"bind","Source":"/srv/shared"},{"Type":"bind","Source":"/var/run/docker.sock"}]}`),

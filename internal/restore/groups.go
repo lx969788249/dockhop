@@ -199,7 +199,10 @@ func (r *run) linkPlaces(uf unionFind, binds []bundle.Bind) {
 // linkWriters 把迁入时要临时停下的已有容器（writers）和它共用的数据卷、目录合到一组。借用别的要停下的
 // 容器的网络、进程空间的，和它在同一组：放回它之前，借用的不能先启动。
 func (r *run) linkWriters(uf unionFind, writers []writer) {
-	vols, targets := r.writeSet()
+	if len(writers) == 0 {
+		return
+	}
+	vols, targets := writeSet(r.writes())
 	for _, w := range writers {
 		k := "w:" + w.summary.Name()
 		uf.find(k)

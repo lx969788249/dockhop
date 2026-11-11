@@ -22,8 +22,8 @@ import (
 // 迁入要写到的地方包括 Compose 项目的目录和项目目录外的文件：新服务器上用着它们的已有容器
 // 要先停下，保留的服务则不能迁入（不然项目文件会盖掉它正在用的配置）。
 func TestWriteSetIncludesProjectFiles(t *testing.T) {
-	r := &run{m: &bundle.Manifest{}, projects: []bundle.Project{{Name: "blog", WorkingDir: "/srv/blog", Outside: []string{"/etc/blog.env"}}}}
-	vols, dirs := r.writeSet()
+	w := preflight.Writes{Projects: []bundle.PlanProject{{Name: "blog", WorkingDir: "/srv/blog", Outside: []string{"/etc/blog.env"}}}}
+	vols, dirs := writeSet(w)
 	if len(vols) != 0 || fmt.Sprint(dirs) != "[{p:blog /srv/blog} {p:blog /etc/blog.env}]" {
 		t.Fatalf("要写的地方：%v %v", vols, dirs)
 	}
