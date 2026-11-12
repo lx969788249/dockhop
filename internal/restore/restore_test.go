@@ -35,7 +35,6 @@ func TestCancelWhileChecking(t *testing.T) {
 	var out bytes.Buffer
 	var counted []string
 	err := Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: t.TempDir(),
-		Getenv:    func(string) string { return "" },
 		Succeeded: func() { counted = append(counted, "成功") }, Failed: func() { counted = append(counted, "失败") },
 	}, Options{Link: link, Yes: true})
 	if !errors.Is(err, ui.ErrCancelled) || !strings.Contains(out.String(), "已取消，这台服务器上什么都没有改动") || strings.Contains(out.String(), "✗") {
@@ -55,7 +54,6 @@ func TestStopBeforeChangeNotCounted(t *testing.T) {
 	var out bytes.Buffer
 	var counted []string
 	err := Run(context.Background(), Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: t.TempDir(),
-		Getenv:    func(string) string { return "" },
 		Succeeded: func() { counted = append(counted, "成功") }, Failed: func() { counted = append(counted, "失败") },
 	}, Options{Link: link, Yes: true})
 	if !errors.Is(err, ui.ErrReported) || !strings.Contains(out.String(), "❌ 迁入失败") || len(counted) > 0 {
@@ -150,8 +148,7 @@ func TestCancelDuringRecovery(t *testing.T) {
 			dc := fake.Client()
 			link, _ := crypto.NewLink("127.0.0.1", 1)
 			var out bytes.Buffer
-			err = Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: home,
-				Getenv: func(string) string { return "" }}, Options{Link: link, Yes: true})
+			err = Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: home}, Options{Link: link, Yes: true})
 			_, statErr := os.Stat(journalPath(dir))
 			text := out.String()
 			if errors.Is(err, ui.ErrCancelled) || !errors.Is(err, ui.ErrReported) || strings.Contains(text, "什么都没有改动") {
@@ -197,8 +194,7 @@ func TestRestoreKeepsRunningExportHelper(t *testing.T) {
 	dc := fake.Client()
 	link, _ := crypto.NewLink("127.0.0.1", 1)
 	var out bytes.Buffer
-	Run(context.Background(), Deps{Docker: dc, Home: home, Screen: ui.New(&out, false, nil), Prompt: ui.NewPrompter(nil, &out),
-		Getenv: func(string) string { return "" }}, Options{Link: link})
+	Run(context.Background(), Deps{Docker: dc, Home: home, Screen: ui.New(&out, false, nil), Prompt: ui.NewPrompter(nil, &out)}, Options{Link: link})
 	if len(deleted) > 0 {
 		t.Errorf("删除了 %v", deleted)
 	}

@@ -160,7 +160,7 @@ func (r *run) stopSources(ctx context.Context, col *collected) error {
 	if err := stopContainers(ctx, r.Docker, waves, s); err != nil {
 		return &ui.Failure{Err: err, Hint: "执行 docker ps 检查容器状态"}
 	}
-	r.testPause(ctx, "after-stop")
+	r.Test.PauseAt(ctx, r.Home, "after-stop")
 	return nil
 }
 

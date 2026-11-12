@@ -82,7 +82,7 @@ func (r *migrate) restoreData(ctx context.Context) error {
 		}
 		rc.Close()
 		p.Done(werr)
-		if werr == nil && r.testFail("volume:"+v.Name) {
+		if werr == nil && r.Test.Fails("volume:"+v.Name) {
 			werr = errors.New("（测试）模拟写入失败")
 		}
 		if werr != nil {
@@ -112,10 +112,10 @@ func (r *migrate) restoreData(ctx context.Context) error {
 		}
 	}
 	r.in("")
-	if r.testFail("after-data") {
+	if r.Test.Fails("after-data") {
 		return &ui.Failure{Reason: "（测试）模拟恢复数据之后失败"}
 	}
-	r.testPause(ctx, "after-data")
+	r.Test.PauseAt(ctx, r.Home, "after-data")
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -192,7 +192,7 @@ func (r *migrate) restoreBind(ctx context.Context, b bundle.Bind) error {
 	err = bundle.ExtractTree(io.TeeReader(rc, p), swap.stage)
 	rc.Close()
 	p.Done(err)
-	if err == nil && r.testFail("bind:"+b.Path) {
+	if err == nil && r.Test.Fails("bind:"+b.Path) {
 		err = errors.New("（测试）模拟写入失败")
 	}
 	if err != nil {

@@ -176,7 +176,8 @@ go test ./...                                # 单元测试
 go test ./internal/ui -update                # 屏幕输出改了以后，更新快照
 scripts/build.sh 0.0.0-dev dist              # 编译三个架构，生成带校验值的 run.sh
 go test -c -tags integration -o dockhop.test ./test/integration
-sudo DOCKHOP_BIN=… ./dockhop.test -test.v    # 在真实 Docker 上的验收测试（需要 root）
+CGO_ENABLED=0 go build -tags testpoint -o dockhop ./cmd/dockhop   # 测试版：认测试用的设置（模拟失败、中断）
+sudo DOCKHOP_BIN=$PWD/dockhop ./dockhop.test -test.v              # 在真实 Docker 上的验收测试（需要 root）
 test/apps/run.sh wordpress                   # 在两台模拟服务器之间迁移一个真实应用
 ```
 

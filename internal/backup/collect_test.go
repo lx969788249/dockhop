@@ -70,7 +70,7 @@ func TestSharedWritersIncludeUnlisted(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		col, err := collect(context.Background(), dc, nil, inv, &selection{units: inv.units, items: inv.units[0].items}, s, nil)
+		col, err := collect(context.Background(), dc, nil, inv, &selection{units: inv.units, items: inv.units[0].items}, s)
 		switch {
 		case want == "停止" && (err != nil || len(col.shared) != 1 || col.shared[0].name() != "writer"):
 			t.Errorf("临时容器应一起停止：%v", err)
@@ -139,7 +139,7 @@ func TestSharedWritersIncludeProjectFiles(t *testing.T) {
 	if app == nil {
 		t.Fatalf("没认出 Compose 项目：%+v", inv.units)
 	}
-	col, err := collect(context.Background(), dc, nil, inv, &selection{units: []*unit{app}, items: app.items}, s, nil)
+	col, err := collect(context.Background(), dc, nil, inv, &selection{units: []*unit{app}, items: app.items}, s)
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out.String())
 	}
@@ -229,7 +229,7 @@ func TestRecheckBeforeStop(t *testing.T) {
 					web = u
 				}
 			}
-			col, err := collect(context.Background(), dc, nil, inv, &selection{units: []*unit{web}, items: web.items}, s, nil)
+			col, err := collect(context.Background(), dc, nil, inv, &selection{units: []*unit{web}, items: web.items}, s)
 			if err != nil || len(col.shared) != 1 || col.shared[0].name() != "reader" {
 				t.Fatalf("读的时候要一起停的应是 reader：%v %v", col.shared, err)
 			}

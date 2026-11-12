@@ -101,7 +101,7 @@ func TestCheckStopsOnCancel(t *testing.T) {
 	}
 	defer log.Finish(logging.Failed, true)
 	r := testRun(t, Deps{Docker: dc, Prompt: ui.NewPrompter(nil, io.Discard), Log: log,
-		Home: dir, Getenv: func(string) string { return "" }}, Options{})
+		Home: dir}, Options{})
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(100*time.Millisecond, cancel)
 	start := time.Now()

@@ -172,10 +172,6 @@ func (r *run) findWriters(ctx context.Context, chk *checked, sc *scope, existing
 	volumes, dirs := writeSet(sc.writes(chk))
 	paths := realPaths(dirs)
 	self, _ := os.Hostname()
-	ignore := map[string]bool{}
-	for _, n := range strings.Split(r.Getenv("DOCKHOP_TEST_IGNORE"), ",") {
-		ignore[strings.TrimSpace(n)] = true
-	}
 	var writers, others []writer
 	for _, c := range existing {
 		name := c.Name()
@@ -183,7 +179,7 @@ func (r *run) findWriters(ctx context.Context, chk *checked, sc *scope, existing
 		if !kept && c.State != "running" && c.State != "paused" && c.State != "restarting" {
 			continue
 		}
-		if match.Replaced(name) || ignore[name] || (len(self) >= 12 && strings.HasPrefix(c.ID, self)) {
+		if match.Replaced(name) || (len(self) >= 12 && strings.HasPrefix(c.ID, self)) {
 			continue
 		}
 		full, _, err := r.Docker.InspectContainer(ctx, c.ID)

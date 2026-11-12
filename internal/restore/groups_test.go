@@ -336,7 +336,7 @@ func partialRun(t *testing.T, dir string) *migrate {
 	}
 	t.Cleanup(func() { log.Finish(logging.Failed, true) })
 	r := testMigrate(t, Deps{Docker: dc, Prompt: ui.NewPrompter(nil, io.Discard), Log: log,
-		Home: t.TempDir(), Getenv: func(string) string { return "" }}, Options{})
+		Home: t.TempDir()}, Options{})
 	r.rbDir = dir
 	r.undo = testUndo(t, dc, r.Screen)
 	r.undo.record = func(e Entry) error { return appendJournal(dir, e) }

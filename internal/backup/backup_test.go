@@ -55,7 +55,7 @@ func TestCancelWhileChecking(t *testing.T) {
 	var out bytes.Buffer
 	failed := 0
 	err := Run(ctx, Deps{Docker: dc, Screen: ui.New(&out, false, nil).WithContext(ctx), Home: t.TempDir(),
-		Getenv: func(string) string { return "" }, Failed: func() { failed++ }}, Options{})
+		Failed: func() { failed++ }}, Options{})
 	if !errors.Is(err, ui.ErrCancelled) || !strings.Contains(out.String(), "已取消，这台服务器上什么都没有改动") || strings.Contains(out.String(), "✗") {
 		t.Fatalf("应按已取消处理、不显示失败：%v\n%s", err, out.String())
 	}
@@ -75,7 +75,7 @@ func TestStopBeforeChangeNotCounted(t *testing.T) {
 	var out bytes.Buffer
 	failed := 0
 	err := Run(context.Background(), Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: t.TempDir(),
-		Getenv: func(string) string { return "" }, Failed: func() { failed++ }}, Options{})
+		Failed: func() { failed++ }}, Options{})
 	if !errors.Is(err, ui.ErrReported) || !strings.Contains(out.String(), "❌ 迁出失败") || failed != 0 {
 		t.Fatalf("应显示失败，不算一次失败（算了 %d 次）：%v\n%s", failed, err, out.String())
 	}

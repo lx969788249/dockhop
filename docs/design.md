@@ -253,7 +253,7 @@ internal/
   restore/    恢复事务：准备、数据、网络、Compose、容器、回滚、提交、中断补救
   host/       磁盘空间、挂载点、路径的真实位置、端口、对外地址、CPU 架构、权限
   helper/     读写数据卷的临时容器：标上是哪个任务建的，清理时只删自己的
-  testpoint/  给验收测试用的埋点：在指定的地方模拟失败、停住
+  testpoint/  测试用的设置：在指定的地方模拟失败、停住，改短等待；只有测试版（-tags testpoint）从环境变量读
 run.sh        一行命令的入口脚本（约 30 行）
 ```
 
@@ -553,7 +553,7 @@ https://203.0.113.7:8080/k3Jx9QmP2vLa/#a7j8zg6qtzkg8ddwxnzl94th3c4ns7ckdzjxu0w0f
 | `RESTORE_BASE`、`RESTORE_ROLLBACK_BASE`、`RESTORE_LOCK_BASE`、`DOCKER_MIGRATE_LOCK_BASE`、`DOCKER_MIGRATE_LOG_DIR` | 统一由 `DOCKHOP_HOME` 决定 |
 | `DOCKER_MIGRATE_KEEP_LOG` | `DOCKHOP_KEEP_LOG` |
 | `--verbose` | `-v` / `--verbose`（不变） |
-| `RESTORE_CONNECT_TIMEOUT`、`RESTORE_STARTUP_GRACE`、`DOCKER_MIGRATE_PROGRESS_INTERVAL`、`DOCKER_MIGRATE_PROGRESS_MODE`、`DM_PROGRESS_STALL`、`RESTORE_IGNORE_CONTAINERS`、`DOCKER_MIGRATE_IGNORE_CONTAINERS` | 只供测试使用，改为不写进文档的 `DOCKHOP_TEST_*` |
+| `RESTORE_CONNECT_TIMEOUT`、`RESTORE_STARTUP_GRACE`、`DOCKER_MIGRATE_PROGRESS_INTERVAL`、`DOCKER_MIGRATE_PROGRESS_MODE`、`DM_PROGRESS_STALL`、`RESTORE_IGNORE_CONTAINERS`、`DOCKER_MIGRATE_IGNORE_CONTAINERS` | 只供测试使用，改为不写进文档的 `DOCKHOP_TEST_*`，只有带 testpoint 标签编译的测试版认，发布的程序里没有 |
 | `DOCKER_MIGRATE_GZIP_LEVEL`、`DOCKER_MIGRATE_LIB_ONLY`、各种 `DM_*` | 不再需要 |
 
 新增：`DOCKHOP_MIRROR`（`run.sh` 下载程序用的镜像站）。`DOCKHOP_COUNT` 是 `run.sh` 交给程序的迁移次数（3.4.14），不写进用户文档。

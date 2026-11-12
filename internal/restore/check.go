@@ -2,6 +2,7 @@ package restore
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,14 +18,9 @@ import (
 // 迁入前检查：从旧服务器取来迁移计划，按它检查新服务器能不能迁入。这时还没下载、也没改动
 // 任何东西；迁移计划是检查和核对下载文件的依据，没有它不能迁入。
 
+// client 连旧服务器，最多等 15 秒（测试时可以改短）。
 func (r *run) client() *transfer.Client {
-	timeout := 15 * time.Second
-	if v := r.Getenv("DOCKHOP_TEST_CONNECT_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			timeout = d
-		}
-	}
-	return transfer.NewClient(r.opts.Link, timeout, r.Log.Printf)
+	return transfer.NewClient(r.opts.Link, cmp.Or(r.Test.ConnectTimeout, 15*time.Second), r.Log.Printf)
 }
 
 func (r *run) fetchPlan(ctx context.Context) (*bundle.Plan, error) {

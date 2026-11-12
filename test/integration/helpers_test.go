@@ -5,7 +5,8 @@
 //
 //	go test -tags integration ./test/integration -v
 //
-// DOCKHOP_BIN 指定要测试的程序；不指定时自动编译。
+// DOCKHOP_BIN 指定要测试的程序，要用测试版（go build -tags testpoint，它才认 DOCKHOP_TEST_* 这些测试用的
+// 设置）；不指定时自动编译。
 package integration
 
 import (
@@ -34,13 +35,17 @@ func TestMain(m *testing.M) {
 	if bin == "" {
 		dir, _ := os.MkdirTemp("", "dockhop-bin")
 		bin = filepath.Join(dir, "dockhop")
-		cmd := exec.Command("go", "build", "-o", bin, "../../cmd/dockhop")
+		cmd := exec.Command("go", "build", "-tags", "testpoint", "-o", bin, "../../cmd/dockhop")
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0") // 静态编译：迁入时要在临时容器里运行它
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
 			fmt.Println("编译失败：", err)
 			os.Exit(1)
 		}
+	}
+	if b, err := os.ReadFile(bin); err != nil || !bytes.Contains(b, []byte("DOCKHOP_TEST_FAIL")) {
+		fmt.Println(bin, "不是测试版，模拟不了失败、中断：要用 go build -tags testpoint 编译")
+		os.Exit(1)
 	}
 	os.Exit(m.Run())
 }

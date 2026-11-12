@@ -56,7 +56,7 @@ type Deps struct {
 	Redactor *logging.Redactor
 	Home     string
 	Version  string
-	Getenv   func(string) string
+	Test     testpoint.Settings // 测试用的设置，照常运行时是零值（见 testpoint）
 	// MountPoint 判断一个目录本身是不是挂载点：挂载点只能原地换内容。为空时用 host.IsMountPoint，
 	// 按这台机器的实际情况判断；测试时换成假的。
 	MountPoint func(path string) (bool, error)
@@ -186,7 +186,7 @@ func newRun(d Deps, o Options) *run {
 		d.MountPoint = host.IsMountPoint
 	}
 	r := &run{Deps: d, opts: o, started: time.Now(), rbDir: filepath.Join(d.Home, "rollback", "current")}
-	r.undo = &undo{dc: d.Docker, screen: d.Screen, logf: d.Log.Printf, fail: r.testFail, mountPoint: d.MountPoint,
+	r.undo = &undo{dc: d.Docker, screen: d.Screen, logf: d.Log.Printf, fail: d.Test.Fails, mountPoint: d.MountPoint,
 		record: func(e Entry) error { return appendJournal(r.rbDir, e) }}
 	return r
 }
@@ -202,13 +202,6 @@ func (r *run) cleanup(success bool) {
 	}
 	r.cleanHelpers(context.Background())
 	removeHelper(r.Home)
-}
-
-// testFail、testPause 是测试用的埋点（见 testpoint）。
-func (r *run) testFail(point string) bool { return testpoint.Fail(r.Getenv, point) }
-
-func (r *run) testPause(ctx context.Context, point string) {
-	testpoint.Pause(ctx, r.Getenv, r.Home, point)
 }
 
 // steps 按屏幕上的六个步骤依次执行各个环节。检查都在改动之前做完（begin 之前），之后对新服务器

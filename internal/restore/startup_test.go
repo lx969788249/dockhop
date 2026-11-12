@@ -16,6 +16,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/compose"
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/docker/dockertest"
+	"github.com/lx969788249/dockhop/internal/testpoint"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -101,12 +102,8 @@ esac
 	}
 	defer j.close()
 	var out bytes.Buffer
-	r := testMigrate(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: home, Getenv: func(k string) string {
-		if k == "DOCKHOP_TEST_STARTUP_GRACE" {
-			return "0s"
-		}
-		return ""
-	}}, Options{})
+	r := testMigrate(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil), Home: home,
+		Test: testpoint.Settings{StartupGrace: time.Nanosecond}}, Options{}) // 启动后不用再看
 	r.tool = tool
 	r.j = j
 	r.pkg.workdir = home

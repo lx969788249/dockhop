@@ -53,7 +53,7 @@ type Deps struct {
 	Redactor *logging.Redactor
 	Home     string
 	Version  string
-	Getenv   func(string) string
+	Test     testpoint.Settings // 测试用的设置，照常运行时是零值（见 testpoint）
 	// Failed 在停机打包之后迁出失败时调用一次，可以为空；还没改动就取消或者停下、按 Ctrl+C 中断、
 	// 传输开始之后自己结束传输时都不调用（见 ending）。之后还有收尾：显示结果。
 	Failed func()
@@ -161,7 +161,7 @@ func (r *run) steps(ctx context.Context) error {
 	s.End(r.chosen)
 
 	s.Begin(3, totalSteps, "读取配置")
-	col, err := collect(ctx, dc, tool, inv, sel, s, r.ignored())
+	col, err := collect(ctx, dc, tool, inv, sel, s)
 	if err != nil {
 		return &ui.Failure{Err: err}
 	}
@@ -293,22 +293,6 @@ func (r *run) removeTempTags() {
 		}
 	}
 	r.tempTags = left
-}
-
-// ignored 是测试时要忽略的容器（例如运行测试的容器自己）。
-func (r *run) ignored() map[string]bool {
-	m := map[string]bool{}
-	for _, n := range strings.Split(r.Getenv("DOCKHOP_TEST_IGNORE"), ",") {
-		if n = strings.TrimSpace(n); n != "" {
-			m[n] = true
-		}
-	}
-	return m
-}
-
-// testPause 是测试用的埋点（见 testpoint），用来模拟“停机期间被强制结束”。
-func (r *run) testPause(ctx context.Context, point string) {
-	testpoint.Pause(ctx, r.Getenv, r.Home, point)
 }
 
 func randomID() string {

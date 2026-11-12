@@ -172,14 +172,19 @@ func undoFile(e Entry, note func(string, ...any)) {
 	}
 }
 
-// moveOrCopy 移动文件或目录；不在同一块磁盘上时复制后删除原来的。复制先写到 dst 旁边的
-// 临时名字，完整写完才改名成 dst：回滚只看 dst 在不在，复制到一半失败或被强制结束时，
-// 不能留下一个看起来像完整备份、实际只有一半的 dst，否则回滚会拿它覆盖完整的原件。
+// moveOrCopy 移动文件或目录；不在同一块磁盘上时复制过去再删除原来的（见 copyAcross）。
 func moveOrCopy(src, dst string) error {
-	err := rename(src, dst)
+	err := os.Rename(src, dst)
 	if err == nil || !errors.Is(err, syscall.EXDEV) {
 		return err
 	}
+	return copyAcross(src, dst)
+}
+
+// copyAcross 把 src 复制到另一块磁盘上的 dst，再删除 src。复制先写到 dst 旁边的临时名字，完整写完才
+// 改名成 dst：回滚只看 dst 在不在，复制到一半失败或被强制结束时，不能留下一个看起来像完整备份、
+// 实际只有一半的 dst，否则回滚会拿它覆盖完整的原件。
+func copyAcross(src, dst string) error {
 	tmp := dst + ".dockhop-partial"
 	if err := os.RemoveAll(tmp); err != nil {
 		return err
@@ -198,9 +203,6 @@ func moveOrCopy(src, dst string) error {
 	}
 	return os.RemoveAll(src)
 }
-
-// rename 测试时换成模拟跨磁盘的版本。
-var rename = os.Rename
 
 // copyTree 复制文件或目录，保留属主、权限、修改时间和软链接。
 func copyTree(src, dst string) error {

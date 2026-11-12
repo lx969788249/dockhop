@@ -1,6 +1,7 @@
 package restore
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -35,11 +36,11 @@ type imageSource struct {
 	pull  bool   // 能从镜像仓库按摘要拉到
 }
 
-var (
+const (
 	// pullCheckTimeout 是查询一个镜像能不能拉到最多等多久（只查询、不下载）。
 	pullCheckTimeout = 15 * time.Second
 	// 拉取在 pullWindow 里进展不到 pullMinBytes（下载和解压合起来）就算卡住或太慢，
-	// 放弃拉取，改从旧服务器下载：一分钟不到 3MB，约 50KB/s。
+	// 放弃拉取，改从旧服务器下载：一分钟不到 3MB，约 50KB/s（测试时可以改短，见 testpoint.Settings）。
 	pullWindow   = time.Minute
 	pullMinBytes = int64(3 << 20)
 )
@@ -194,8 +195,9 @@ func (r *migrate) pullImage(ctx context.Context, label string, f bundle.ImageFil
 	defer cancel()
 	var activity atomic.Int64
 	var tooSlow atomic.Bool
+	window, least := cmp.Or(r.Test.PullWindow, pullWindow), cmp.Or(r.Test.PullMinBytes, pullMinBytes)
 	go func() {
-		t := time.NewTicker(pullWindow / 12)
+		t := time.NewTicker(window / 12)
 		defer t.Stop()
 		last, since := int64(0), time.Now()
 		for {
@@ -204,11 +206,11 @@ func (r *migrate) pullImage(ctx context.Context, label string, f bundle.ImageFil
 				return
 			case <-t.C:
 			}
-			if time.Since(since) < pullWindow {
+			if time.Since(since) < window {
 				continue
 			}
 			n := activity.Load()
-			if n-last < pullMinBytes {
+			if n-last < least {
 				tooSlow.Store(true)
 				cancel()
 				return
@@ -232,7 +234,7 @@ func (r *migrate) pullImage(ctx context.Context, label string, f bundle.ImageFil
 		return ctx.Err()
 	}
 	if tooSlow.Load() {
-		err = fmt.Errorf("%v 内进展不到 %dMB", pullWindow, pullMinBytes>>20)
+		err = fmt.Errorf("%v 内进展不到 %dMB", window, least>>20)
 	}
 	r.Log.Printf("从镜像仓库拉取 %s 没成功（%v），改从旧服务器下载", f.Pull, err)
 	return r.loadImageFile(ctx, label, f)

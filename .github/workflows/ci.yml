@@ -18,12 +18,16 @@ jobs:
       - name: 代码格式
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - name: go vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          go vet -tags testpoint ./...
       - name: staticcheck
         # 固定版本：用 @latest 时，staticcheck 出了新版本，没改过的代码也可能突然检查不过。
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
       - name: 单元测试
-        run: go test -race ./...
+        run: |
+          go test -race ./...
+          go test -tags testpoint ./internal/testpoint
       - name: 脚本检查
         run: |
           go install mvdan.cc/sh/v3/cmd/shfmt@v3.10.0
@@ -33,7 +37,10 @@ jobs:
           norm() { sed -E 's/^(VERSION|SHA256_[A-Z0-9]+)=".*"$/\1=""/' "$1"; }
           diff -u <(norm scripts/run.sh.in) <(norm run.sh) || { echo "run.sh 应由 scripts/run.sh.in 生成，请修改模板"; exit 1; }
       - name: 编译三个架构
-        run: scripts/build.sh 0.0.0-ci dist
+        run: |
+          scripts/build.sh 0.0.0-ci dist
+          # 测试用的设置（DOCKHOP_TEST_*）只编进测试版（-tags testpoint），发布的程序里不能有。
+          if grep -l DOCKHOP_TEST_ dist/dockhop-*; then exit 1; fi
       - name: run.sh 下载、核对、运行
         run: scripts/test-run-sh.sh dist
       - name: 在真实 Docker 上运行
@@ -62,7 +69,7 @@ jobs:
           go-version-file: go.mod
       - name: 编译
         run: |
-          CGO_ENABLED=0 go build -o "$RUNNER_TEMP/dockhop" ./cmd/dockhop
+          CGO_ENABLED=0 go build -tags testpoint -o "$RUNNER_TEMP/dockhop" ./cmd/dockhop
           CGO_ENABLED=0 go test -c -tags integration -o "$RUNNER_TEMP/dockhop.test" ./test/integration
       - name: 验收测试
         working-directory: test/integration

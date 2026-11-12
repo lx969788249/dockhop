@@ -82,7 +82,7 @@ func (r *migrate) prepare(ctx context.Context) error {
 		backedUp += len(r.sc.existingProjects[p])
 	}
 	r.in("")
-	if r.testFail("prepare") {
+	if r.Test.Fails("prepare") {
 		return &ui.Failure{Reason: "（测试）模拟备份已有服务时失败"}
 	}
 	if backedUp > 0 {

@@ -100,13 +100,12 @@ func TestWaitReadyExitedExplains(t *testing.T) {
 // 没有健康检查的容器一直在重启：等到时间才失败（它要连的服务可能还没起来），报错里说明重启了
 // 几次；每次重启记进日志。
 func TestWaitReadyRestartLoop(t *testing.T) {
-	minHealthWait = 3 * time.Second
-	t.Cleanup(func() { minHealthWait = 60 * time.Second })
 	var states []string
 	for i := 1; i <= 6; i++ {
 		states = append(states, fmt.Sprintf(`{"Id":"new-app","Name":"/app","RestartCount":%d,"State":{"Status":"restarting","ExitCode":1}}`, i))
 	}
 	_, _, r := fakeContainer(t, "nc: bad address 'db'", states...)
+	r.Test.HealthWait = 3 * time.Second
 	err := r.waitReady(context.Background(), &citem{m: bundle.Container{Name: "app"}, newID: "new-app", startedAt: time.Now()})
 	if err == nil || !strings.Contains(err.Error(), "没能稳定运行（等了 3 秒，最后的状态：正在重启，自动重启了") ||
 		!strings.Contains(err.Error(), "最后的输出：nc: bad address 'db'") {
@@ -133,8 +132,6 @@ func TestWaitReadyStableRunning(t *testing.T) {
 // 没有健康检查的容器稳定运行几秒就算就绪，之后还可能停掉。决定提交之前把就绪了的容器再查一遍：
 // 停了、在重启、不健康了的，它所在的组按没能启动处理；还在运行的不受影响。
 func TestConfirmReady(t *testing.T) {
-	minHealthWait = 3 * time.Second
-	t.Cleanup(func() { minHealthWait = 60 * time.Second })
 	old := time.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339Nano)
 	running := `{"Id":"new-app","Name":"/app","State":{"Status":"running","Running":true,"StartedAt":"` + old + `"}}`
 	restarting := `{"Id":"new-app","Name":"/app","RestartCount":1,"State":{"Status":"restarting","Running":true,"ExitCode":2}}`
@@ -156,6 +153,7 @@ func TestConfirmReady(t *testing.T) {
 		{"暂停着", []string{`{"Id":"new-app","Name":"/app","State":{"Status":"paused","Running":true,"Paused":true}}`}, ""},
 	} {
 		_, _, r := fakeContainer(t, "panic: boom", c.states...)
+		r.Test.HealthWait = 3 * time.Second
 		src := &docker.Container{}
 		src.State.Running = true
 		g := &group{id: "g", items: []*citem{{m: bundle.Container{Name: "app"}, c: src, newID: "new-app", ready: true}}}

@@ -188,7 +188,7 @@ func (c *collected) dataBytes() int64 {
 }
 
 // collect 读取选中内容的全部配置和大小。只读，不改动任何东西。
-func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *inventory, sel *selection, screen *ui.Screen, ignore map[string]bool) (*collected, error) {
+func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *inventory, sel *selection, screen *ui.Screen) (*collected, error) {
 	out := &collected{sel: sel, inv: inv}
 	usage, err := dc.VolumeUsage(ctx)
 	if err != nil {
@@ -273,7 +273,7 @@ func collect(ctx context.Context, dc *docker.Client, tool *compose.Tool, inv *in
 		out.projects = append(out.projects, p)
 	}
 
-	shared, err := sharers(inv, sel.items, out.volumeNames(), out.hostPaths(), ignore, screen)
+	shared, err := sharers(inv, sel.items, out.volumeNames(), out.hostPaths(), screen)
 	if err != nil {
 		return nil, err
 	}
@@ -451,7 +451,7 @@ func collectProject(ctx context.Context, tool *compose.Tool, u *unit, binds []*b
 // 数据前后对不上；借用要停止的容器的网络、进程空间的（如 VPN 的 sidecar），被借用的容器一停它们就断了，
 // 重启后也不会自己接回去，所以一起临时停止、再一起恢复。Swarm 服务的容器一停就会被重新创建，停不住，
 // 遇到时停下。
-func sharers(inv *inventory, sel []*item, vols map[string]bool, paths []string, ignore map[string]bool, screen *ui.Screen) ([]*item, error) {
+func sharers(inv *inventory, sel []*item, vols map[string]bool, paths []string, screen *ui.Screen) ([]*item, error) {
 	stopping := map[*item]bool{}
 	for _, it := range sel {
 		stopping[it] = true
@@ -469,7 +469,7 @@ func sharers(inv *inventory, sel []*item, vols map[string]bool, paths []string, 
 		return nil
 	}
 	for _, it := range inv.all {
-		if stopping[it] || !it.c.State.Running || ignore[it.name()] || !spec.WritesData(it.c, vols, paths) {
+		if stopping[it] || !it.c.State.Running || !spec.WritesData(it.c, vols, paths) {
 			continue
 		}
 		if err := share(it); err != nil {
@@ -479,7 +479,7 @@ func sharers(inv *inventory, sel []*item, vols map[string]bool, paths []string, 
 	for changed := true; changed; {
 		changed = false
 		for _, it := range inv.all {
-			if stopping[it] || !it.c.State.Running || ignore[it.name()] {
+			if stopping[it] || !it.c.State.Running {
 				continue
 			}
 			for _, ref := range spec.Dependencies(it.c) {
@@ -537,7 +537,7 @@ func (r *run) recheck(ctx context.Context, col *collected) error {
 			sel = append(sel, cur)
 		}
 	}
-	shared, err := sharers(now, sel, col.volumeNames(), col.hostPaths(), r.ignored(), s)
+	shared, err := sharers(now, sel, col.volumeNames(), col.hostPaths(), s)
 	if err != nil {
 		return err
 	}

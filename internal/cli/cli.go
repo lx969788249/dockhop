@@ -267,7 +267,7 @@ func runOut(env *Env, opts OutOptions) error {
 	wait := func() {} // 迁出失败时发出的计数，退出前等它结束
 	err = backup.Run(env.Context, backup.Deps{
 		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
-		Home: t.home, Version: env.Version, Getenv: env.Getenv,
+		Home: t.home, Version: env.Version, Test: t.test,
 		Failed: func() { wait = countFailed(env) },
 	}, backup.Options{Include: opts.Include, StopShared: opts.StopShared, Port: opts.Port, Host: opts.Host})
 	t.finish(err)
@@ -316,7 +316,7 @@ func runIn(env *Env, opts InOptions) error {
 	wait := func() {} // 迁入成功、失败时发出的计数，退出前等它结束
 	err = restore.Run(env.Context, restore.Deps{
 		Docker: t.docker, Screen: t.screen, Prompt: t.prompt, Log: t.log, Redactor: t.redactor,
-		Home: t.home, Version: env.Version, Getenv: env.Getenv,
+		Home: t.home, Version: env.Version, Test: t.test,
 		Succeeded: func() { wait = countSucceeded(env) },
 		Failed:    func() { wait = countFailed(env) },
 	}, restore.Options{Link: link, Yes: opts.Yes, Existing: opts.Existing, KeepSucceeded: opts.KeepSucceeded})

@@ -18,7 +18,7 @@
 #   verify.sh        在新服务器上确认这份数据还在
 #
 # 环境变量：
-#   DOCKHOP_BIN=程序          要测试的 DockHop（linux 静态编译）；不设置时自动编译
+#   DOCKHOP_BIN=程序          要测试的 DockHop（linux 静态编译的测试版，-tags testpoint）；不设置时自动编译
 #   OLD_DOCKER=27.5           旧服务器的 Docker 版本；NEW_DOCKER 同理（例如 20.10）
 #   DOCKHOP_APPS_ARTIFACTS=目录  失败时把日志复制到那里
 set -euo pipefail
@@ -450,7 +450,7 @@ for bin in docker jq; do
 done
 if [[ -z "${DOCKHOP_BIN:-}" ]]; then
   DOCKHOP_BIN="${tmp}/dockhop"
-  CGO_ENABLED=0 GOOS=linux go build -C "$ROOT_DIR" -o "$DOCKHOP_BIN" ./cmd/dockhop
+  CGO_ENABLED=0 GOOS=linux go build -C "$ROOT_DIR" -tags testpoint -o "$DOCKHOP_BIN" ./cmd/dockhop
 fi
 for v in $(printf '%s\n' "$OLD_DOCKER" "$NEW_DOCKER" | sort -u); do
   docker build -q --build-arg DIND_VERSION="$v" -t "$(host_image "$v")" -f "${APPS_DIR}/host.Dockerfile" "$APPS_DIR" >/dev/null

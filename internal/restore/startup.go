@@ -216,10 +216,10 @@ func (r *migrate) waitUnit(ctx context.Context, u *unit) error {
 		}
 	}
 	u.ready = true
-	if u.project != nil && r.testFail("project:"+u.project.Name) {
+	if u.project != nil && r.Test.Fails("project:"+u.project.Name) {
 		return r.unitError(u, errors.New("（测试）模拟项目失败"))
 	}
-	if u.project == nil && r.testFail("container:"+u.items[0].m.Name) {
+	if u.project == nil && r.Test.Fails("container:"+u.items[0].m.Name) {
 		return &ui.Failure{Reason: "（测试）模拟容器 " + u.items[0].m.Name + " 失败"}
 	}
 	return nil

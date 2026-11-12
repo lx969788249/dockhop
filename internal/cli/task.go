@@ -10,10 +10,11 @@ import (
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/host"
 	"github.com/lx969788249/dockhop/internal/logging"
+	"github.com/lx969788249/dockhop/internal/testpoint"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
-// task 是迁出、迁入共用的准备工作：日志、屏幕、提问、Docker 连接。
+// task 是迁出、迁入共用的准备工作：日志、屏幕、提问、Docker 连接，以及测试用的设置。
 type task struct {
 	env      *Env
 	home     string
@@ -23,6 +24,7 @@ type task struct {
 	screen   *ui.Screen
 	prompt   *ui.Prompter
 	docker   *docker.Client
+	test     testpoint.Settings // 只有测试版从环境变量读，发布的程序里是零值（见 testpoint.FromEnv）
 }
 
 func startTask(env *Env, kind string) (*task, error) {
@@ -31,7 +33,7 @@ func startTask(env *Env, kind string) (*task, error) {
 		env.screen.Problem(err.Error(), "设置 HOME，或者用 DOCKHOP_HOME 指定 DockHop 放文件的目录")
 		return nil, ui.ErrReported
 	}
-	t := &task{env: env, home: home, ownHome: own, redactor: &logging.Redactor{}}
+	t := &task{env: env, home: home, ownHome: own, redactor: &logging.Redactor{}, test: testpoint.FromEnv(env.Getenv)}
 	log, err := logging.Open(filepath.Join(t.home, "logs"), kind, t.redactor)
 	if err != nil {
 		// 没有日志也能继续，只是出错时没有日志可以反馈。
@@ -60,7 +62,7 @@ func startTask(env *Env, kind string) (*task, error) {
 	return t, nil
 }
 
-// finish 结束任务：按结局处理日志（见 logging.Outcome；测试时 DOCKHOP_TEST_KEEP_LOG=1 都保留），
+// finish 结束任务：按结局处理日志（见 logging.Outcome；测试要求时都保留，见 testpoint.Settings），
 // 再删掉 DockHop 目录里空了的子目录，DockHop 自己的目录整个空了就把它也删掉。迁移成功、只是看看
 // 之后，服务器上不留东西；失败时留下的日志、下载照旧留着。
 func (t *task) finish(err error) {
@@ -71,7 +73,7 @@ func (t *task) finish(err error) {
 	case errors.Is(err, ui.ErrCancelled): // 还没改动就取消了
 		outcome = logging.Cancelled
 	}
-	t.log.Finish(outcome, t.env.Getenv("DOCKHOP_TEST_KEEP_LOG") == "1")
+	t.log.Finish(outcome, t.test.KeepLog)
 	tidyHome(t.home, t.ownHome)
 }
 

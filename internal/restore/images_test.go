@@ -21,6 +21,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/crypto"
 	"github.com/lx969788249/dockhop/internal/docker"
 	"github.com/lx969788249/dockhop/internal/docker/dockertest"
+	"github.com/lx969788249/dockhop/internal/testpoint"
 	"github.com/lx969788249/dockhop/internal/transfer"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
@@ -29,9 +30,6 @@ import (
 // 仓库里查不到、本来就没有仓库摘要（自己构建的）的，从旧服务器下载。下载来的镜像加载进
 // Docker 的内容和旧服务器导出的一模一样，用完就删。
 func TestImageSources(t *testing.T) {
-	pullWindow, pullMinBytes = 300*time.Millisecond, 1<<20
-	t.Cleanup(func() { pullWindow, pullMinBytes = time.Minute, 3<<20 })
-
 	// 旧服务器：导出好的镜像文件和下载服务。
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -134,7 +132,8 @@ func TestImageSources(t *testing.T) {
 	dc := fake.Client()
 
 	var out bytes.Buffer
-	r := testMigrate(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil)}, Options{Link: link})
+	r := testMigrate(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil),
+		Test: testpoint.Settings{PullWindow: 300 * time.Millisecond, PullMinBytes: 1 << 20}}, Options{Link: link})
 	r.pkg.workdir = t.TempDir()
 	r.pkg.m = &bundle.Manifest{ImageFiles: files}
 	r.j = testJournal(t)

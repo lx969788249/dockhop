@@ -14,9 +14,6 @@ func testRun(t *testing.T, d Deps, o Options) *run {
 	if d.Screen == nil {
 		d.Screen = ui.New(io.Discard, false, nil)
 	}
-	if d.Getenv == nil {
-		d.Getenv = func(string) string { return "" }
-	}
 	if d.Home == "" {
 		d.Home = t.TempDir()
 	}

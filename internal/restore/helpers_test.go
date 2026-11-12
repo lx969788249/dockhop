@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/docker"
@@ -17,6 +18,7 @@ import (
 	"github.com/lx969788249/dockhop/internal/logging"
 	"github.com/lx969788249/dockhop/internal/preflight"
 	"github.com/lx969788249/dockhop/internal/spec"
+	"github.com/lx969788249/dockhop/internal/testpoint"
 	"github.com/lx969788249/dockhop/internal/ui"
 )
 
@@ -30,9 +32,6 @@ func testRun(t *testing.T, d Deps, o Options) *run {
 	t.Helper()
 	if d.Screen == nil {
 		d.Screen = ui.New(io.Discard, false, nil)
-	}
-	if d.Getenv == nil {
-		d.Getenv = func(string) string { return "" }
 	}
 	if d.Home == "" {
 		d.Home = t.TempDir()
@@ -139,11 +138,6 @@ func fakeContainer(t *testing.T, logs string, states ...string) (*docker.Client,
 	t.Cleanup(func() { log.Finish(logging.Failed, true) })
 	var out bytes.Buffer
 	r := testMigrate(t, Deps{Docker: dc, Screen: ui.New(&out, false, nil), Log: log, Redactor: &logging.Redactor{},
-		Getenv: func(k string) string {
-			if k == "DOCKHOP_TEST_STARTUP_GRACE" {
-				return "1s"
-			}
-			return ""
-		}}, Options{})
+		Test: testpoint.Settings{StartupGrace: time.Second}}, Options{})
 	return dc, &out, r
 }

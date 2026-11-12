@@ -1,6 +1,7 @@
 package restore
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"regexp"
@@ -20,8 +21,12 @@ import (
 // 就绪时，把容器最后的输出写进日志（之后回滚会删掉容器，就看不到了），报错里接上最能说明
 // 问题的一行。
 
-// minHealthWait 是等容器就绪至少等多久（测试时改短）。
-var minHealthWait = 60 * time.Second
+const (
+	// minHealthWait 是等容器就绪至少等多久，startupGrace 是没有健康检查的容器至少要稳定运行多久
+	// （测试时都可以改短，见 testpoint.Settings）。
+	minHealthWait = 60 * time.Second
+	startupGrace  = 3 * time.Second
+)
 
 // waitReady 等一个刚启动的容器就绪。
 func (r *run) waitReady(ctx context.Context, it *citem) error {
@@ -37,9 +42,10 @@ func (r *run) waitReady(ctx context.Context, it *citem) error {
 	}
 	hc := c.Config.Healthcheck
 	hasCheck := hc != nil && len(hc.Test) > 0 && hc.Test[0] != "NONE"
-	limit, grace, what := minHealthWait, r.startupGrace(), "确认运行"
+	wait := cmp.Or(r.Test.HealthWait, minHealthWait)
+	limit, grace, what := wait, cmp.Or(r.Test.StartupGrace, startupGrace), "确认运行"
 	if hasCheck {
-		limit, what = healthTimeout(minHealthWait, hc.StartPeriod, hc.Interval, hc.Timeout, hc.Retries), "健康检查"
+		limit, what = healthTimeout(wait, hc.StartPeriod, hc.Interval, hc.Timeout, hc.Retries), "健康检查"
 	}
 	limit += it.extra
 	if hasCheck {
@@ -112,15 +118,6 @@ func checkRule(startPeriod, interval, timeout int64, retries int) string {
 		s = "启动后 " + ui.Elapsed(time.Duration(startPeriod)) + "内不算，之后" + s
 	}
 	return "（" + s + "）"
-}
-
-func (r *run) startupGrace() time.Duration {
-	if v := r.Getenv("DOCKHOP_TEST_STARTUP_GRACE"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
-	}
-	return 3 * time.Second
 }
 
 // watch 记下等待中看到的变化，写进日志。

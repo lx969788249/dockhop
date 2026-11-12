@@ -8,20 +8,20 @@ import (
 	"time"
 )
 
-func TestFail(t *testing.T) {
-	get := func(k string) string { return map[string]string{"DOCKHOP_TEST_FAIL": "volume:db, commit-cleanup"}[k] }
-	if !Fail(get, "volume:db") || !Fail(get, "commit-cleanup") || Fail(get, "volume") || Fail(nil, "volume:db") {
+func TestFails(t *testing.T) {
+	s := Settings{Fail: []string{"volume:db", "commit-cleanup"}}
+	if !s.Fails("volume:db") || !s.Fails("commit-cleanup") || s.Fails("volume") || (Settings{}).Fails("volume:db") {
 		t.Error("只在列出的地方模拟失败")
 	}
 }
 
 // 在指定的地方停住，测试删掉标记文件后继续；别的地方不停。
-func TestPause(t *testing.T) {
+func TestPauseAt(t *testing.T) {
 	dir := t.TempDir()
-	get := func(k string) string { return map[string]string{"DOCKHOP_TEST_PAUSE": "after-stop"}[k] }
-	Pause(context.Background(), get, dir, "after-data") // 不是这里：马上返回
+	s := Settings{Pause: "after-stop"}
+	s.PauseAt(context.Background(), dir, "after-data") // 不是这里：马上返回
 	done := make(chan struct{})
-	go func() { Pause(context.Background(), get, dir, "after-stop"); close(done) }()
+	go func() { s.PauseAt(context.Background(), dir, "after-stop"); close(done) }()
 	marker := filepath.Join(dir, "test-paused-after-stop")
 	for i := 0; i < 100; i++ {
 		if _, err := os.Stat(marker); err == nil {
