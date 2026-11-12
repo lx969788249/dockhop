@@ -353,8 +353,6 @@ type exception struct {
 
 var exceptions = map[string]exception{
 	"spec Rebuild.Build": {64, 3, "不拆：平铺的一条条配置规则，各条互不相干；拆开要来回传六七个变量，反而难对照"},
-
-	"backup changesStream": {46, 5, "待整理：把一个路径的内容抄进 tar 单独成一个函数"},
 }
 
 func TestFunctions(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/lx969788249/dockhop/internal/bundle"
 	"github.com/lx969788249/dockhop/internal/compose"
+	"github.com/lx969788249/dockhop/internal/docker/dockertest"
 )
 
 // slowWriter 每写一段停一下，模拟往压缩、加密的迁移包里写一个很大的文件。
@@ -206,5 +208,64 @@ func TestApproveRootAroundProject(t *testing.T) {
 				t.Errorf("%s %s：system=%v err=%v", pol.what, c.path, system, err)
 			}
 		}
+	}
+}
+
+// 打包容器里改动过的文件：接口按每个路径的上级目录给出相对路径，改成相对于根目录（目录名带 /，硬链接的目标
+// 跟着改）；打包时已经没了的路径跳过，读不到的停下。
+func TestChangesStream(t *testing.T) {
+	archive := func(entries ...*tar.Header) []byte {
+		var b bytes.Buffer
+		tw := tar.NewWriter(&b)
+		for _, h := range entries {
+			tw.WriteHeader(h)
+			if h.Typeflag == tar.TypeReg {
+				tw.Write([]byte(strings.ToUpper(h.Name[len(h.Name)-1:])))
+			}
+		}
+		tw.Close()
+		return b.Bytes()
+	}
+	fake := dockertest.New(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/containers/app/archive" {
+			return false
+		}
+		switch r.URL.Query().Get("path") {
+		case "/etc/app/conf.d":
+			w.Write(archive(&tar.Header{Name: "conf.d/", Typeflag: tar.TypeDir, Mode: 0o755},
+				&tar.Header{Name: "conf.d/a", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1},
+				&tar.Header{Name: "conf.d/hard", Typeflag: tar.TypeLink, Linkname: "conf.d/a"}))
+		case "/var/lib/x":
+			w.Write(archive(&tar.Header{Name: "x", Typeflag: tar.TypeReg, Mode: 0o600, Size: 1}))
+		case "/gone":
+			http.NotFound(w, r)
+		default:
+			return false // /bad：Docker 内部错误
+		}
+		return true
+	})
+	dc := fake.Client()
+	rc := changesStream(context.Background(), dc, "app", []string{"/etc/app/conf.d", "/gone", "/var/lib/x"})
+	defer rc.Close()
+	var got []string
+	tr := tar.NewReader(rc)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(tr)
+		got = append(got, h.Name+"→"+h.Linkname+"="+string(body))
+	}
+	if want := "etc/app/conf.d/→= etc/app/conf.d/a→=A etc/app/conf.d/hard→etc/app/conf.d/a= var/lib/x→=X"; strings.Join(got, " ") != want {
+		t.Errorf("打包的：%v，应为 %s", got, want)
+	}
+	bad := changesStream(context.Background(), dc, "app", []string{"/bad"})
+	defer bad.Close()
+	if _, err := io.ReadAll(bad); err == nil || !strings.Contains(err.Error(), "/bad") {
+		t.Errorf("读不到时应停下：%v", err)
 	}
 }

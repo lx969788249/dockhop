@@ -148,48 +148,52 @@ func changesStream(ctx context.Context, dc *docker.Client, id string, paths []st
 		tw := tar.NewWriter(pw)
 		err := func() error {
 			for _, p := range paths {
-				rc, err := dc.GetArchive(ctx, id, p)
-				if err != nil {
-					if docker.IsNotFound(err) {
-						continue // 打包时文件已经没了
-					}
-					return fmt.Errorf("读取容器里的 %s 失败：%v", p, err)
+				if err := copyChanged(ctx, dc, id, p, tw); err != nil {
+					return err
 				}
-				// 接口返回的路径相对于 p 的上级目录，改成相对于根目录。
-				prefix := strings.TrimPrefix(path.Dir(p), "/")
-				tr := tar.NewReader(rc)
-				for {
-					h, err := tr.Next()
-					if err == io.EOF {
-						break
-					}
-					if err != nil {
-						rc.Close()
-						return err
-					}
-					h.Name = path.Join(prefix, h.Name)
-					if h.Typeflag == tar.TypeDir {
-						h.Name += "/"
-					}
-					if h.Typeflag == tar.TypeLink {
-						h.Linkname = path.Join(prefix, h.Linkname)
-					}
-					if err := tw.WriteHeader(h); err != nil {
-						rc.Close()
-						return err
-					}
-					if _, err := io.Copy(tw, tr); err != nil {
-						rc.Close()
-						return err
-					}
-				}
-				rc.Close()
 			}
 			return tw.Close()
 		}()
 		pw.CloseWithError(err)
 	}()
 	return pr
+}
+
+// copyChanged 把容器 id 里的 p（文件或目录）抄进 tw。接口返回的路径相对于 p 的上级目录，改成相对于根目录；
+// 打包时已经没了的跳过。
+func copyChanged(ctx context.Context, dc *docker.Client, id, p string, tw *tar.Writer) error {
+	rc, err := dc.GetArchive(ctx, id, p)
+	if docker.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("读取容器里的 %s 失败：%v", p, err)
+	}
+	defer rc.Close()
+	prefix := strings.TrimPrefix(path.Dir(p), "/")
+	tr := tar.NewReader(rc)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		h.Name = path.Join(prefix, h.Name)
+		if h.Typeflag == tar.TypeDir {
+			h.Name += "/"
+		}
+		if h.Typeflag == tar.TypeLink {
+			h.Linkname = path.Join(prefix, h.Linkname)
+		}
+		if err := tw.WriteHeader(h); err != nil {
+			return err
+		}
+		if _, err := io.Copy(tw, tr); err != nil {
+			return err
+		}
+	}
 }
 
 // openVolume 读出卷里的全部内容（tar 流，路径以 dockhop-data/ 开头）。用迁移涉及的
