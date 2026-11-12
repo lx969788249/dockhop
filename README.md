@@ -169,11 +169,12 @@ bash <(curl -fsSL https://dockhop.run) out --port 9000
 
 ## 参与开发
 
-DockHop 用 Go 编写，编译成一个不依赖系统库的程序。设计说明见 [docs/design.md](docs/design.md)，每个版本在设计上改了什么、为什么改见 [docs/changelog.md](docs/changelog.md)。
+DockHop 用 Go 编写，编译成一个不依赖系统库的程序。设计说明见 [docs/design.md](docs/design.md)，每个版本在设计上改了什么、为什么改见 [docs/changelog.md](docs/changelog.md)，写代码的规矩见 [CLAUDE.md](CLAUDE.md)。
 
 ```bash
 go test ./...                                # 单元测试
 go test ./internal/ui -update                # 屏幕输出改了以后，更新快照
+go test ./internal/codecheck -run Report -v   # 结构体检：复杂度最高的函数（发布前看一次）
 scripts/build.sh 0.0.0-dev dist              # 编译三个架构，生成带校验值的 run.sh
 go test -c -tags integration -o dockhop.test ./test/integration
 CGO_ENABLED=0 go build -tags testpoint -o dockhop ./cmd/dockhop   # 测试版：认测试用的设置（模拟失败、中断）
