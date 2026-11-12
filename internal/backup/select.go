@@ -246,34 +246,55 @@ func (s *selection) projectCount() int {
 // chooseUnits 决定迁移哪些：给了 --include 就按名字找，否则显示菜单让用户选。
 func chooseUnits(inv *inventory, include []string, screen *ui.Screen, prompt *ui.Prompter) ([]*unit, error) {
 	if len(include) > 0 {
-		var chosen []*unit
-		seen := map[*unit]bool{}
-		for _, name := range include {
-			it := inv.byName[name]
-			if it == nil {
-				return nil, fmt.Errorf("没有找到容器 %s（执行 docker ps -a 查看容器名）", name)
-			}
-			u := inv.unitOf[it]
-			if u == nil {
-				return nil, fmt.Errorf("容器 %s 不能迁移", name)
-			}
-			if u.project != "" && len(u.items) > 1 && !seen[u] {
-				screen.Info("%s 属于 Compose 项目 %s，项目里的 %d 个容器一起迁移", name, u.project, len(u.items))
-			}
-			if !seen[u] {
-				seen[u] = true
-				chosen = append(chosen, u)
-			}
-		}
-		return chosen, nil
+		return unitsNamed(inv, include, screen)
 	}
 	if !prompt.Interactive() {
 		return nil, fmt.Errorf("没有可以输入的终端，无法显示菜单。请用 --include 容器1,容器2 指定要迁移的容器")
 	}
 	screen.Hold()
-	// 菜单只写名字和 [ ] 里的补充说明；项目目录不显示，一长串路径只会让名字更难找。
+	question := "\n请输入要迁移的序号，多个用逗号隔开（例如 1,3），直接回车迁移全部"
+	if showMenu(inv, screen) {
+		question += "（不含面板自身）"
+	}
+	question += "："
+	var chosen []*unit
+	_, err := prompt.Ask(question, func(s string) error {
+		var err error
+		chosen, err = parseChoice(inv, s)
+		return err
+	})
+	return chosen, err
+}
+
+// unitsNamed 按 --include 给的容器名找要迁移的：在 Compose 项目里的，整个项目一起迁移（说一声）。
+func unitsNamed(inv *inventory, include []string, screen *ui.Screen) ([]*unit, error) {
+	var chosen []*unit
+	seen := map[*unit]bool{}
+	for _, name := range include {
+		it := inv.byName[name]
+		if it == nil {
+			return nil, fmt.Errorf("没有找到容器 %s（执行 docker ps -a 查看容器名）", name)
+		}
+		u := inv.unitOf[it]
+		if u == nil {
+			return nil, fmt.Errorf("容器 %s 不能迁移", name)
+		}
+		if seen[u] {
+			continue
+		}
+		if u.project != "" && len(u.items) > 1 {
+			screen.Info("%s 属于 Compose 项目 %s，项目里的 %d 个容器一起迁移", name, u.project, len(u.items))
+		}
+		seen[u] = true
+		chosen = append(chosen, u)
+	}
+	return chosen, nil
+}
+
+// showMenu 列出能迁移的单独的容器、Compose 项目，和不能迁移的，返回里面有没有面板自身。菜单只写名字和
+// [ ] 里的补充说明；项目目录不显示，一长串路径只会让名字更难找。
+func showMenu(inv *inventory, screen *ui.Screen) (panels bool) {
 	var standalone, projects []string
-	panels := false
 	width := len(strconv.Itoa(len(inv.units)))
 	for i, u := range inv.units {
 		line := fmt.Sprintf("    %*d. %s", width, i+1, u.label())
@@ -301,44 +322,40 @@ func chooseUnits(inv *inventory, include []string, screen *ui.Screen, prompt *ui
 			screen.Println("    · " + s)
 		}
 	}
-	question := "\n请输入要迁移的序号，多个用逗号隔开（例如 1,3），直接回车迁移全部"
-	if panels {
-		question += "（不含面板自身）"
-	}
-	question += "："
+	return panels
+}
+
+// parseChoice 读用户在菜单里输入的序号：逗号、中文逗号、顿号、空格都可以用来分开，重复的只算一次；直接回车是
+// 除了面板自身的全部。写错了返回错误，重新问。
+func parseChoice(inv *inventory, s string) ([]*unit, error) {
 	var chosen []*unit
-	_, err := prompt.Ask(question, func(s string) error {
-		chosen = nil
-		if strings.TrimSpace(s) == "" {
-			for _, u := range inv.units {
-				if !u.panel {
-					chosen = append(chosen, u)
-				}
-			}
-			if len(chosen) == 0 {
-				return fmt.Errorf("除了面板自身没有别的容器了，请输入序号选择")
-			}
-			return nil
-		}
-		seen := map[int]bool{}
-		// 逗号、中文逗号、顿号、空格都可以用来分开。
-		separator := func(r rune) bool { return unicode.IsSpace(r) || strings.ContainsRune(",，、", r) }
-		for _, part := range strings.FieldsFunc(s, separator) {
-			n, err := strconv.Atoi(part)
-			if err != nil || n < 1 || n > len(inv.units) {
-				return fmt.Errorf("序号 %s 不对，请输入 1 到 %d 之间的数字", part, len(inv.units))
-			}
-			if !seen[n] {
-				seen[n] = true
-				chosen = append(chosen, inv.units[n-1])
+	if strings.TrimSpace(s) == "" {
+		for _, u := range inv.units {
+			if !u.panel {
+				chosen = append(chosen, u)
 			}
 		}
 		if len(chosen) == 0 {
-			return fmt.Errorf("请至少选择一项")
+			return nil, fmt.Errorf("除了面板自身没有别的容器了，请输入序号选择")
 		}
-		return nil
-	})
-	return chosen, err
+		return chosen, nil
+	}
+	seen := map[int]bool{}
+	separator := func(r rune) bool { return unicode.IsSpace(r) || strings.ContainsRune(",，、", r) }
+	for _, part := range strings.FieldsFunc(s, separator) {
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 1 || n > len(inv.units) {
+			return nil, fmt.Errorf("序号 %s 不对，请输入 1 到 %d 之间的数字", part, len(inv.units))
+		}
+		if !seen[n] {
+			seen[n] = true
+			chosen = append(chosen, inv.units[n-1])
+		}
+	}
+	if len(chosen) == 0 {
+		return nil, fmt.Errorf("请至少选择一项")
+	}
+	return chosen, nil
 }
 
 // withDependencies 把选中容器依赖的容器（借用网络、进程、IPC，--link、
