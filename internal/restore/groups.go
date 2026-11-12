@@ -214,15 +214,20 @@ func (sc *scope) linkWriters(uf unionFind, chk *checked) {
 				}
 			}
 		}
-		for _, m := range w.full.Mounts {
-			switch {
-			case m.Type == "volume" && vols[m.Name]:
-				uf.union(k, "v:"+m.Name)
-			case m.Type == "bind":
-				for _, t := range targets {
-					if overlap(m.Source, t.path) {
-						uf.union(k, t.key)
-					}
+		linkMounts(uf, k, w.full.Mounts, vols, targets)
+	}
+}
+
+// linkMounts 把 k（一个要临时停下的已有容器）和它挂载的、要写入数据的数据卷、目录合到一组。
+func linkMounts(uf unionFind, k string, mounts []docker.Mount, vols map[string]bool, targets []writeTarget) {
+	for _, m := range mounts {
+		switch {
+		case m.Type == "volume" && vols[m.Name]:
+			uf.union(k, "v:"+m.Name)
+		case m.Type == "bind":
+			for _, t := range targets {
+				if overlap(m.Source, t.path) {
+					uf.union(k, t.key)
 				}
 			}
 		}
