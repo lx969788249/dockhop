@@ -798,6 +798,8 @@ func diskIssues(plan *bundle.Plan, t *Target, d *Decisions, o Options, usedVolum
 	return need
 }
 
+// networkIssues 检查要迁入的网络：macvlan、ipvlan 要新服务器的网卡名称一样；和新服务器上已有的网络冲突的
+// （见 networkClash）要处理；固定 IP 被占着的也要处理（见 ipIssues）。
 func networkIssues(plan *bundle.Plan, t *Target, d *Decisions, containers []bundle.PlanContainer, match Counterparts, addIssue func(Issue)) {
 	used := map[string]bool{}
 	for _, c := range containers {
@@ -816,52 +818,71 @@ func networkIssues(plan *bundle.Plan, t *Target, d *Decisions, containers []bund
 		if d.ReuseExisting(n.Name) || d.AutoSubnetFor(n.Name) {
 			continue
 		}
-		// 处理这两种问题要让网络里的容器改为自动分配 IP。Compose 项目的固定 IP 写在用户自己的
-		// 配置文件里，迁入时不会去改，所以对它们不提供这个做法，只能处理后重查或者跳过项目。
-		netIssue := func(kind, problem string) {
-			for _, c := range containers {
-				for _, cn := range c.Networks {
-					if cn.Name == n.Name && cn.IP != "" && c.Project != "" {
-						addIssue(Issue{Level: Ask, Kind: kind, Network: n.Name, Container: c.Name, Project: c.Project,
-							Title: fmt.Sprintf("%s；Compose 项目 %s 的容器 %s 在这个网络里用固定 IP %s", problem, c.Project, c.Name, cn.IP),
-							Hint:  "在新服务器上处理好这个网络，或者修改 " + c.Project + " 配置文件里的固定 IP 后重新运行"})
-						return
-					}
-				}
-			}
-			addIssue(Issue{Level: Ask, Kind: kind, Network: n.Name, Title: problem})
+		if kind, problem := networkClash(n, t); kind != "" {
+			addIssue(networkProblem(n, containers, kind, problem))
 		}
-		if have, ok := t.Networks[n.Name]; ok {
-			if !sameSet(have.Subnets, n.Subnets) || driverOf(have.Driver) != driverOf(n.Driver) {
-				netIssue("network_mismatch", fmt.Sprintf("新服务器已有同名网络 %s，但网段不同（旧服务器 %s，新服务器 %s）", n.Name, joinOr(n.Subnets, "自动"), joinOr(have.Subnets, "自动")))
-			}
+	}
+	ipIssues(t, d, containers, match, addIssue)
+}
+
+// networkClash 说明要迁入的网络 n 和新服务器上已有的网络冲突在哪里：同名、但网段或驱动不一样
+// （network_mismatch），或者网段和别的网络重叠（subnet_conflict）；不冲突时 kind 为空。
+func networkClash(n bundle.PlanNetwork, t *Target) (kind, problem string) {
+	if have, ok := t.Networks[n.Name]; ok {
+		if !sameSet(have.Subnets, n.Subnets) || driverOf(have.Driver) != driverOf(n.Driver) {
+			return "network_mismatch", fmt.Sprintf("新服务器已有同名网络 %s，但网段不同（旧服务器 %s，新服务器 %s）", n.Name, joinOr(n.Subnets, "自动"), joinOr(have.Subnets, "自动"))
+		}
+		return "", ""
+	}
+	for _, s := range n.Subnets {
+		_, mine, err := net.ParseCIDR(s)
+		if err != nil {
 			continue
 		}
-		for _, s := range n.Subnets {
-			_, mine, err := net.ParseCIDR(s)
-			if err != nil {
-				continue
-			}
-			clash := ""
-			for other, have := range t.Networks {
-				for _, hs := range have.Subnets {
-					if _, theirs, err := net.ParseCIDR(hs); err == nil && (mine.Contains(theirs.IP) || theirs.Contains(mine.IP)) {
-						clash = fmt.Sprintf("%s（%s）", other, hs)
-					}
-				}
-			}
-			if clash != "" {
-				netIssue("subnet_conflict", fmt.Sprintf("网络 %s 要用的网段 %s 和新服务器上的网络 %s 重叠", n.Name, s, clash))
-				break
+		if clash := overlapping(mine, t.Networks); clash != "" {
+			return "subnet_conflict", fmt.Sprintf("网络 %s 要用的网段 %s 和新服务器上的网络 %s 重叠", n.Name, s, clash)
+		}
+	}
+	return "", ""
+}
+
+// overlapping 是新服务器上网段和 mine 重叠的网络，写成“名字（网段）”；没有时为空。
+func overlapping(mine *net.IPNet, networks map[string]TargetNetwork) string {
+	clash := ""
+	for other, have := range networks {
+		for _, hs := range have.Subnets {
+			if _, theirs, err := net.ParseCIDR(hs); err == nil && (mine.Contains(theirs.IP) || theirs.Contains(mine.IP)) {
+				clash = fmt.Sprintf("%s（%s）", other, hs)
 			}
 		}
 	}
+	return clash
+}
+
+// networkProblem 是网络 n 的冲突（kind、problem）要问用户的那一条。处理这种问题要让网络里的容器改为
+// 自动分配 IP；Compose 项目的固定 IP 写在用户自己的配置文件里，迁入时不会去改，所以对它们不提供这个
+// 做法，只能处理后重查或者跳过项目。
+func networkProblem(n bundle.PlanNetwork, containers []bundle.PlanContainer, kind, problem string) Issue {
+	for _, c := range containers {
+		for _, cn := range c.Networks {
+			if cn.Name == n.Name && cn.IP != "" && c.Project != "" {
+				return Issue{Level: Ask, Kind: kind, Network: n.Name, Container: c.Name, Project: c.Project,
+					Title: fmt.Sprintf("%s；Compose 项目 %s 的容器 %s 在这个网络里用固定 IP %s", problem, c.Project, c.Name, cn.IP),
+					Hint:  "在新服务器上处理好这个网络，或者修改 " + c.Project + " 配置文件里的固定 IP 后重新运行"}
+			}
+		}
+	}
+	return Issue{Level: Ask, Kind: kind, Network: n.Name, Title: problem}
+}
+
+// ipIssues 找出要用的固定 IP 在新服务器上已经被别的容器占着的。迁入前会替换的已有容器（见 Counterparts）
+// 让出 IP，不算。
+func ipIssues(t *Target, d *Decisions, containers []bundle.PlanContainer, match Counterparts, addIssue func(Issue)) {
 	for _, c := range containers {
 		for _, n := range c.Networks {
 			if n.IP == "" || d.AutoIPFor(c.Name, n.Name) {
 				continue
 			}
-			// 迁入前会替换的已有容器（见 Counterparts）让出 IP。
 			holder := t.Networks[n.Name].IPs[n.IP]
 			if holder != "" && !match.Replaced(holder) {
 				addIssue(Issue{Level: Ask, Kind: "ip_conflict", Container: c.Name, Project: c.Project, Network: n.Name,
