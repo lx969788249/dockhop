@@ -5,6 +5,7 @@
 ## 下一个版本（还没发布）
 
 - 写代码的规矩落到仓库里：程序查得了的写成测试（internal/codecheck，`go test ./...` 会跑），查不了的写进 CLAUDE.md，每条写明为什么。查的有：包分层（只能用更低层的包，restore 和 backup 互不依赖）；函数的认知复杂度不超过 45、嵌套不超过 4 层；StepFailed 只在 Run；只在 cli 读环境变量；测试不改包级变量、用 testRun 这些造 run。函数不按行数划线：量下来 30 行以上的函数里，行数和认知复杂度只是中等相关（等级相关 0.61），按 100 行划线会抓到只是按顺序列出六个步骤的 backup 的 steps（130 行，复杂度 24），却漏掉最难读的 8 个里的 6 个（例如 88 行的 units、49 行的 changesStream）。复杂度和嵌套的线按本项目的分布定，抓最难读的 1%；超线的 10 个里，9 个有现成的拆分点，记为待整理，Rebuild.Build 是一条条平铺的配置规则，不拆。认知复杂度按 SonarSource 的算法，Go 里出错就返回的判断不算（不然平铺的 Go 代码会被冤枉）。
+- 拆开结构检查记为待整理的 9 个函数，每个一个提交、行为不变：迁入启动单位的依赖（units，按依赖从哪来分开）、迁入前检查的主循环（Runner.Run）、网络冲突（networkIssues）、读新服务器的情况（Collect）、迁移计划里每个容器要的条件（buildPlan）、迁出时选服务（chooseUnits）、打包容器里的改动（changesStream）、提交后的清理（cleanupCommitted）、停下的容器分组（linkWriters）。其中 Collect、chooseUnits、changesStream 和 buildPlan 逐个容器的那部分以前没有单元测试，先按拆之前的代码补了测试再拆。拆完全项目最深嵌套 4 层，99% 的函数复杂度在 34 以下（原来是 44），例外只剩不拆的 Rebuild.Build。
 
 ## v1.2.9
 
