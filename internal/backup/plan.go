@@ -32,70 +32,7 @@ func buildPlan(m *bundle.Manifest, col *collected, bundleSize int64, bundleSum s
 		p.Sizes.Binds += b.Bytes
 	}
 	for _, it := range col.sel.items {
-		c := it.c
-		pc := bundle.PlanContainer{
-			Name:         it.name(),
-			Project:      projectOf(col, it),
-			State:        stateName(c.State.Status, c.State.Paused),
-			Image:        c.Config.Image,
-			DigestPinned: strings.Contains(c.Config.Image, "@sha256:"),
-			NetworkMode:  c.HostConfig.NetworkMode,
-			Memory:       c.HostConfig.Memory,
-		}
-		if c.HostConfig.Runtime != "" && c.HostConfig.Runtime != "runc" {
-			pc.Runtime = c.HostConfig.Runtime
-		}
-		for _, r := range c.HostConfig.DeviceRequests {
-			for _, caps := range r.Capabilities {
-				for _, cp := range caps {
-					if cp == "gpu" {
-						pc.GPU = true
-					}
-				}
-			}
-			if r.Driver == "nvidia" {
-				pc.GPU = true
-			}
-		}
-		for _, d := range c.HostConfig.Devices {
-			pc.Devices = append(pc.Devices, d.PathOnHost)
-		}
-		ports := make([]string, 0, len(c.HostConfig.PortBindings))
-		for k := range c.HostConfig.PortBindings {
-			ports = append(ports, k)
-		}
-		sort.Strings(ports)
-		for _, k := range ports {
-			cport, proto, _ := strings.Cut(k, "/")
-			if proto == "" {
-				proto = "tcp"
-			}
-			for _, b := range c.HostConfig.PortBindings[k] {
-				if b.HostPort == "" {
-					continue // Docker 随机分配的端口，不会冲突
-				}
-				pc.Ports = append(pc.Ports, bundle.PlanPort{HostIP: b.HostIP, HostPort: b.HostPort, ContainerPort: cport, Proto: proto})
-			}
-		}
-		nets := make([]string, 0, len(c.NetworkSettings.Networks))
-		for n := range c.NetworkSettings.Networks {
-			nets = append(nets, n)
-		}
-		sort.Strings(nets)
-		for _, n := range nets {
-			addr := bundle.PlanNetAddr{Name: n}
-			if cfg := c.NetworkSettings.Networks[n].IPAMConfig; cfg != nil {
-				addr.IP = cfg.IPv4Address // 只有用户指定的固定 IP 才记录
-			}
-			pc.Networks = append(pc.Networks, addr)
-		}
-		for _, mt := range c.Mounts {
-			if mt.Type == "volume" {
-				pc.Volumes = append(pc.Volumes, mt.Name)
-			}
-		}
-		pc.Binds = bindsOf(c, col.binds)
-		p.Containers = append(p.Containers, pc)
+		p.Containers = append(p.Containers, planContainer(it, col))
 	}
 	for _, pr := range m.Projects {
 		p.Projects = append(p.Projects, bundle.PlanProject{Name: pr.Name, Services: pr.Services, WorkingDir: pr.WorkingDir, Outside: pr.Outside})
@@ -110,6 +47,87 @@ func buildPlan(m *bundle.Manifest, col *collected, bundleSize int64, bundleSum s
 		p.Networks = append(p.Networks, bundle.PlanNetwork{Name: n.name, Driver: n.driver, Subnets: n.subnets, Compose: n.compose})
 	}
 	return p
+}
+
+// planContainer 是迁移计划里的一个容器：新服务器要满足的条件（运行时、显卡、设备、端口、网络和固定 IP），
+// 和它要写的数据卷、目录。
+func planContainer(it *item, col *collected) bundle.PlanContainer {
+	c := it.c
+	pc := bundle.PlanContainer{
+		Name:         it.name(),
+		Project:      projectOf(col, it),
+		State:        stateName(c.State.Status, c.State.Paused),
+		Image:        c.Config.Image,
+		DigestPinned: strings.Contains(c.Config.Image, "@sha256:"),
+		NetworkMode:  c.HostConfig.NetworkMode,
+		Memory:       c.HostConfig.Memory,
+		GPU:          wantsGPU(c),
+		Ports:        planPorts(c),
+		Networks:     planNetworks(c),
+		Binds:        bindsOf(c, col.binds),
+	}
+	if c.HostConfig.Runtime != "" && c.HostConfig.Runtime != "runc" {
+		pc.Runtime = c.HostConfig.Runtime
+	}
+	for _, d := range c.HostConfig.Devices {
+		pc.Devices = append(pc.Devices, d.PathOnHost)
+	}
+	for _, mt := range c.Mounts {
+		if mt.Type == "volume" {
+			pc.Volumes = append(pc.Volumes, mt.Name)
+		}
+	}
+	return pc
+}
+
+// wantsGPU 表示容器要用显卡：--gpus（设备能力里有 gpu），或者用 nvidia 的设备驱动。
+func wantsGPU(c *docker.Container) bool {
+	for _, r := range c.HostConfig.DeviceRequests {
+		if r.Driver == "nvidia" || slices.ContainsFunc(r.Capabilities, func(caps []string) bool { return slices.Contains(caps, "gpu") }) {
+			return true
+		}
+	}
+	return false
+}
+
+// planPorts 是容器映射到宿主机的端口，按容器端口排好；Docker 随机分配的不会冲突，不记。
+func planPorts(c *docker.Container) []bundle.PlanPort {
+	keys := make([]string, 0, len(c.HostConfig.PortBindings))
+	for k := range c.HostConfig.PortBindings {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out []bundle.PlanPort
+	for _, k := range keys {
+		cport, proto, _ := strings.Cut(k, "/")
+		if proto == "" {
+			proto = "tcp"
+		}
+		for _, b := range c.HostConfig.PortBindings[k] {
+			if b.HostPort != "" {
+				out = append(out, bundle.PlanPort{HostIP: b.HostIP, HostPort: b.HostPort, ContainerPort: cport, Proto: proto})
+			}
+		}
+	}
+	return out
+}
+
+// planNetworks 是容器接的网络，按名字排好；只记用户指定的固定 IP。
+func planNetworks(c *docker.Container) []bundle.PlanNetAddr {
+	names := make([]string, 0, len(c.NetworkSettings.Networks))
+	for n := range c.NetworkSettings.Networks {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var out []bundle.PlanNetAddr
+	for _, n := range names {
+		addr := bundle.PlanNetAddr{Name: n}
+		if cfg := c.NetworkSettings.Networks[n].IPAMConfig; cfg != nil {
+			addr.IP = cfg.IPv4Address
+		}
+		out = append(out, addr)
+	}
+	return out
 }
 
 // bindsOf 是容器 c 挂载的目录在迁移包里是哪几个（binds 里的真实路径）：挂载的路径就是它、在它里面，

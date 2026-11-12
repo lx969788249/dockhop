@@ -354,7 +354,6 @@ type exception struct {
 var exceptions = map[string]exception{
 	"spec Rebuild.Build": {64, 3, "不拆：平铺的一条条配置规则，各条互不相干；拆开要来回传六七个变量，反而难对照"},
 
-	"backup buildPlan":     {59, 5, "待整理：每个容器要的东西（显卡、设备、端口、网络、卷）单独成一个函数"},
 	"backup chooseUnits":   {54, 4, "待整理：按 --include 选和在菜单里选分成两个函数"},
 	"backup changesStream": {46, 5, "待整理：把一个路径的内容抄进 tar 单独成一个函数"},
 }
