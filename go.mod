@@ -1,6 +1,6 @@
 module github.com/lx969788249/dockhop
 
-go 1.26.0
+go 1.27.4
 
 require (
 	filippo.io/age v1.3.2

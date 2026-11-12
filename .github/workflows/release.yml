@@ -36,12 +36,23 @@ jobs:
           go-version-file: go.mod
       - name: 检查版本号
         run: |
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "版本号要写成 1.2.4 这样：$VERSION" >&2
+          # 每一位都是 0 到 9，像十进制一样进位：1.2.9 之后是 1.3.0，不是 1.2.10。
+          if [[ ! "$VERSION" =~ ^[0-9]\.[0-9]\.[0-9]$ ]]; then
+            echo "版本号要写成 1.3.1 这样，每一位都是 0 到 9：$VERSION" >&2
             exit 1
           fi
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "$TAG 已经有了" >&2
+            exit 1
+          fi
+      - name: 检查 Go 是不是最新的补丁版本
+        # 发布的程序用 go.mod 定的 Go 编译。它不是官方现在维护的最新补丁版本时不发布：以前一直用 1.26.0，
+        # 后面九个带安全修复的补丁版（TLS、HTTP、tar、证书）都没进发布的程序。
+        run: |
+          have=$(go env GOVERSION)
+          latest=$(curl -fsSL --retry 3 'https://go.dev/dl/?mode=json' | jq -r '.[].version')
+          if ! grep -qx "$have" <<<"$latest"; then
+            echo "发布用的 Go 是 $have，官方现在维护的是 $(echo $latest)：先把 go.mod 里的 go 升到其中最新的补丁版本" >&2
             exit 1
           fi
       - name: 测试

@@ -17,7 +17,7 @@
 1. 修根本原因，不打补丁，不留兼容旧逻辑的代码。
 2. 修缺陷先写会失败的测试，再改代码；整理结构时行为不变。修缺陷和整理结构分开提交。
 3. 测试用的假 Docker 只用 `internal/docker/dockertest`；测试里的 run、migrate、undo 用 helpers_test.go 里的 testRun、testMigrate、testUndo 造（codecheck 查）。
-4. 改完要过：gofmt（CI 用 Go 1.26 的 gofmt）、`go vet ./...` 和 `go vet -tags testpoint ./...`、`go test ./...`。动了迁移流程的，用测试版在真实 Docker 上跑验收测试（命令见 README 的“参与开发”）。
+4. 改完要过：gofmt（用 go.mod 定的 Go 版本的：在仓库里运行 `$(go env GOROOT)/bin/gofmt`，不同版本的对齐方式偶尔不一样）、`go vet ./...` 和 `go vet -tags testpoint ./...`、`go test ./...`。动了迁移流程的，用测试版在真实 Docker 上跑验收测试（命令见 README 的“参与开发”）。
 5. 改了设计，docs/design.md 直接改成新的样子；改了什么、为什么，记在 docs/changelog.md 的“下一个版本”里。
 6. 发布前做一次结构体检：`go test ./internal/codecheck -run Report -v`，看复杂度最高的几个和例外表有没有变多，记进改动记录；“待整理”的越积越多，就先整理再加功能。
 7. 仓库是公开的：提交里不能有服务器地址、密钥、迁移链接。
