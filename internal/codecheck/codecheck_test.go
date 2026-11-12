@@ -356,7 +356,6 @@ var exceptions = map[string]exception{
 
 	"backup buildPlan":     {59, 5, "待整理：每个容器要的东西（显卡、设备、端口、网络、卷）单独成一个函数"},
 	"backup chooseUnits":   {54, 4, "待整理：按 --include 选和在菜单里选分成两个函数"},
-	"preflight Collect":    {48, 4, "待整理：容器、数据卷、网络、端口各读各的"},
 	"backup changesStream": {46, 5, "待整理：把一个路径的内容抄进 tar 单独成一个函数"},
 }
 

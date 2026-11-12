@@ -127,13 +127,33 @@ func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, e
 	for _, p := range info.Plugins.Volume {
 		t.VolumePlugins[p] = true
 	}
-	list, err := dc.Containers(ctx, true)
-	if err != nil {
+	if err := t.readContainers(ctx, dc); err != nil {
 		return nil, err
 	}
+	t.readVolumes(ctx, dc)
+	t.readNetworks(ctx, dc)
+	if ls, err := host.Listeners(); err == nil {
+		t.Listeners, t.ListenersOK = ls, true
+	}
+	if dc.Local() {
+		t.HostIPs = hostIPs()
+	}
+	t.Pullable = func(ref string) bool {
+		c, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		return dc.DistributionInspect(c, ref) == nil
+	}
+	return t, nil
+}
+
+// readContainers 读已有的容器：所在的 Compose 项目、状态、用到的数据卷和目录、对外开放的端口。
+func (t *Target) readContainers(ctx context.Context, dc *docker.Client) error {
+	list, err := dc.Containers(ctx, true)
+	if err != nil {
+		return err
+	}
 	for _, c := range list {
-		proj := c.Labels["com.docker.compose.project"]
-		tc := TargetContainer{Project: proj, State: c.State}
+		tc := TargetContainer{Project: c.Labels["com.docker.compose.project"], State: c.State}
 		for _, m := range c.Mounts {
 			switch m.Type {
 			case "volume":
@@ -149,53 +169,59 @@ func Collect(ctx context.Context, dc *docker.Client, compose string) (*Target, e
 			}
 		}
 	}
+	return nil
+}
+
+// readVolumes 读已有的数据卷；读不到的跳过。
+func (t *Target) readVolumes(ctx context.Context, dc *docker.Client) {
 	vols, err := dc.Volumes(ctx)
-	if err == nil {
-		for _, v := range vols {
-			if full, err := dc.InspectVolume(ctx, v.Name); err == nil {
-				t.Volumes[v.Name] = full
-			}
+	if err != nil {
+		return
+	}
+	for _, v := range vols {
+		if full, err := dc.InspectVolume(ctx, v.Name); err == nil {
+			t.Volumes[v.Name] = full
 		}
 	}
+}
+
+// readNetworks 读已有的网络：网段，和每个容器在里面的 IP；读不到的跳过。
+func (t *Target) readNetworks(ctx context.Context, dc *docker.Client) {
 	nets, err := dc.Networks(ctx)
-	if err == nil {
-		for _, n := range nets {
-			full, err := dc.InspectNetwork(ctx, n.ID)
-			if err != nil {
-				continue
-			}
-			tn := TargetNetwork{Driver: full.Driver, IPs: map[string]string{}}
-			for _, c := range full.IPAM.Config {
-				if c.Subnet != "" {
-					tn.Subnets = append(tn.Subnets, c.Subnet)
-				}
-			}
-			for _, c := range full.Containers {
-				ip, _, _ := strings.Cut(c.IPv4Address, "/")
-				if ip != "" {
-					tn.IPs[ip] = c.Name
-				}
-			}
-			t.Networks[full.Name] = tn
+	if err != nil {
+		return
+	}
+	for _, n := range nets {
+		full, err := dc.InspectNetwork(ctx, n.ID)
+		if err != nil {
+			continue
 		}
-	}
-	if ls, err := host.Listeners(); err == nil {
-		t.Listeners, t.ListenersOK = ls, true
-	}
-	if dc.Local() {
-		if addrs, err := net.InterfaceAddrs(); err == nil {
-			t.HostIPs = map[string]bool{}
-			for _, a := range addrs {
-				if ipn, ok := a.(*net.IPNet); ok {
-					t.HostIPs[ipn.IP.String()] = true
-				}
+		tn := TargetNetwork{Driver: full.Driver, IPs: map[string]string{}}
+		for _, c := range full.IPAM.Config {
+			if c.Subnet != "" {
+				tn.Subnets = append(tn.Subnets, c.Subnet)
 			}
 		}
+		for _, c := range full.Containers {
+			if ip, _, _ := strings.Cut(c.IPv4Address, "/"); ip != "" {
+				tn.IPs[ip] = c.Name
+			}
+		}
+		t.Networks[full.Name] = tn
 	}
-	t.Pullable = func(ref string) bool {
-		c, cancel := context.WithTimeout(ctx, 20*time.Second)
-		defer cancel()
-		return dc.DistributionInspect(c, ref) == nil
+}
+
+// hostIPs 是本机的地址；读不到时为 nil，不检查。
+func hostIPs() map[string]bool {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
 	}
-	return t, nil
+	ips := map[string]bool{}
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			ips[ipn.IP.String()] = true
+		}
+	}
+	return ips
 }
