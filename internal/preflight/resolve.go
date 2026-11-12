@@ -57,37 +57,9 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 			return nil, &ui.Failure{Reason: "读取新服务器的情况失败", Err: err}
 		}
 		res := Evaluate(plan, t, d, o)
-		var asks, stops []Issue
-		for _, i := range res.Issues {
-			switch i.Level {
-			case Note:
-				if r.firstTime(i) {
-					r.Screen.Info("%s", i.Title)
-				}
-			case Info:
-				if r.firstTime(i) {
-					r.raised = true
-					r.Screen.Warn("%s", i.Title)
-				}
-			case Ask:
-				asks = append(asks, i)
-			case Stop:
-				stops = append(stops, i)
-			}
-		}
+		asks, stops := r.classify(res.Issues)
 		if len(stops) > 0 {
-			r.Screen.Hold()
-			// 只有一个问题时，原因和建议都写在最后的结果里，这里不重复。
-			if len(stops) > 1 {
-				r.Screen.Println(fmt.Sprintf("发现 %d 个无法继续的问题，还没有下载或改动任何东西：", len(stops)))
-				for _, s := range stops {
-					r.Screen.Println("  ✗ " + s.Title)
-					if s.Hint != "" {
-						r.Screen.Println("    建议：" + s.Hint)
-					}
-				}
-			}
-			return res, &ui.Failure{Reason: stops[0].Title, Hint: stops[0].Hint}
+			return res, r.stop(stops)
 		}
 		if len(asks) == 0 {
 			return res, nil
@@ -101,46 +73,98 @@ func (r *Runner) Run(plan *bundle.Plan, d *Decisions, o Options) (*Result, error
 			}
 			auto = false
 		}
-		if !r.Prompt.Interactive() && !auto {
-			r.Screen.Hold()
-			r.Screen.Println(fmt.Sprintf("发现 %d 个需要处理的问题，还没有下载或改动任何东西：", len(asks)))
-			for _, a := range asks {
-				r.Screen.Println("  ! " + a.Title)
-				if a.Hint != "" {
-					r.Screen.Println("    建议：" + a.Hint)
-				}
-			}
-			return res, &ui.Failure{Reason: asks[0].Title,
-				Hint: "处理后重新运行；或者加上 --yes，自动采用推荐的做法（例如自动换一个空闲端口）"}
-		}
-		if !auto {
-			r.Screen.Hold()
-			r.Screen.Println(fmt.Sprintf("发现 %d 个需要处理的问题（还没有下载或改动任何东西）：", len(asks)))
-		}
-		for i, a := range asks {
-			err := r.resolve(a, d, i+1, len(asks), auto)
-			if errors.Is(err, errRecheck) {
-				break
-			}
-			if err != nil {
-				hint := "处理后用同一个链接重新迁入即可继续"
-				if auto {
-					hint = "这个问题没法自动处理，请处理后重新运行"
-				}
-				var p *ui.Failure
-				if errors.As(err, &p) {
-					return res, p
-				}
-				if errors.Is(err, errCancel) {
-					return res, &ui.Failure{Reason: "已取消：" + a.Title, Hint: hint}
-				}
-				return res, err
-			}
-		}
-		if !auto {
-			r.Screen.Println("\n重新检查……")
+		if err := r.handle(asks, d, auto); err != nil {
+			return res, err
 		}
 	}
+}
+
+// classify 把检查出的问题分开：说明和提醒当场显示（重新检查时同样的不再显示），要问的和要停下的交回去。
+func (r *Runner) classify(issues []Issue) (asks, stops []Issue) {
+	for _, i := range issues {
+		switch i.Level {
+		case Note:
+			if r.firstTime(i) {
+				r.Screen.Info("%s", i.Title)
+			}
+		case Info:
+			if r.firstTime(i) {
+				r.raised = true
+				r.Screen.Warn("%s", i.Title)
+			}
+		case Ask:
+			asks = append(asks, i)
+		case Stop:
+			stops = append(stops, i)
+		}
+	}
+	return asks, stops
+}
+
+// stop 在有没法继续的问题时停下：只有一个时，原因和建议都写在最后的结果里，这里不重复；好几个时先都列出来。
+func (r *Runner) stop(stops []Issue) error {
+	r.Screen.Hold()
+	if len(stops) > 1 {
+		r.Screen.Println(fmt.Sprintf("发现 %d 个无法继续的问题，还没有下载或改动任何东西：", len(stops)))
+		r.list("✗", stops)
+	}
+	return &ui.Failure{Reason: stops[0].Title, Hint: stops[0].Hint}
+}
+
+// handle 处理这一轮要处理的问题（auto 时自动采用推荐的做法），都处理了返回 nil，接着重新检查。不能提问、
+// 又不自动处理时，列出问题停下。
+func (r *Runner) handle(asks []Issue, d *Decisions, auto bool) error {
+	if !r.Prompt.Interactive() && !auto {
+		r.Screen.Hold()
+		r.Screen.Println(fmt.Sprintf("发现 %d 个需要处理的问题，还没有下载或改动任何东西：", len(asks)))
+		r.list("!", asks)
+		return &ui.Failure{Reason: asks[0].Title,
+			Hint: "处理后重新运行；或者加上 --yes，自动采用推荐的做法（例如自动换一个空闲端口）"}
+	}
+	if !auto {
+		r.Screen.Hold()
+		r.Screen.Println(fmt.Sprintf("发现 %d 个需要处理的问题（还没有下载或改动任何东西）：", len(asks)))
+	}
+	for i, a := range asks {
+		err := r.resolve(a, d, i+1, len(asks), auto)
+		if errors.Is(err, errRecheck) {
+			break
+		}
+		if err != nil {
+			return resolveFailure(a, err, auto)
+		}
+	}
+	if !auto {
+		r.Screen.Println("\n重新检查……")
+	}
+	return nil
+}
+
+// list 列出问题和建议，mark 是每行开头的记号（✗ 没法继续的，! 要处理的）。
+func (r *Runner) list(mark string, issues []Issue) {
+	for _, i := range issues {
+		r.Screen.Println("  " + mark + " " + i.Title)
+		if i.Hint != "" {
+			r.Screen.Println("    建议：" + i.Hint)
+		}
+	}
+}
+
+// resolveFailure 是处理问题 a 时出的错 err 的结果：检查没通过的（*ui.Failure）照原样；用户选了取消的，说明
+// 取消了什么、接下来怎么办；别的（例如回答时按了 Ctrl+C）原样返回。
+func resolveFailure(a Issue, err error, auto bool) error {
+	var f *ui.Failure
+	if errors.As(err, &f) {
+		return f
+	}
+	if errors.Is(err, errCancel) {
+		hint := "处理后用同一个链接重新迁入即可继续"
+		if auto {
+			hint = "这个问题没法自动处理，请处理后重新运行"
+		}
+		return &ui.Failure{Reason: "已取消：" + a.Title, Hint: hint}
+	}
+	return err
 }
 
 var errCancel = errors.New("取消")
