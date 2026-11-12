@@ -636,15 +636,7 @@ func (u *undo) cleanupCommitted(ctx context.Context, entries []Entry) []string {
 				left = append(left, fmt.Sprintf("改名备份的旧容器 %s：%v", e.Backup, err))
 			}
 		case opComposeOld:
-			// 删除原有的 Compose 容器时留着它们的匿名卷，回滚重建时要用（见 spec.Rebuild 的 KeepVolumes）。
-			// 还挂在别的容器上的不是没人用的，不删。
-			for _, o := range e.Old {
-				for _, v := range o.Volumes {
-					if err := u.dc.RemoveVolume(ctx, v); err != nil && !docker.IsNotFound(err) && !docker.IsConflict(err) {
-						left = append(left, fmt.Sprintf("原来的容器 %s 的匿名卷 %s：%v", o.Name, v, err))
-					}
-				}
-			}
+			left = append(left, u.removeOldVolumes(ctx, e)...)
 		case opOldImages:
 			for _, img := range e.Images {
 				if err := u.dc.RemoveImage(ctx, img); err != nil && !docker.IsNotFound(err) {
@@ -668,6 +660,20 @@ func (u *undo) cleanupCommitted(ctx context.Context, entries []Entry) []string {
 			// 没有要删的回滚资料：数据卷、文件的备份在回滚资料目录里，跟着目录一起删
 		default:
 			left = append(left, fmt.Sprintf("日志里有不认识的记录 %s，没有清理", e.Op))
+		}
+	}
+	return left
+}
+
+// removeOldVolumes 删掉被替换的原有 Compose 容器（e）留下的匿名卷，返回没能删的。删除原有的容器时留着它们，
+// 回滚重建时要用（见 spec.Rebuild 的 KeepVolumes）；提交之后就用不上了。还挂在别的容器上的不是没人用的，不删。
+func (u *undo) removeOldVolumes(ctx context.Context, e Entry) []string {
+	var left []string
+	for _, o := range e.Old {
+		for _, v := range o.Volumes {
+			if err := u.dc.RemoveVolume(ctx, v); err != nil && !docker.IsNotFound(err) && !docker.IsConflict(err) {
+				left = append(left, fmt.Sprintf("原来的容器 %s 的匿名卷 %s：%v", o.Name, v, err))
+			}
 		}
 	}
 	return left
