@@ -354,7 +354,6 @@ type exception struct {
 var exceptions = map[string]exception{
 	"spec Rebuild.Build": {64, 3, "不拆：平铺的一条条配置规则，各条互不相干；拆开要来回传六七个变量，反而难对照"},
 
-	"restore migrate.units":         {78, 5, "待整理：按依赖从哪来拆开（显式依赖、Compose 建的网络、配置里提到的名字）"},
 	"preflight Runner.Run":          {75, 5, "待整理：显示说明和提醒、停下的问题、要问的问题各成一个函数"},
 	"preflight networkIssues":       {62, 5, "待整理：找重叠的网段、固定 IP 被占用各成一个函数"},
 	"backup buildPlan":              {59, 5, "待整理：每个容器要的东西（显卡、设备、端口、网络、卷）单独成一个函数"},

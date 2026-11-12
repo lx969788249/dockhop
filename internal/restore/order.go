@@ -87,8 +87,23 @@ func (u *unit) serviceOrder() []string {
 		func(svc string) []string { return slices.Concat(u.configured[svc].Needs(), u.uses[svc]) })
 }
 
-// units 列出一组服务里的启动单位，并找出它们之间的依赖。
+// units 列出一组服务里的启动单位，并找出它们之间的依赖（三种，见本文件开头）。
 func (r *migrate) units(g *group) []*unit {
+	out := r.groupUnits(g)
+	ix := indexUnits(out)
+	networkOwner := r.networkOwners()
+	for _, u := range out {
+		for _, it := range u.items {
+			r.linkDeps(u, it, ix)
+			networkDeps(u, it, ix, networkOwner)
+		}
+		mentionDeps(u, out)
+	}
+	return out
+}
+
+// groupUnits 是一组服务里的启动单位：迁入的 Compose 项目各一个，单独迁入的容器各一个。
+func (r *migrate) groupUnits(g *group) []*unit {
 	var out []*unit
 	for i := range g.projects {
 		p := &g.projects[i]
@@ -105,76 +120,102 @@ func (r *migrate) units(g *group) []*unit {
 			out = append(out, &unit{key: "c:" + it.m.Name, label: "容器 " + it.m.Name, items: []*citem{it}})
 		}
 	}
-	byKey := map[string]*unit{}
-	owner := map[string]*unit{}
-	service := map[string]string{} // 容器名 → 它是 Compose 项目里的哪个服务
-	for _, u := range out {
-		byKey[u.key] = u
+	return out
+}
+
+// unitIndex 按键、按容器名找单位，以及每个容器是它所在的 Compose 项目里的哪个服务。
+type unitIndex struct {
+	byKey, owner map[string]*unit
+	service      map[string]string
+}
+
+func indexUnits(units []*unit) unitIndex {
+	ix := unitIndex{byKey: map[string]*unit{}, owner: map[string]*unit{}, service: map[string]string{}}
+	for _, u := range units {
+		ix.byKey[u.key] = u
 		for _, it := range u.items {
-			owner[it.m.Name] = u
-			service[it.m.Name] = it.m.Service
+			ix.owner[it.m.Name] = u
+			ix.service[it.m.Name] = it.m.Service
 		}
 	}
-	networkOwner := r.networkOwners()
-	for _, u := range out {
-		dep := func(on *unit) *unitDep {
-			if on == nil || on == u {
-				return nil
-			}
-			for _, d := range u.deps {
-				if d.on == on {
-					return d
-				}
-			}
-			d := &unitDep{on: on}
-			u.deps = append(u.deps, d)
+	return ix
+}
+
+// depOn 是 u 对 on 的依赖，还没有就加上；on 为空或者就是 u 自己时为 nil。
+func (u *unit) depOn(on *unit) *unitDep {
+	if on == nil || on == u {
+		return nil
+	}
+	for _, d := range u.deps {
+		if d.on == on {
 			return d
 		}
-		for _, it := range u.items {
-			for _, x := range spec.Deps(it.c) {
-				name := x.Ref
-				if n := r.pkg.nameOfOld(x.Ref); n != "" {
-					name = n
-				}
-				if u.project != nil && owner[name] == u {
-					u.uses[it.m.Service] = append(u.uses[it.m.Service], service[name]) // 见 serviceOrder
-				}
-				if d := dep(owner[name]); d != nil {
-					how := "--volumes-from"
-					if x.Running {
-						d.ready, how = true, "借用网络（或 --link）"
-					}
-					d.exist = true
-					d.why = append(d.why, it.m.Name+" 用"+how+"连着 "+name)
-				}
-			}
-			for n := range it.c.NetworkSettings.Networks {
-				if proj := networkOwner[n]; proj != "" {
-					if d := dep(byKey["p:"+proj]); d != nil {
-						d.exist = true
-						d.why = append(d.why, it.m.Name+" 接在 Compose 项目 "+proj+" 建的网络 "+n+" 上")
-					}
-				}
-			}
+	}
+	d := &unitDep{on: on}
+	u.deps = append(u.deps, d)
+	return d
+}
+
+// linkDeps 记下 it 借用网络、--link、--volumes-from 用到的容器：在别的单位里的，那个单位要先存在（借用
+// 网络、--link 的还要先就绪）；在同一个 Compose 项目里的，记进 uses（见 serviceOrder）。
+func (r *migrate) linkDeps(u *unit, it *citem, ix unitIndex) {
+	for _, x := range spec.Deps(it.c) {
+		name := x.Ref
+		if n := r.pkg.nameOfOld(x.Ref); n != "" {
+			name = n
 		}
-		for _, v := range out {
-			if v == u {
-				continue
-			}
-		next:
-			for _, it := range u.items {
-				for _, other := range v.items {
-					if why := mentions(it.c, other.c); why != "" {
-						d := dep(v)
-						d.prefer = true
-						d.why = append(d.why, it.m.Name+" 的"+why)
-						break next
-					}
-				}
+		if u.project != nil && ix.owner[name] == u {
+			u.uses[it.m.Service] = append(u.uses[it.m.Service], ix.service[name])
+		}
+		d := u.depOn(ix.owner[name])
+		if d == nil {
+			continue
+		}
+		how := "--volumes-from"
+		if x.Running {
+			d.ready, how = true, "借用网络（或 --link）"
+		}
+		d.exist = true
+		d.why = append(d.why, it.m.Name+" 用"+how+"连着 "+name)
+	}
+}
+
+// networkDeps 记下 it 接在别的 Compose 项目创建的网络上：那个项目要先存在。
+func networkDeps(u *unit, it *citem, ix unitIndex, networkOwner map[string]string) {
+	for n := range it.c.NetworkSettings.Networks {
+		if proj := networkOwner[n]; proj != "" {
+			if d := u.depOn(ix.byKey["p:"+proj]); d != nil {
+				d.exist = true
+				d.why = append(d.why, it.m.Name+" 接在 Compose 项目 "+proj+" 建的网络 "+n+" 上")
 			}
 		}
 	}
-	return out
+}
+
+// mentionDeps 记下 u 的容器的配置里提到了哪些别的单位（“最好先就绪”，见本文件开头），每个单位记一次。
+func mentionDeps(u *unit, all []*unit) {
+	for _, v := range all {
+		if v == u {
+			continue
+		}
+		if why := mentionOf(u, v); why != "" {
+			d := u.depOn(v)
+			d.prefer = true
+			d.why = append(d.why, why)
+		}
+	}
+}
+
+// mentionOf 说明 u 里第一个在配置里提到 v 的容器怎么提到的；都没提到时为空。
+func mentionOf(u, v *unit) string {
+	for _, it := range u.items {
+		for _, other := range v.items {
+			if why := mentions(it.c, other.c); why != "" {
+				return it.m.Name + " 的" + why
+			}
+		}
+	}
+	return ""
 }
 
 // networkOwners 是由迁入的 Compose 项目创建的网络 → 项目名：这些网络交给 Compose 按项目文件
